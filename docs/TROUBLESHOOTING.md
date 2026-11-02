@@ -939,6 +939,77 @@ run; `Stalled` — the checks ran and kept producing the same failing
 output. `PinNotDescendant` is the operator refusing the pin before any
 check runs: the agent's claimed work does not even sit on the Loop's base.
 
+### `Failed: TestsRemoved` — the canary found every test deleted (F94a)
+
+**What you see:** the Loop ends `Failed` with reason `TestsRemoved` (terminal
+— no retry, no new verify Job), with a Warning Event naming the canary.
+In the verify Job's pod, the `canary` init container terminated with
+exit code `46`.
+
+**What it means:** the base commit (`status.baseCommit`) had at least one
+`*_test.go` and the verified commit (the agent's pin) has none. The canary
+treats that as subversion of the evidence: `go test` would pass vacuously
+on a testless tree, so the acceptance checks' output is no longer
+trustworthy. It is terminal for the same reason `SubvertedVerify` is (exit
+43): the agent's own commit made the evidence dishonest, and a re-run would
+import the same pin and read the same 46.
+
+**What to do:** inspect the pin's diff for deleted `*_test.go` files
+(`git diff --stat <base> <pin> -- '*_test.go'`). If the removal is real and
+intentional, that is the outcome the Loop should have had — restart the
+Loop with the tests restored (or re-base the Loop so the base predates the
+removal). A git failure reading the base commit's tree is NOT this: that
+exits 44 and follows the `VerifyInfraFailed` path below.
+
+### `Failed: VerifyInfraFailed` from the canary (exit 44) — the canary was unavailable (F94c)
+
+**What you see:** the `canary` init container in the verify Job's pod
+terminated with exit code `44` (its log ends with one of: `canary: no go
+toolchain; canary unavailable`, `canary: cannot read the base commit's
+tree; canary unavailable`, or `canary: every package was skipped (no
+go.mod above any package); canary unavailable`). The Loop was retried with
+`VerifyInfraRetry` Warning Events and ends `Failed` with reason
+`VerifyInfraFailed` after the bound (three total runs) — before F94c a
+permanent 44 held the Loop in `Verifying` forever with a one-time
+`VerifyCanaryUnavailable` event and no decision; that path is gone.
+
+**What it means:** the canary (the Go negative control) could not run. Exit
+44 is an **infrastructure** failure, never a subversion verdict: no `go`
+toolchain in the verify image, every candidate package skipped because no
+`go.mod` sits above it, or the base commit's tree is unreadable (the canary
+script fails closed on any git error rather than reading it as "the base
+had no tests" — an unreadable base must not read as a skip).
+
+**What to do:** treat it as infrastructure, like the F39
+`VerifyInfraFailed` above. Check that the verify image has the Go
+toolchain the repo needs, that the repo has a `go.mod` above its test
+packages, and that `baseCommit` is a real commit in the repo (the canary's
+log names the failure). A 44 that keeps recurring after the bound is a
+permanent `Failed`, not a hold: fix the cause and re-apply the Loop.
+
+### `CanarySkipped=True / NoTestsInRepo` — the repo never had tests (F94)
+
+**What you see:** the Loop's conditions include `CanarySkipped: True`
+with reason `NoTestsInRepo` (the canary's termination message carries the
+marker line `canary-skipped: no-tests-in-repo`, which the operator reads
+only when the canary exits 0). The
+Loop proceeds to the acceptance checks as normal.
+
+**What it means:** the repo had no `*_test.go` at the base commit AND none
+at the verified commit, so the canary had nothing to canary: it exited 0
+with a skip marker (read only on exit 0), and the acceptance checks decide
+the verify without the Go negative control. This is the honest-testless
+case and is not a failure — but it does mean the canary's protection is
+absent for this Loop. (The distinct reason `CanaryNotApplicable` is the
+operator-side skip for `spec.verify.preset: none` repos, #370.)
+
+**The spoof limit, in one sentence:** the agent's own test code runs in the
+canary container (post-F53 it runs against a copy of the checkout, but in
+the same pod and in code the agent wrote), so a subverting test could write
+the marker and make a tested repo read as skip-only — but a spoofed marker
+yields only a misleading `CanarySkipped` condition, never a change to the
+verdict: the acceptance checks still decide the outcome.
+
 ### `MeteringDegraded=True` / `BudgetReadingStale=True` on the Loop (F44)
 
 **What you see:** `kubectl cox describe` shows the `MeteringDegraded` and/or

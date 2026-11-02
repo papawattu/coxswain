@@ -2786,12 +2786,13 @@ const TamperedVerifyReason = "TamperedVerify"
 // TamperedVerify: the Loop is Failed and no new verify Job is created.
 const SubvertedVerifyReason = "SubvertedVerify"
 
-// VerifyCanaryUnavailableReason (F60) is the Warning Event reason the
-// operator records when the canary init exited 44 — the target package has
-// no *_test.go (nothing to canary). It is a NO-DECISION event: the Loop
-// stays Verifying and no verdict is drawn on the agent's work. Emitted
-// exactly once (idempotent — see the one-shot annotation in applyVerifyOutcome).
-const VerifyCanaryUnavailableReason = "VerifyCanaryUnavailable"
+// TestsRemovedReason (F94a) is the terminal Failed reason recorded when the
+// verify canary exited 46: HEAD has no *_test.go but the base commit HAD
+// tests, so the agent removed every test (go test would pass vacuously).
+// Terminal, like SubvertedVerify: the agent's own commit made the evidence
+// dishonest, so no acceptance check is trustworthy and no new verify Job is
+// created (a re-run would import the same pin).
+const TestsRemovedReason = "TestsRemoved"
 
 // CanarySkippedCondition is the condition Type recorded when the verify
 // canary is SKIPPED because the Loop declared a non-Go repo
@@ -2809,6 +2810,15 @@ const CanarySkippedCondition = "CanarySkipped"
 // is skipped for a non-Go repo (preset none). The canary is a Go negative
 // control; a repo with no Go tests has nothing to canary.
 const CanaryNotApplicableReason = "CanaryNotApplicable"
+
+// NoTestsInRepoReason (F94 s4) is the CanarySkipped condition reason recorded
+// when the canary RAN (preset go) but exited 0 with its skip marker (the repo
+// has no *_test.go at the base or verified commit, so there was nothing to
+// canary). Distinct from CanaryNotApplicableReason (the operator omitted the
+// canary init for preset none): here the canary ran, ran clean, and self-
+// reported the skip — the acceptance checks ran without the Go negative
+// control and the skip is surfaced with the same condition (I90).
+const NoTestsInRepoReason = "NoTestsInRepo"
 
 // PinNotDescendantReason is the terminal Failed reason recorded when the verify
 // Job's import-agent init refused the pinned commit because it is not a

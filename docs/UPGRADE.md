@@ -172,6 +172,21 @@ what you must DO (or why there is nothing to do).
   which the editor role no longer allows) — upgrade the CLI with the
   operator, not separately.
 
+- **Behaviour change (F94): the verify canary's exit 44 is now a bounded
+  infra retry, and a testless repo proceeds instead of holding.** Before
+  F94, a canary exit 44 (unavailable) held the Loop in `Verifying` forever
+  with a one-time `VerifyCanaryUnavailable` event and no decision. It is
+  now a bounded infrastructure retry (`VerifyInfraRetry` events, three total
+  runs) that ends `Failed` with reason `VerifyInfraFailed`. A repo that
+  never had `*_test.go` (at the base or the verified commit) now proceeds
+  to the acceptance checks with the condition
+  `CanarySkipped=True / NoTestsInRepo` — the acceptance checks decide
+  without the Go negative control — and a verified commit that REMOVED
+  every test (the base had tests, the pin has none) now fails the Loop
+  terminally with reason `TestsRemoved` instead of passing vacuously.
+  Nothing to do at upgrade time; Loops mid-`Verifying` pick the new
+  behaviour up on the next verify outcome read.
+
 ### The operator's ClusterRole gained a serviceaccounts rule
 
 The ClusterRole now includes `serviceaccounts` (create, get, list, watch)

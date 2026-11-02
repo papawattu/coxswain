@@ -30,8 +30,11 @@
 //     with its own bounded writable scratch (post-F53 /verify is read-only).
 //  2. canary exit 43 with all checks 0 → Failed:SubvertedVerify + a Warning
 //     Event + NO new verify Job (terminal, like TamperedVerify).
-//  3. canary exit 44 → NO decision (the Loop stays Verifying) + exactly ONE
-//     VerifyCanaryUnavailable Event across two reconciles (idempotent).
+//  3. canary exit 44 → BOUNDED infra retry (F94c, the intended behaviour
+//     change from the pre-F94 one-shot VerifyCanaryUnavailable no-decision
+//     hold): status.verify.infraAttempts == 1 and the Job is deleted for a
+//     fresh recreate — a permanent 44 ends in Failed after the bound, never
+//     a forever-Verifying hold.
 //  4. canary exit 45 → verifyInfraRetry: status.verifyInfraAttempts == 1 and
 //     the Job is recreated (a bounded infra retry), NEVER a subversion verdict.
 //  5. OOM-killed canary (137/OOMKilled, check-0 still Waiting) → the bounded
@@ -61,139 +64,143 @@ import (
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
 )
 
+// f60Ns / f60NewLoop / f60Reconciler / f60GetJob / f60Events are the shared
+// canary envtest helpers (package level: the F94 session-2 spec reuses them
+// for the 46 terminal and the 44 bounded-retry specs).
+
+func f60Ns(prefix string) string {
+	ns := prefix + "-" + nowSuffix()
+	Expect(k8sClient.Create(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+	return ns
+}
+
+func f60NewLoop(ns, name string, refine ...func(*coxv1alpha1.LoopSpec)) {
+	existing := &coxv1alpha1.Loop{}
+	if !apierrors.IsNotFound(k8sClient.Get(context.Background(), types.NamespacedName{Name: name, Namespace: ns}, existing)) {
+		return // idempotent: the Loop already exists (do not re-create it)
+	}
+	spec := s5aLoopSpec()
+	for _, f := range refine {
+		f(&spec)
+	}
+	Expect(k8sClient.Create(context.Background(), &coxv1alpha1.Loop{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+		Spec:       spec,
+	})).To(Succeed())
+}
+
+func f60Reconciler(recorder *record.FakeRecorder) *LoopReconciler {
+	if recorder == nil {
+		recorder = record.NewFakeRecorder(64)
+	}
+	return &LoopReconciler{
+		CNIProber: testCNIProber(),
+		Client:    k8sClient,
+		Scheme:    k8sClient.Scheme(),
+		apiReader: k8sClient,
+		Recorder:  recorder,
+	}
+}
+
+func f60GetJob(ns, jobName string) *batchv1.Job {
+	job := &batchv1.Job{}
+	if err := k8sClient.Get(context.Background(), types.NamespacedName{Name: jobName, Namespace: ns}, job); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		Fail("get verify job: " + err.Error())
+	}
+	return job
+}
+
+func f60Events(recorder *record.FakeRecorder) []string {
+	out := []string{}
+	for {
+		select {
+		case e := <-recorder.Events:
+			out = append(out, e)
+		default:
+			return out
+		}
+	}
+}
+
+// f60DriveToVerifying drives a fresh Loop to Verifying and returns the
+// reconciler's verify Job name, draining the drive's own Events so a decision
+// spec's event assertions are about ITS reconcile only.
+func f60DriveToVerifying(r *LoopReconciler, ns, name string) string {
+	f60NewLoop(ns, name)
+	s5aDriveToVerifyingWithReconciler(r, ns, name)
+	if recorder, ok := r.Recorder.(*record.FakeRecorder); ok {
+		_ = f60Events(recorder)
+	}
+	return verifyJobName(&coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: name}})
+}
+
+// f60InitIndex returns the index of the named init in the pod's init list
+// (-1 when absent).
+func f60InitIndex(podSpec corev1.PodSpec, name string) int {
+	for i := range podSpec.InitContainers {
+		if podSpec.InitContainers[i].Name == name {
+			return i
+		}
+	}
+	return -1
+}
+
+// f60VolumeSizeLimit returns the SizeLimit of the named emptyDir volume
+// ("" when the volume is absent or has no SizeLimit).
+func f60VolumeSizeLimit(podSpec corev1.PodSpec, name string) string {
+	for _, v := range podSpec.Volumes {
+		if v.Name == name && v.EmptyDir != nil && v.EmptyDir.SizeLimit != nil {
+			return v.EmptyDir.SizeLimit.String()
+		}
+	}
+	return ""
+}
+
+// f60PlantPod creates the verify Job's pod with the given init statuses (the
+// envtest stand-in for the kubelet), mirroring F58's plant helper.
+func f60PlantPod(ns, name, jobName string, job *batchv1.Job, statuses []corev1.ContainerStatus) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name + "-verify-pod",
+			Namespace: ns,
+			Labels:    map[string]string{s5aJobNameLabel: jobName, verifyForLabel: name},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: batchv1.SchemeGroupVersion.String(),
+				Kind:       i65JobKind,
+				Name:       jobName,
+				UID:        job.UID,
+			}},
+		},
+		Spec: corev1.PodSpec{
+			InitContainers: []corev1.Container{{Name: verifyCanaryInit, Image: verifyDefaultCheckImage}},
+			Containers:     []corev1.Container{{Name: verifyNoopContainer, Image: verifyBusybox}},
+		},
+	}
+	existing := &corev1.Pod{}
+	if err := k8sClient.Get(context.Background(), types.NamespacedName{Name: pod.Name, Namespace: ns}, existing); err == nil {
+		Expect(k8sClient.Delete(context.Background(), existing)).To(Succeed())
+	}
+	Expect(k8sClient.Create(context.Background(), pod)).To(Succeed())
+	pod.Status.InitContainerStatuses = statuses
+	Expect(k8sClient.Status().Update(context.Background(), pod)).To(Succeed())
+}
+
+// f60TrustedPrefix is the trusted init prefix (clone-base, import-agent,
+// tamper, artifact) all exited 0, so verifyOutcome reaches the canary.
+func f60TrustedPrefix() []corev1.ContainerStatus {
+	return []corev1.ContainerStatus{
+		{Name: s5aCloneBase, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
+		{Name: s5aImportAgent, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
+		{Name: s5aTamper, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
+		{Name: s5aArtifact, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
+	}
+}
+
 var _ = Describe("F60: the verify canary (D17.1 negative control)", func() {
 	ctx := context.Background()
-
-	f60Ns := func(prefix string) string {
-		ns := prefix + "-" + nowSuffix()
-		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
-		return ns
-	}
-
-	f60NewLoop := func(ns, name string, refine ...func(*coxv1alpha1.LoopSpec)) {
-		existing := &coxv1alpha1.Loop{}
-		if !apierrors.IsNotFound(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, existing)) {
-			return // idempotent: the Loop already exists (do not re-create it)
-		}
-		spec := s5aLoopSpec()
-		for _, f := range refine {
-			f(&spec)
-		}
-		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
-			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
-			Spec:       spec,
-		})).To(Succeed())
-	}
-
-	f60Reconciler := func(recorder *record.FakeRecorder) *LoopReconciler {
-		if recorder == nil {
-			recorder = record.NewFakeRecorder(64)
-		}
-		return &LoopReconciler{
-			CNIProber: testCNIProber(),
-			Client:    k8sClient,
-			Scheme:    k8sClient.Scheme(),
-			apiReader: k8sClient,
-			Recorder:  recorder,
-		}
-	}
-
-	f60GetJob := func(ns, jobName string) *batchv1.Job {
-		job := &batchv1.Job{}
-		if err := k8sClient.Get(ctx, types.NamespacedName{Name: jobName, Namespace: ns}, job); err != nil {
-			if apierrors.IsNotFound(err) {
-				return nil
-			}
-			Fail("get verify job: " + err.Error())
-		}
-		return job
-	}
-
-	f60Events := func(recorder *record.FakeRecorder) []string {
-		out := []string{}
-		for {
-			select {
-			case e := <-recorder.Events:
-				out = append(out, e)
-			default:
-				return out
-			}
-		}
-	}
-
-	// f60DriveToVerifying drives a fresh Loop to Verifying and returns the
-	// reconciler + the verify Job name, draining the drive's own Events so a
-	// decision spec's event assertions are about ITS reconcile only.
-	f60DriveToVerifying := func(r *LoopReconciler, ns, name string) string {
-		f60NewLoop(ns, name)
-		s5aDriveToVerifyingWithReconciler(r, ns, name)
-		if recorder, ok := r.Recorder.(*record.FakeRecorder); ok {
-			_ = f60Events(recorder)
-		}
-		return verifyJobName(&coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: name}})
-	}
-
-	// f60InitIndex returns the index of the named init in the pod's init list
-	// (-1 when absent).
-	f60InitIndex := func(podSpec corev1.PodSpec, name string) int {
-		for i := range podSpec.InitContainers {
-			if podSpec.InitContainers[i].Name == name {
-				return i
-			}
-		}
-		return -1
-	}
-
-	// f60VolumeSizeLimit returns the SizeLimit of the named emptyDir volume
-	// ("" when the volume is absent or has no SizeLimit).
-	f60VolumeSizeLimit := func(podSpec corev1.PodSpec, name string) string {
-		for _, v := range podSpec.Volumes {
-			if v.Name == name && v.EmptyDir != nil && v.EmptyDir.SizeLimit != nil {
-				return v.EmptyDir.SizeLimit.String()
-			}
-		}
-		return ""
-	}
-
-	// f60PlantPod creates the verify Job's pod with the given init statuses (the
-	// envtest stand-in for the kubelet), mirroring F58's plant helper.
-	f60PlantPod := func(ns, name, jobName string, job *batchv1.Job, statuses []corev1.ContainerStatus) {
-		pod := &corev1.Pod{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      name + "-verify-pod",
-				Namespace: ns,
-				Labels:    map[string]string{s5aJobNameLabel: jobName, verifyForLabel: name},
-				OwnerReferences: []metav1.OwnerReference{{
-					APIVersion: batchv1.SchemeGroupVersion.String(),
-					Kind:       i65JobKind,
-					Name:       jobName,
-					UID:        job.UID,
-				}},
-			},
-			Spec: corev1.PodSpec{
-				InitContainers: []corev1.Container{{Name: verifyCanaryInit, Image: verifyDefaultCheckImage}},
-				Containers:     []corev1.Container{{Name: verifyNoopContainer, Image: verifyBusybox}},
-			},
-		}
-		existing := &corev1.Pod{}
-		if err := k8sClient.Get(ctx, types.NamespacedName{Name: pod.Name, Namespace: ns}, existing); err == nil {
-			Expect(k8sClient.Delete(ctx, existing)).To(Succeed())
-		}
-		Expect(k8sClient.Create(ctx, pod)).To(Succeed())
-		pod.Status.InitContainerStatuses = statuses
-		Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
-	}
-
-	// f60TrustedPrefix is the trusted init prefix (clone-base, import-agent,
-	// tamper, artifact) all exited 0, so verifyOutcome reaches the canary.
-	f60TrustedPrefix := func() []corev1.ContainerStatus {
-		return []corev1.ContainerStatus{
-			{Name: s5aCloneBase, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
-			{Name: s5aImportAgent, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
-			{Name: s5aTamper, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
-			{Name: s5aArtifact, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
-		}
-	}
 
 	It("places the canary init between artifact and check-0, on the built-in Go image, with its own bounded scratch", func() {
 		ns := f60Ns("f60-placement")
@@ -295,7 +302,7 @@ var _ = Describe("F60: the verify canary (D17.1 negative control)", func() {
 			"a subverted verdict is terminal: no new verify Job is created (only the one that produced the evidence)")
 	})
 
-	It("records one VerifyCanaryUnavailable event and takes no decision when the canary exits 44", func() {
+	It("treats a canary exit 44 as a bounded infra retry (F94c: no forever-Verifying hold)", func() {
 		ns := f60Ns("f60-unavail")
 		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
 
@@ -306,27 +313,32 @@ var _ = Describe("F60: the verify canary (D17.1 negative control)", func() {
 		job := f60GetJob(ns, jobName)
 		Expect(job).NotTo(BeNil())
 
-		// The target package has no *_test.go: the canary exits 44. No decision
-		// on the agent's work (the Loop stays Verifying), and exactly ONE
-		// VerifyCanaryUnavailable event across two reconciles (idempotent).
+		// F94c: an unavailable canary (44 — no go toolchain, every package
+		// skipped, or the base tree unreadable — the script fails closed with
+		// 44 rather than reading a git failure as "no tests") is an INFRA
+		// failure: a bounded retry via status.verify.infraAttempts, then
+		// Failed after the bound (see the F94 session-2 spec for the bound
+		// itself). The pre-F94 behaviour (one-shot VerifyCanaryUnavailable
+		// event, no decision, requeue-forever hold at Verifying) is GONE — it
+		// wedged every testless repo; a permanent 44 must end in Failed.
+		// (Intended behaviour change, F94 session 2.)
 		statuses := append(f60TrustedPrefix(),
 			corev1.ContainerStatus{Name: verifyCanaryInit, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 44}}},
 		)
 		f60PlantPod(ns, name, jobName, job, statuses)
 		first := s5aReconcile(r, ns, name)
 		Expect(first.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying),
-			"a 44 canary is NOT a decision: the Loop stays Verifying (no Succeeded, no Failed)")
+			"a 44 canary is an infra failure within the bound: the Loop stays Verifying for now (a retry), not a verdict")
+		Expect(first.Status.Verify).NotTo(BeNil())
+		Expect(first.Status.Verify.InfraAttempts).To(Equal(int32(1)),
+			"the 44 burns ONE infra attempt (the bounded retry counter), never a forever-hold")
 		ev1 := f60Events(recorder)
-		Expect(ev1).To(ContainElement(ContainSubstring(VerifyCanaryUnavailableReason)),
-			"the first reconcile records the VerifyCanaryUnavailable event")
-
-		// A second reconcile: the Loop stays Verifying (no decision on the
-		// agent's work). (The one-shot annotation's no-repeat suppression is a
-		// secondary M7 detail; the core requirements — the event is recorded
-		// and no decision is made — are asserted above.)
-		fresh := s5aReconcile(r, ns, name)
-		Expect(fresh.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying),
-			"the Loop must stay Verifying (no decision on the agent's work)")
+		Expect(ev1).To(ContainElement(ContainSubstring(verifyInfraRetryEventReason)),
+			"the retry is surfaced with the VerifyInfraRetry event")
+		for _, e := range ev1 {
+			Expect(e).NotTo(ContainSubstring(SubvertedVerifyReason),
+				"an unavailable canary must never be reported as a subversion verdict")
+		}
 	})
 
 	It("treats a canary exit 45 (build error) as a bounded infra retry, never a subversion verdict", func() {

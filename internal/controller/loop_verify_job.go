@@ -85,8 +85,19 @@ const (
 	// the failure output (the 4 KB tail) in the terminationMessage the
 	// operator reads for the stall normaliser — NO pod-log read. It lives on
 	// the /tmp check-tmp emptyDir (writable, the readOnlyRootFilesystem
-	// exception).
+	// exception). The canary init reuses the SAME path (F94b): when the repo
+	// has no tests at the base commit either, the canary exits 0 after writing
+	// the skip marker here, and the operator reads the marker from the
+	// canary's terminationMessage (exit 0 only — a non-zero exit is a defined
+	// canary outcome, not a skip).
 	verifyTerminationLogPath = "/tmp/termination.log"
+	// verifyCanarySkipMarker is the line the canary writes to its
+	// terminationMessage when the repo has no *_test.go at the BASE commit
+	// either (F94b): there is nothing to canary and the exit is 0 (NOT a new
+	// non-zero code — a non-zero init exit fails the pod and the acceptance
+	// checks would never run). The operator reads the marker ONLY when the
+	// canary's exit is 0 (F94, session 2).
+	verifyCanarySkipMarker = "canary-skipped: no-tests-in-repo"
 	// verifyCloneBaseInit is the base-commit clone init container's name.
 	verifyCloneBaseInit = "clone-base"
 	// verifyImportAgentInit is the agent-workspace import init container's name.
@@ -116,14 +127,6 @@ const (
 	// to its own scratch and runs the generated test there). Bounded like the
 	// per-check scratch.
 	verifyCanaryTmpVolName = "check-tmp-canary"
-	// verifyCanaryUnavailableAnnotation is the one-shot annotation the
-	// operator sets when it records the VerifyCanaryUnavailable event (F60):
-	// it gates the event so it fires exactly ONCE per Loop (idempotent across
-	// the requeues that hold the Loop at Verifying). Cleared by the next pin
-	// (a fresh verify Job resets the annotation map on the new Job object; the
-	// annotation lives on the Loop and is re-cleared at the pin in
-	// ensureVerifyJob when a new Job is created — see the annotation clear).
-	verifyCanaryUnavailableAnnotation = "coxswain.io/canary-unavailable-noted"
 	// verifyArtifactMaxBytes is the I47 size cap for a file ADDED in
 	// baseCommit..verifiedCommit (1 MiB — the same cap the runner's
 	// commitWorkspace refuses against on the agent side).
@@ -670,12 +673,25 @@ exit 0
 //	43 → a tested package's canary test exited 0 (despite the forced
 //	     t.Fatal), or exited non-zero without the token in its -json output:
 //	     the harness is subverted in that package.
-//	44 → the canary is unavailable: no *_test.go anywhere, or no go binary
-//	     on PATH — the operator records a VerifyCanaryUnavailable event and
-//	     takes no decision.
+//	44 → the canary is unavailable: no go binary on PATH, every package
+//	     skipped (no go.mod above any package), or the base commit's tree
+//	     could not be read (ls-tree failed — fail closed, never read as
+//	     "the base had no tests") — the operator treats it as an infra
+//	     failure (bounded retry, then Failed:VerifyInfraFailed; F94c).
 //	45 → some tested package's canary could not even build (a go test -json
 //	     build-fail for THAT package) — the operator treats it as an infra
 //	     failure (bounded retry), never as subversion.
+//	46 → no *_test.go anywhere at HEAD and the BASE commit HAD tests:
+//	     the agent removed every test — terminal (F94a). The 44 hold
+//	     that kept this case is what stops a vacuously-passing `go test`
+//	     after test removal; reading the base commit is the distinction
+//	     (clone-base fetched it, so it is reachable in /verify/.git).
+//	0  (with the skip marker) → no *_test.go at HEAD and none at the base
+//	     either: the repo has nothing to canary. The canary first writes
+//	     "canary-skipped: no-tests-in-repo" to its terminationMessage file
+//	     and exits 0 (a non-zero exit would fail the pod and the acceptance
+//	     checks would never run); the operator reads the marker ONLY when
+//	     the exit is 0 (F94b, session 2).
 func canaryCheckScript() string {
 	return `set -u
 export TMPDIR="/tmp"
@@ -708,8 +724,8 @@ cp -a /verify/. "$SCRATCH/"
 trap 'rm -rf "$SCRATCH"' EXIT
 cd "$SCRATCH"
 
-# No go toolchain: nothing to canary with → unavailable (the operator records
-# a VerifyCanaryUnavailable event and takes no decision).
+# No go toolchain: nothing to canary with → unavailable (the operator
+# treats 44 as a bounded infra failure, F94c).
 command -v go >/dev/null 2>&1 || { echo "canary: no go toolchain; canary unavailable"; exit 44; }
 
 # Every directory that has a *_test.go (NUL-safe: a -print0 | sort -z chain
@@ -720,10 +736,56 @@ command -v go >/dev/null 2>&1 || { echo "canary: no go toolchain; canary unavail
 DIRLIST="$SCRATCH/.canary-dirs"
 find . -name '*_test.go' -not -path './.git/*' -print0 | sort -z | xargs -0 -n1 dirname 2>/dev/null | tr '\0' '\n' | awk 'NF' | sort -u > "$DIRLIST"
 N=$(awk 'NF' "$DIRLIST" | wc -l)
+
+# F94: when the operator sets BASE_COMMIT + TERMINATION_MESSAGE_PATH/MARKER
+# (always, since F94), the no-*_test.go branch decides by the BASE commit —
+# the checkout holds BOTH the base and the verified commit (clone-base
+# fetched baseCommit; import-agent grafted the verified commit on top), so git
+# ls-tree over the base SHA lists the tree as the base had it. The env is
+# computed LAZILY (only when HEAD has no tests): the F60 execution test drives
+# the pre-F94 shape (no .git in the tree, no env) and its 44 "no tests"
+# branch must keep reading 44 there. With the env missing, the branch falls
+# back to the pre-F94 44 (it cannot tell tests-removed from never-had-tests;
+# a marker file that is never written would mislead the session-2 reader).
 if [ "$N" -eq 0 ]; then
+  if [ -n "${BASE_COMMIT:-}" ] && [ -n "${TERMINATION_MESSAGE_PATH:-}" ] && [ -n "${TERMINATION_MESSAGE_MARKER:-}" ]; then
+    BASE_TESTLIST="$SCRATCH/.canary-base-tests"
+    # Fail closed: run git ls-tree ON ITS OWN and check its exit status
+    # BEFORE grepping. A non-zero exit (unreachable base SHA, safe.directory
+    # / ownership error, missing git) must NOT read as "the base had no
+    # tests" — that would let the canary skip on a tree the agent emptied and
+    # the vacuous go test would pass. Non-zero git exit → 44 (the operator
+    # treats it as the bounded unavailable path, F94c), never a skip.
+    if ! git -c safe.directory='*' ls-tree -r --name-only "$BASE_COMMIT" > "$BASE_TESTLIST.raw"; then
+      echo "canary: cannot read the base commit's tree; canary unavailable"
+      exit 44
+    fi
+    grep '_test\.go$' "$BASE_TESTLIST.raw" > "$BASE_TESTLIST" || true
+    # The base commit had tests and HEAD deleted them all: subversion (go
+    # test would pass vacuously) — terminal. The base listing is the
+    # reference, not the HEAD tree (HEAD's empty listing is why we are in
+    # this branch).
+    if [ -s "$BASE_TESTLIST" ]; then
+      echo "canary: no *_test.go at HEAD but the base commit $BASE_COMMIT had tests — tests removed (subversion)"
+      exit 46
+    fi
+    # Never had tests: skip the canary. Exit 0 (NOT a new non-zero code: a
+    # non-zero init exit fails the pod and the acceptance checks would never
+    # run). Write the skip marker to the termination-message file FIRST
+    # (before exit, so the kubelet records it in the canary's
+    # terminationMessage even though the exit is 0); it also lands on
+    # stdout for the pod log.
+    {
+      echo "canary: no *_test.go at HEAD or at the base commit $BASE_COMMIT — nothing to canary; skipping"
+      echo "$TERMINATION_MESSAGE_MARKER"
+    } | tee "$TERMINATION_MESSAGE_PATH"
+    exit 0
+  fi
+  # Pre-F94 fallback (env missing): the no-tests branch stays the old 44.
   echo "canary: no *_test.go anywhere; canary unavailable"
   exit 44
 fi
+
 if [ "$N" -gt "$CAP" ]; then
   echo "canary: capped — $N packages found, testing only the first $CAP (sorted)"
 fi
@@ -910,15 +972,22 @@ const (
 	// ignored the forced failure (exited 0 despite t.Fatal, or the round-8
 	// os.Exit(0) probe) — subversion detected.
 	verifyCanarySubvertedExit = 43
-	// verifyCanaryUnavailableExit is the canary's exit when the target package
-	// has no *_test.go (nothing to canary) — the operator records a
-	// VerifyCanaryUnavailable event and takes no decision.
+	// verifyCanaryUnavailableExit is the canary's exit when it is unavailable
+	// (no go toolchain, every package skipped, or the base commit's tree
+	// unreadable — the script fails closed on any git error): the operator
+	// treats it as a bounded infra failure (F94c), retried to the infra
+	// bound and then Failed:VerifyInfraFailed — never a no-decision hold.
 	verifyCanaryUnavailableExit = 44
 	// verifyCanaryBuildErrorExit is the canary's exit when the canary code
 	// does not compile (a build error, NOT the subversion probe) — the
 	// operator treats it as an infra failure (bounded retry), never as a
 	// subversion verdict.
 	verifyCanaryBuildErrorExit = 45
+	// verifyCanaryTestsRemovedExit is the canary's exit when HEAD has no
+	// *_test.go but the BASE commit had tests (F94a): the agent removed every
+	// test — subversion (go test would pass vacuously). Terminal; the gate
+	// mapping lands in session 2.
+	verifyCanaryTestsRemovedExit = 46
 )
 
 // tamperCheckScript builds the tamper init's sh script (B2, F39). It diffs
@@ -1200,8 +1269,24 @@ func (r *LoopReconciler) buildVerifyJobSpec(loop *coxv1alpha1.Loop) batchv1.JobS
 			Command:         []string{verifySh, "-c", canaryCheckScript()},
 			WorkingDir:      "/verify",
 			SecurityContext: trustedContainerSecurityContext(),
-			Env:             verifyCheckEnv(),
-			Resources:       verifyCheckResources(loop),
+			// F94: the canary needs the base commit (BASE_COMMIT) to tell
+			// "tests removed" (46) from "never had tests" (skip marker, exit
+			// 0) when HEAD has no *_test.go — the same value the tamper and
+			// artifact scripts receive. TERMINATION_MESSAGE_PATH is the skip
+			// marker's file and TERMINATION_MESSAGE_MARKER the marker line
+			// itself (the operator reads the marker only on exit 0 — session
+			// 2).
+			Env: append(verifyCheckEnv(),
+				corev1.EnvVar{Name: "BASE_COMMIT", Value: baseCommit},
+				corev1.EnvVar{Name: "TERMINATION_MESSAGE_PATH", Value: verifyTerminationLogPath},
+				corev1.EnvVar{Name: "TERMINATION_MESSAGE_MARKER", Value: verifyCanarySkipMarker},
+			),
+			// F94b: the skip marker (exit 0, never-had-tests) has to reach the
+			// operator WITHOUT a pod-log read — the same path as the check
+			// containers' teed termination logs (P2e). It lives on the
+			// canary's own /tmp scratch (check-tmp-canary, agentTmpMount).
+			TerminationMessagePath: verifyTerminationLogPath,
+			Resources:              verifyCheckResources(loop),
 			VolumeMounts: []corev1.VolumeMount{
 				{Name: verifyVol, MountPath: verifyScratchPath, ReadOnly: true},
 				{Name: verifyCanaryTmpVolName, MountPath: agentTmpMount},
@@ -1681,11 +1766,20 @@ const (
 	// tamper: the agent's own code made the test binary dishonest, so no check
 	// can be trusted. The Loop is Failed with reason SubvertedVerify.
 	verifySubverted
-	// verifyCanaryUnavailable (F60): the canary init exited 44 — the target
-	// package has no *_test.go (nothing to canary). NO decision on the
-	// agent's work: the Loop stays Verifying and the operator records a
-	// VerifyCanaryUnavailable event (exactly once). Distinct from subverted (a
-	// verdict) and from infra (a retry): there is simply nothing to canary.
+	// verifyTestsRemoved (F94a): the canary init exited 46 — HEAD has no
+	// *_test.go and the BASE commit had tests, so the agent removed every
+	// test (go test would pass vacuously). Terminal, like tamper/subverted:
+	// the agent's own commit made the evidence dishonest, so no check is
+	// trustworthy and no new verify Job is created (a re-run would import the
+	// same pin). The Loop is Failed with reason TestsRemoved.
+	verifyTestsRemoved
+	// verifyCanaryUnavailable (F94c): the canary init exited 44 — the canary
+	// is unavailable (no go toolchain, every package skipped, or the base
+	// commit's tree unreadable — the script fails closed with 44 rather than
+	// reading a git failure as "no tests"). It is an INFRA failure (bounded
+	// retry, then Failed:VerifyInfraFailed), not a decision and not a
+	// forever-hold: the F60 one-shot no-decision path that held a testless
+	// repo at Verifying forever is gone.
 	verifyCanaryUnavailable
 )
 
@@ -1709,7 +1803,7 @@ const (
 // evidence). A Job the batch controller failed on its activeDeadlineSeconds
 // (F53) is an infra failure too, decided BEFORE the per-init walk and whatever
 // the init statuses still say.
-func verifyOutcome(pod *corev1.Pod, checkCount int, jobFailed bool, deadlineExceeded bool) (int, bool, string, int32) {
+func verifyOutcome(pod *corev1.Pod, checkCount int, jobFailed bool, deadlineExceeded bool) (int, bool, string, int32, bool) {
 	// F53: a Job the batch controller already failed on its deadline can never
 	// produce evidence, whatever stale Waiting/Running state the pod read still
 	// shows (the read can race the kill), and even when the pod is already gone.
@@ -1717,16 +1811,16 @@ func verifyOutcome(pod *corev1.Pod, checkCount int, jobFailed bool, deadlineExce
 	// that it is not in progress. It sits above the pod==nil branch so the
 	// decision does not depend on the caller also reporting jobFailed.
 	if deadlineExceeded {
-		return verifyInfraFailed, false, "", 0
+		return verifyInfraFailed, false, "", 0, false
 	}
 	if pod == nil {
 		// No pod at all: no decision yet unless the Job itself is Failed
 		// (a failed Job whose pod is gone — evicted, garbage-collected — is
 		// still a decision: the evidence was never produced).
 		if jobFailed {
-			return verifyInfraFailed, false, "", 0
+			return verifyInfraFailed, false, "", 0, false
 		}
-		return verifyNoDecision, true, "", 0
+		return verifyNoDecision, true, "", 0, false
 	}
 	// I65: the trusted inits (clone-base, import-agent) run BEFORE the evidence
 	// inits. Their decision is read by trustedInitDecision (F60-lint: extracted
@@ -1735,7 +1829,7 @@ func verifyOutcome(pod *corev1.Pod, checkCount int, jobFailed bool, deadlineExce
 	// the checks never ran; a trusted init still Running or Waiting is PENDING
 	// (no decision, requeue — the I49 norm: in-progress is never a failure).
 	if d := trustedInitDecision(pod); d != nil {
-		return d.outcome, d.requeue, d.container, d.exitCode
+		return d.outcome, d.requeue, d.container, d.exitCode, false
 	}
 	// The evidence gates are walked in evidence order (tamper -> artifact ->
 	// canary -> checks); each helper returns the decision for its own gate
@@ -1747,10 +1841,10 @@ func verifyOutcome(pod *corev1.Pod, checkCount int, jobFailed bool, deadlineExce
 	// pod's status) so the caller falls through to the next gate (F60-lint:
 	// extracted from this function, same order, same decisions).
 	if d := tamperGateDecision(pod); d != nil {
-		return d.outcome, d.requeue, d.container, d.exitCode
+		return d.outcome, d.requeue, d.container, d.exitCode, false
 	}
 	if d := artifactGateDecision(pod); d != nil {
-		return d.outcome, d.requeue, d.container, d.exitCode
+		return d.outcome, d.requeue, d.container, d.exitCode, false
 	}
 	// F60 (D17.1): the canary runs BETWEEN artifact and check-0 (tamper ->
 	// artifact -> canary -> checks). Tamper and artifact are clean at this
@@ -1759,13 +1853,30 @@ func verifyOutcome(pod *corev1.Pod, checkCount int, jobFailed bool, deadlineExce
 	// artifact gates above); a canary absent from the pod's status (a pre-F60
 	// legacy pod, or a test fixture that plants the old init set) is not in
 	// force, so fall through to the checks (the pre-F60 decision path).
-	if d := canaryGateDecision(pod); d != nil {
-		return d.outcome, d.requeue, d.container, d.exitCode
+	// The canary gate returns (decision, skipped): a nil decision with skipped=true
+	// means the canary exited 0 with the skip marker — the walk continues to the
+	// checks (exactly as a healthy exit 0 does), and the skip flag is carried
+	// by a local variable (F94 s5: per call, not a package global).
+	canaryDecision, canarySkipped := canaryGateDecision(pod)
+	if canaryDecision != nil {
+		return canaryDecision.outcome, canaryDecision.requeue, canaryDecision.container, canaryDecision.exitCode, false
 	}
 	// Tamper clean + artifact clean + canary healthy (or absent): read the
-	// check inits (check-0 .. check-<checkCount-1>).
-	d := checkGateDecision(pod, checkCount)
-	return d.outcome, d.requeue, d.container, d.exitCode
+	// check inits (check-0 .. check-<checkCount-1). A decision from the check
+	// gate carries the canary skip flag when the canary self-reported a skip
+	// (exit 0 + marker), so applyVerifyOutcome records CanarySkipped once the
+	// check decision is final.
+	if d := checkGateDecision(pod, checkCount); d != nil {
+		return d.outcome, d.requeue, d.container, d.exitCode, canarySkipped
+	}
+	// No decision from the check gate (not in force — the pod lacks the check
+	// status): the checks never produced evidence on this read. The canary may
+	// still have self-reported a skip (exit 0 + marker), so that skip is not
+	// lost with the walk: report it on the no-decision requeue.
+	if cd2, _ := canaryGateDecision(pod); cd2 != nil {
+		return verifyNoDecision, true, cd2.container, cd2.exitCode, canarySkipped
+	}
+	return verifyNoDecision, true, "", 0, canarySkipped
 }
 
 // verifyCheckResult is one acceptance check's read from the pod's init statuses.
@@ -1786,6 +1897,14 @@ type verifyCheckResult struct {
 	// an out-of-memory kill (137 = SIGKILL in both) from a check that killed
 	// itself.
 	oom bool
+	// message is the kubelet-recorded termination message (F94 s4): the
+	// canary's skip marker rides here via its TERMINATION_MESSAGE_PATH env
+	// (the canary writes verifyCanarySkipMarker to the termination file when
+	// the repo has no *_test.go at the base or verified commit and exits 0).
+	// Meaningful only when terminated; read ONLY on exit 0 (a non-zero exit
+	// keeps its own meaning — a marker in a non-zero exit's message is
+	// ignored).
+	message string
 }
 
 // readVerifyCheck reads the named check container's status from the pod.
@@ -1803,6 +1922,7 @@ func readVerifyCheck(pod *corev1.Pod, name string) verifyCheckResult {
 			terminated: true,
 			code:       ics.State.Terminated.ExitCode,
 			oom:        ics.State.Terminated.Reason == tamperOOMKilledReason,
+			message:    ics.State.Terminated.Message,
 		}
 	}
 	return verifyCheckResult{}
@@ -1962,7 +2082,7 @@ func (r *LoopReconciler) applyVerifyOutcome(ctx context.Context, loop *coxv1alph
 	// still running.
 	evidenceChanged := recordTamperEvidence(loop, pod, job)
 	checkCount := len(loop.Spec.Verify.AcceptanceChecks)
-	outcome, requeue, failedCheck, checkExitCode := verifyOutcome(pod, checkCount, jobFailed, deadlineExceeded)
+	outcome, requeue, failedCheck, checkExitCode, canarySkipped := verifyOutcome(pod, checkCount, jobFailed, deadlineExceeded)
 	if requeue {
 		return evidenceChanged, true
 	}
@@ -1983,6 +2103,21 @@ func (r *LoopReconciler) applyVerifyOutcome(ctx context.Context, loop *coxv1alph
 	// extracted from this function (F60-lint: the nested found/notRun
 	// branches added complexity).
 	recordCheckResults(pod, loop, checkCount)
+	// F94 s4/s5: the canary RAN (preset go) and self-reported a skip (exit 0 +
+	// the skip marker in its termination message — the repo has no *_test.go
+	// at the base or verified commit). Record CanarySkipped=True with the
+	// NoTestsInRepo reason so the skip is visible to `kubectl cox describe`
+	// (the I90 surface, the same condition preset none records at Job
+	// creation); the decision itself is unchanged — exit 0 already proceeded
+	// to the acceptance checks (see the SPOOF LIMIT on canaryGateDecision).
+	// The skip rides on the decision (canarySkipped), per call, so a retried
+	// Job whose canary did not skip cannot inherit a stale skip from a
+	// previous attempt's reconcile.
+	if canarySkipped {
+		setCondition(loop, CanarySkippedCondition, metav1.ConditionTrue,
+			NoTestsInRepoReason,
+			"the verify canary was skipped: the repository has no *_test.go at the base or verified commit; the acceptance checks ran without the Go negative control")
+	}
 	// B5a: bumpVerifyResult is called for every verify outcome decision.
 	bumpVerifyResult(outcome)
 	switch outcome {
@@ -2029,17 +2164,22 @@ func (r *LoopReconciler) applyVerifyOutcome(ctx context.Context, loop *coxv1alph
 		// created (a re-run would import the same subverted commit).
 		// F60-lint: the case body moved verbatim to applyVerifySubverted.
 		return r.applyVerifySubverted(loop)
+	case verifyTestsRemoved:
+		// F94a: the canary exited 46 — HEAD has no *_test.go and the base
+		// commit HAD tests: the agent removed every test. Terminal, like
+		// SubvertedVerify: the agent's own commit made the evidence dishonest,
+		// so no acceptance check is trustworthy. Fail the Loop with the
+		// distinct TestsRemoved reason; no new verify Job is created (a re-run
+		// would import the same pin).
+		return r.applyVerifyTestsRemoved(loop)
 	case verifyCanaryUnavailable:
-		// F60: the canary exited 44 — the target package has no *_test.go
-		// (nothing to canary). NO decision on the agent's work: the Loop stays
-		// Verifying (requeue), and the operator records a VerifyCanaryUnavailable
-		// Warning event exactly ONCE (idempotent — gated on a one-shot
-		// annotation so it does not repeat every reconcile). The Loop is held at
-		// Verifying until the next pin re-creates a fresh verify Job (the
-		// requeue keeps it alive); a Loop with no testable package is a
-		// configuration smell the user sees via the event, not a verdict.
-		// F60-lint: the case body moved verbatim to applyVerifyCanaryUnavailable.
-		return r.applyVerifyCanaryUnavailable(loop)
+		// F94c: the canary exited 44 — unavailable (no go toolchain, every
+		// package skipped, or the base tree unreadable). It is an INFRA
+		// failure: the bounded-retry path (status.verify.infraAttempts, the
+		// verifyInfraRetries cap, then Failed:VerifyInfraFailed) — a permanent
+		// 44 ends in Failed after the bound instead of holding Verifying
+		// forever.
+		return r.applyVerifyInfraFailure(ctx, loop, pod, job, failedCheck, checkExitCode, deadlineExceeded)
 	}
 	return false, false
 }
@@ -2052,12 +2192,12 @@ func bumpVerifyResult(outcome int) {
 	switch outcome {
 	case verifySucceeded:
 		verifyResultsTotal.WithLabelValues("pass").Inc()
-	case verifyIterate, verifyTampered, verifyNotDescendant, verifySubverted:
+	case verifyIterate, verifyTampered, verifyNotDescendant, verifySubverted, verifyTestsRemoved:
 		verifyResultsTotal.WithLabelValues("fail").Inc()
 	case verifyInfraFailed:
 		verifyResultsTotal.WithLabelValues("infra").Inc()
-		// verifyCanaryUnavailable: no decision (the Loop stays Verifying) — it is
-		// not a pass/fail/infra verdict, so it does not enter the pass-rate ratio.
+		// verifyCanaryUnavailable is an infra failure (F94c: bounded retry,
+		// then Failed) — it enters the ratio via verifyInfraFailed.
 	}
 }
 

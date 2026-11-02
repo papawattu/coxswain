@@ -917,21 +917,19 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	condsBefore := make([]metav1.Condition, len(loop.Status.Conditions))
 	copy(condsBefore, loop.Status.Conditions)
 
-	// F84c: a terminal Loop is not held for its model proxy, and the clear must
-	// run before EVERY hold that can return early — including validateStep just
-	// below, which PERSISTS status while it holds (agentPoliciesValid /
+	// F84c + F56: the pre-hold condition surfaces (the f84cF56Surfaces helper
+	// keeps the Reconcile within the gocyclo budget). F84c: a terminal Loop is
+	// not held for its model proxy, and the clear must run before EVERY hold
+	// that can return early — including validateStep just below, which
+	// PERSISTS status while it holds (agentPoliciesValid /
 	// modelConfigInvalid both call Status().Update), and the restore/b2 and D30
 	// holds further down (sandboxSuspendedByGate reaches the D35a gate only
 	// after them, and a b2 hold skips the bootstrap and the gate entirely). The
 	// return value is not needed here: the snapshot above predates the clear.
-	_ = clearModelProxyHoldForTerminal(&loop)
-
 	// F56: say on the object whether the sandbox will actually run the runner,
 	// or the 'sleep infinity' stand-in because the operator has no
-	// --runner-image. Before F56 that fallback was silent (the Loop looked
-	// Running and never advanced). The helper keeps terminal Loops untouched and
-	// adds no branch here (Reconcile is at its gocyclo budget).
-	r.surfaceRunnerAvailable(&loop)
+	// --runner-image (the helper keeps terminal Loops untouched).
+	r.f84cF56Surfaces(&loop)
 
 	// C6a + D34: validate the referenced AgentPolicies and the
 	// endpointSecretRef + modelEndpoint pair (the validateStep helper keeps
@@ -1108,23 +1106,17 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// runs AFTER the proxy ensure (above) and AFTER applyBudgetStep's read
 	// (just above) — not in validateStep (a hold there would deadlock a new
 	// maxCost Loop with no reading yet: it would never get a proxy, so never
-	// a reading). While held it blocks the phase advance and any new
-	// sandbox/iteration: the claim reader below only runs at Verifying, the
-	// verify Job is only ensured at Verifying, and the sandbox was built and
-	// (if running) suspended by the gate BEFORE it, in this same reconcile. The
-	// proxy and the usage read kept running while held, so the recovered
-	// reading releases the hold on the next pass (no restart, no manual resume).
-	// A held pass runs the trailing status write (finalizeLoopStatus) so the
-	// BudgetHold condition is persisted, then returns budgetHoldRequeue instead
-	// of the trailing requeue.
-	if r.applyBudgetHoldGate(ctx, &loop) {
-		// D77: the held pass persists via the trailing status write
-		// (finalizeLoopStatus) before it returns budgetHoldRequeue — the hold is
-		// not left in memory only.
-		if err := r.finalizeLoopStatus(ctx, &loop, changed, conditionsChanged, resumeCleared, deliverKeep, advancedFrom); err != nil {
-			return ctrl.Result{}, err
-		}
-		return ctrl.Result{RequeueAfter: budgetHoldRequeue}, nil
+	// a reading). The budget-hold helper (d77BudgetHold) keeps Reconcile
+	// within the gocyclo budget: while held it blocks the phase advance and
+	// any new sandbox/iteration (the gate sits after the sandbox ensure and
+	// the suspend), and the held pass persists via the trailing status write
+	// (finalizeLoopStatus) before it returns budgetHoldRequeue — the hold is
+	// not left in memory only. The proxy and the usage read keep running while
+	// held, so the recovered reading releases the hold on the next pass (no
+	// restart, no manual resume). A non-held pass returns ok so Reconcile
+	// falls through to the shared trailing status write below.
+	if done, d77Err := r.d77BudgetHold(ctx, &loop, changed, conditionsChanged, resumeCleared, deliverKeep, advancedFrom); d77Err != nil || done {
+		return ctrl.Result{RequeueAfter: budgetHoldRequeue}, d77Err
 	}
 
 	// I52: the trailing status write + the end-of-reconcile annotation PATCH
@@ -1145,8 +1137,17 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// return, AFTER the shared Status().Update). A completed restore is
 	// one-shot (the Restore condition True/Restored is the marker — no
 	// requeue).
+	return r.reconcileFinal(ctx, &loop, changed, conditionsChanged, resumeCleared, deliverKeep, advancedFrom, b2Requeue, baseCommitPending, claimReadPending, verifyRequeue, deliverRequeue, budgetRequeue, memoryRequeue, kaptCRDMissing)
+}
+
+// reconcileFinal is the shared end-of-reconcile step (the I52 final return).
+// It ORs the B2 restore step's requeue (b2Requeue) into the verify requeue,
+// runs the trailing status write (finalizeLoopStatus), and returns the shared
+// requeue decision. Extracted to keep the top-level reconcile within the
+// gocyclo budget.
+func (r *LoopReconciler) reconcileFinal(ctx context.Context, loop *coxv1alpha1.Loop, changed, conditionsChanged, resumeCleared, deliverKeep bool, advancedFrom coxv1alpha1.LoopPhase, b2Requeue, baseCommitPending, claimReadPending, verifyRequeue, deliverRequeue bool, budgetRequeue, memoryRequeue time.Duration, kaptCRDMissing bool) (ctrl.Result, error) {
 	verifyRequeue = verifyRequeue || b2Requeue
-	if err := r.finalizeLoopStatus(ctx, &loop, changed, conditionsChanged, resumeCleared, deliverKeep, advancedFrom); err != nil {
+	if err := r.finalizeLoopStatus(ctx, loop, changed, conditionsChanged, resumeCleared, deliverKeep, advancedFrom); err != nil {
 		return ctrl.Result{}, err
 	}
 	return r.reconcileRequeueAfter(r.baseCommitSeeded, baseCommitPending, claimReadPending, verifyRequeue, deliverRequeue, budgetRequeue, memoryRequeue, f92HeldRequeue(kaptCRDMissing, loop.Status.Phase)), nil
@@ -1162,6 +1163,29 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 // defeat optimistic concurrency (it can silently overwrite status another
 // writer just set). Extracted so the top-level reconcile stays within the
 // gocyclo budget.
+
+// f84cF56Surfaces runs the F84c terminal model-proxy-hold clear and the F56
+// runner-available surface on the Loop in place. Extracted to keep the
+// top-level reconcile within the gocyclo budget; both calls are pure in-place
+// condition writes (no API, no state beyond the Loop).
+func (r *LoopReconciler) f84cF56Surfaces(loop *coxv1alpha1.Loop) {
+	_ = clearModelProxyHoldForTerminal(loop)
+	r.surfaceRunnerAvailable(loop)
+}
+
+// d77BudgetHold is the D77 budget-hold gate step (maxCost + a stale reading
+// -> hold). It runs the gate (applyBudgetHoldGate) and, on a held pass, runs
+// the trailing status write (finalizeLoopStatus) so the BudgetHold condition
+// is persisted, then returns (true, err) so Reconcile returns
+// budgetHoldRequeue instead of the shared trailing requeue. A non-held pass
+// returns (false, nil) and Reconcile falls through to the shared finalize
+// below. Extracted to keep the top-level reconcile within the gocyclo budget.
+func (r *LoopReconciler) d77BudgetHold(ctx context.Context, loop *coxv1alpha1.Loop, changed, conditionsChanged, resumeCleared, deliverKeep bool, advancedFrom coxv1alpha1.LoopPhase) (bool, error) {
+	if !r.applyBudgetHoldGate(ctx, loop) {
+		return false, nil
+	}
+	return true, r.finalizeLoopStatus(ctx, loop, changed, conditionsChanged, resumeCleared, deliverKeep, advancedFrom)
+}
 
 // finalizeLoopStatus persists the reconcile's status changes (the trailing
 // Status().Update), and — when a phase advance was committed this pass

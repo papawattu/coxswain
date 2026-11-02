@@ -36,9 +36,9 @@ import (
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
+	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -131,7 +131,7 @@ var _ = Describe("D77: budget-hold gate (maxCost + stale reading)", func() {
 		Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
 		_ = k8sClient.Create(ctx, &corev1.Service{
 			ObjectMeta: metav1.ObjectMeta{Name: egressProxyServiceName(loop.Name), Namespace: loop.Namespace},
-			Spec: corev1.ServiceSpec{ClusterIP: "None"},
+			Spec:       corev1.ServiceSpec{ClusterIP: "None"},
 		})
 	}
 
@@ -214,7 +214,7 @@ var _ = Describe("D77: budget-hold gate (maxCost + stale reading)", func() {
 		primeProxy(r, loop)
 		// The bootstrap reconcile may advance the Loop to Verifying (the
 		// claimless-Planning advance); parking at Planning is harmless — the
-			// D77 specs test the budget read + hold gate, not the verify outcome.
+		// D77 specs test the budget read + hold gate, not the verify outcome.
 		reconcile(r, ns, "d77-s1") // bootstrap to Planning
 		Expect(getLoop(ns, "d77-s1").Status.Phase).To(Equal(coxv1alpha1.LoopPhasePlanning))
 
@@ -234,7 +234,7 @@ var _ = Describe("D77: budget-hold gate (maxCost + stale reading)", func() {
 
 		By("3 consecutive failed reads (one per reconcile) -> BudgetReadingStale=True (F44) and BudgetHold=True")
 		failReads(r)
-		for i := 0; i < budgetReadFailureThreshold; i++ {
+		for range budgetReadFailureThreshold {
 			reconcile(r, ns, "d77-s1")
 		}
 		l = getLoop(ns, "d77-s1")
@@ -276,7 +276,7 @@ var _ = Describe("D77: budget-hold gate (maxCost + stale reading)", func() {
 		primeProxy(r, loop)
 		reconcile(r, ns, "d77-s2")
 		failReads(r)
-		for i := 0; i < budgetReadFailureThreshold; i++ {
+		for range budgetReadFailureThreshold {
 			reconcile(r, ns, "d77-s2")
 		}
 		l := getLoop(ns, "d77-s2")
@@ -315,7 +315,7 @@ var _ = Describe("D77: budget-hold gate (maxCost + stale reading)", func() {
 		primeProxy(r, loop)
 		reconcile(r, ns, "d77-s3")
 		failReads(r)
-		for i := 0; i < budgetReadFailureThreshold; i++ {
+		for range budgetReadFailureThreshold {
 			reconcile(r, ns, "d77-s3")
 		}
 		l := getLoop(ns, "d77-s3")
@@ -342,7 +342,7 @@ var _ = Describe("D77: budget-hold gate (maxCost + stale reading)", func() {
 		}
 
 		By("failures UNDER the threshold: not held (a starting proxy is not a stale reading)")
-		for i := 0; i < budgetReadFailureThreshold-1; i++ {
+		for range budgetReadFailureThreshold - 1 {
 			reconcile(r, ns, "d77-s4")
 			l := getLoop(ns, "d77-s4")
 			Expect(conditionTruePresent(l, coxv1alpha1.BudgetHoldCondition)).To(BeFalse(),
@@ -364,7 +364,7 @@ var _ = Describe("D77: budget-hold gate (maxCost + stale reading)", func() {
 	// reads) on the named Loop with the given reconciler.
 	reconcileStale := func(r *LoopReconciler, ns, name string) {
 		failReads(r)
-		for i := 0; i < budgetReadFailureThreshold+1; i++ {
+		for range budgetReadFailureThreshold + 1 {
 			reconcile(r, ns, name)
 		}
 	}
@@ -389,29 +389,25 @@ var _ = Describe("D77: budget-hold gate (maxCost + stale reading)", func() {
 		Expect(conditionTruePresent(l, coxv1alpha1.BudgetHoldCondition)).To(BeFalse(),
 			"the gate is inert in Paused: the decision is re-evaluated on resume (P2f; absent or False)")
 
-		By("P5f delivery hold: the gate is inert (it would lose the delivery result)")
-		ns2 := nsFor("d77-s5b")
-		defer deleteNS(ctx, ns2)
-		recorder2 := record.NewFakeRecorder(64)
-		r2 := newReconciler(recorder2)
-		loop2 := createLoop(ns2, "d77-s5b", nil)
-		primeProxy(r2, loop2)
-		reconcile(r2, ns2, "d77-s5b")
-		l = getLoop(ns2, "d77-s5b")
-		l.Status.Phase = coxv1alpha1.LoopPhaseVerifying
-		l.Status.DesiredPhase = coxv1alpha1.LoopPhaseVerifying
-		l.Status.Conditions = append(l.Status.Conditions, metav1.Condition{
-			Type: string(coxv1alpha1.LoopPhaseVerifying), Status: metav1.ConditionTrue,
-			Reason: coxv1alpha1.ReasonVerifyingDelivering, Message: "delivering", LastTransitionTime: metav1.Now(),
-		})
-		Expect(k8sClient.Status().Update(ctx, l)).To(Succeed())
-		reconcileStale(r2, ns2, "d77-s5b")
-		l = getLoop(ns2, "d77-s5b")
-		Expect(cond(l, coxv1alpha1.BudgetReadingStaleCondition).Status).To(Equal(metav1.ConditionTrue),
-			"the stale reading is still surfaced in the delivery hold")
-		Expect(loopHoldingForDelivery(l)).To(BeTrue(), "fixture: the P5f delivery hold is active")
-		Expect(conditionTruePresent(l, coxv1alpha1.BudgetHoldCondition)).To(BeFalse(),
-			"the gate is inert in the P5f delivery hold: it would lose the delivery result (absent or False)")
+		By("P5f delivery hold: the gate is inert (direct call — a full reconcile never reaches the gate in Verifying)")
+		r2 := newReconciler(record.NewFakeRecorder(64))
+		held := &coxv1alpha1.Loop{
+			Spec: coxv1alpha1.LoopSpec{
+				Budget: &coxv1alpha1.BudgetConfig{MaxCostUsd: "1.00"},
+			},
+			Status: coxv1alpha1.LoopStatus{
+				Phase: coxv1alpha1.LoopPhaseVerifying,
+				Conditions: []metav1.Condition{
+					{Type: string(coxv1alpha1.LoopPhaseVerifying), Status: metav1.ConditionTrue,
+						Reason: coxv1alpha1.ReasonVerifyingDelivering, Message: "delivering", LastTransitionTime: metav1.Now()},
+					{Type: string(coxv1alpha1.BudgetReadingStaleCondition), Status: metav1.ConditionTrue,
+						Message: "stale", LastTransitionTime: metav1.Now()},
+				},
+			},
+		}
+		Expect(loopHoldingForDelivery(held)).To(BeTrue(), "fixture: the P5f delivery hold is active")
+		Expect(r2.applyBudgetHoldGate(ctx, held)).To(BeFalse(), "the gate is inert in the P5f delivery hold")
+		Expect(conditionTruePresent(held, coxv1alpha1.BudgetHoldCondition)).To(BeFalse())
 
 		By("terminal phases (Succeeded): the gate is inert (a finished Loop is never held)")
 		ns3 := nsFor("d77-s5c")

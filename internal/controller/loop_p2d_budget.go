@@ -109,8 +109,8 @@ const (
 	budgetHoldEventReason = "BudgetHold"
 	budgetHoldRequeue     = 30 * time.Second
 	// budgetHoldReason* are the BudgetHold condition's stable reasons.
-	budgetHoldReasonStale  = "StaleReading"
-	budgetHoldReasonFresh  = "ReadingFresh"
+	budgetHoldReasonStale = "StaleReading"
+	budgetHoldReasonFresh = "ReadingFresh"
 	// budgetHoldMessage / budgetReleaseMessage are the STABLE condition
 	// messages (a message that changed every pass would re-stamp
 	// LastTransitionTime and cost a status write each reconcile — the same
@@ -329,7 +329,7 @@ func (r *LoopReconciler) applyBudgetHoldGate(ctx context.Context, loop *coxv1alp
 		r.Recorder.Eventf(loop, corev1.EventTypeWarning, budgetHoldEventReason,
 			"holding the Loop: the maxCost cap cannot be enforced without a fresh usage reading; the running sandbox is suspended and the phase advance and new iterations are blocked until the reading recovers")
 	}
-// Suspend the running sandbox (the agent spends model money; stopping it
+	// Suspend the running sandbox (the agent spends model money; stopping it
 	// is the point of a cost hold). The proxy is NOT touched: its read is the
 	// release, so it stays up while held.
 	if err := r.suspendSandboxIfRunning(ctx, loop); err != nil {

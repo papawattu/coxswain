@@ -1472,6 +1472,16 @@ const (
 	// (False/Ready) once the pod is Ready, and (False/NoEndpoint) when the Loop
 	// has no model endpoint. Surfacing only: the hold itself is unchanged.
 	ModelProxyNotReadyCondition = "ModelProxyNotReady"
+	// BudgetHoldCondition (D77, R30: owner chose (b) for maxCost / (a) for
+	// maxTokens) is True while a maxCost Loop's usage reading is stale
+	// (BudgetReadingStale == True, F44): the cost cap cannot be enforced
+	// without a fresh reading, and the owner's choice for maxCost is to HOLD
+	// (the phase advance and any new sandbox/iteration are blocked; a running
+	// sandbox is suspended) while the proxy and the usage read keep running
+	// so a recovered reading releases the hold automatically (False,
+	// reason ReadingFresh). maxTokens-only Loops are never held: for them a
+	// stale reading is surfaced only (F44).
+	BudgetHoldCondition = "BudgetHold"
 	// RunnerAvailableCondition (F56) reports whether the sandbox will actually
 	// run the operator's runner. It is False/RunnerImageUnset when neither
 	// --runner-image nor spec.agent.image is set: agentPodSpec then keeps the

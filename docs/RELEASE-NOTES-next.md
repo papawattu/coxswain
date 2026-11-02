@@ -332,6 +332,11 @@ override is yours to pin.
   `74c56f3` = PR #220). The F42 upgrade-fence note above (stale-cache gate
   read) is closed by this fix.
 
+
+### D77: a maxCost Loop holds on a stale usage reading, and releases on the next fresh one (R30)
+
+- **What changed.** A Loop with a `spec.budget.maxCostUsd` cap now HOLDS when its usage reading is stale (`BudgetReadingStale=True`, F44): the operator sets `BudgetHold=True` (reason `StaleReading`) and suspends the running sandbox — the maxCost cap cannot be enforced without a fresh reading, so the Loop waits instead of running on uncapped (owner choice (b) for maxCost). The model proxy stays up (its read is the release) and the usage read keeps being retried; the hold releases on its own on the next fresh reading (`BudgetHold=False` reason `ReadingFresh`, sandbox resumed) — no restart, no manual resume. The gate is inert in Paused, in the delivery hold, and in terminal phases. Loops with only `maxTokens` (or no budget cap) are unchanged: stale readings are still surfaced but never hold. UPGRADE (behaviour change; nothing to do — see "A maxCost Loop holds when its usage reading is stale (D77)") and a TROUBLESHOOTING entry for `BudgetHold=True` / `StaleReading` (check the model proxy pod and its usage endpoint) landed with it (this PR).
+
 ## Other changes
 
 ### I167: the samples kustomization's loop coverage is enforced, and `loop-d61-proof.yaml` is marked applied by path only — #372

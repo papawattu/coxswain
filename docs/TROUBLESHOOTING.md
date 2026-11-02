@@ -1365,3 +1365,46 @@ right one). A Loop that names no Secret is unaffected: it carries
 `SecretsUsable=True reason=NoSecrets` (the condition is always set, never
 absent). See `docs/OPERATOR.md` (Secret opt-in) and `docs/UPGRADE.md` (the
 D76/D102 section).
+
+## `BudgetHold=True` / `StaleReading` — the Loop holds on a stale usage reading (D77)
+
+**What you see:** a Loop with a `spec.budget.maxCostUsd` cap (a maxTokens-only
+Loop is never held this way) carries `BudgetHold=True` with reason
+`StaleReading` and `BudgetReadingStale=True` (F44), and its running sandbox is
+**suspended** (the sandbox pod's `status.conditions` shows `Suspended=True`,
+or `kubectl get sandbox` shows the sandbox pod stopping). The phase does not
+advance and no new iteration starts while held. A `UsageReadFailed` Warning
+Event names the failed read.
+
+**What it means:** the operator cannot read the per-Loop model proxy's usage
+endpoint (consecutive read failures past the F44 threshold set
+`BudgetReadingStale=True`), so it cannot enforce the maxCost cap from the
+reading. D77 (R30, owner choice (b) for maxCost): a maxCost Loop HOLDS while
+the reading is stale rather than running on uncapped — the agent spends model
+money, so the operator stops it. The proxy itself is left running (its read IS
+the release) and the usage read keeps being retried on every reconcile. The
+hold releases **on its own** on the next fresh reading: the operator sets
+`BudgetHold=False` (reason `ReadingFresh`) and resumes the sandbox — no
+restart, no manual resume. The gate is inert in Paused (the decision
+re-evaluates on resume), in the delivery hold, and in terminal phases.
+
+**What to do:** check the model proxy pod and its usage endpoint:
+
+```bash
+# the per-Loop proxy pod (the namespace is <loop-namespace>)
+kubectl -n <namespace> get pods -l coxswain.io/proxy-for=<loop-name>
+kubectl -n <namespace> logs <proxy-pod> --tail=50
+
+# the operator's read attempts (the UsageReadFailed reason)
+kubectl -n <namespace> get events --field-selector involvedObject.kind=Loop,involvedObject.name=<loop>,reason=UsageReadFailed
+
+# the condition (the hold and the stale reading surface)
+kubectl -n <namespace> get loop <loop-name> -o jsonpath='{.status.conditions[?(@.type=="BudgetHold")]}{"\n"}{.status.conditions[?(@.type=="BudgetReadingStale")]}{"\n"}'
+```
+
+A proxy that never comes up (image pull, crashloop, port) or an unreachable
+endpoint is the usual cause — fix the proxy and the reading recovers. While
+the reading stays stale the hold re-queues every 30s; once one read succeeds
+the hold clears on the next reconcile. See `docs/UPGRADE.md` (the "Upgrading
+from v0.1.2" section) for the behaviour change and the F44 stale-reading
+surfacing that the hold builds on.

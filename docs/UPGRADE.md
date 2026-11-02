@@ -242,6 +242,27 @@ this change, such a Loop could start before the proxy was ready and the
 init clone would fail. On upgrade, such a Loop may briefly be held
 `Suspended` if the proxy is not yet ready. There is nothing to do.
 
+### A maxCost Loop holds when its usage reading is stale (D77)
+
+A Loop with a `spec.budget.maxCostUsd` cap now **holds** when its usage
+reading is stale (`BudgetReadingStale=True`, F44: consecutive proxy
+usage-endpoint read failures past the threshold): the operator sets
+`BudgetHold=True` (reason `StaleReading`) and **suspends the running sandbox**
+— a maxCost cap cannot be enforced without a fresh reading, so the Loop
+waits instead of running on uncapped. The proxy stays up (its read is the
+release), and the hold **releases on its own** on the next fresh reading
+(`BudgetHold=False` reason `ReadingFresh`, sandbox resumed) — no restart, no
+manual resume. Loops with only `maxTokens` (or no budget cap) are **unchanged**:
+stale readings are still surfaced (`BudgetReadingStale=True`, the
+`UsageReadFailed` Event) but never hold.
+
+There is nothing to do; the hold is automatic and self-releasing. If a held
+Loop should not hold (e.g. the proxy is expected to be intermittently
+unreachable), fix the proxy and its usage endpoint — see
+`docs/TROUBLESHOOTING.md` (the `BudgetHold=True` / `StaleReading` entry).
+
+### Memory PVC binding is now visible (P5a)
+
 ### Memory PVC binding is now visible (P5a)
 
 While a Loop's new memory PVC is unbound (the class is not ReadWriteMany,

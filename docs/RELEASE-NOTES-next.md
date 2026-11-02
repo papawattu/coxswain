@@ -1,7 +1,7 @@
 # Release notes: changes since v0.1.2 (unreleased)
 
 For an operator upgrading from v0.1.2. All items are verified against the
-merged code on `main` (as of `ff6783c` = PR #380); each claim cites its
+merged code on `main` (as of `0f94222` = PR #382); each claim cites its
 merged PR and the squash commit it landed as.
 
 ## Upgrade
@@ -357,9 +357,9 @@ The Loop now holds `Succeeded` until the `Delivered` condition is terminal. Befo
   read) is closed by this fix.
 
 
-### D77: a maxCost Loop holds on a stale usage reading, and releases on the next fresh one (R30)
+### D77: a maxCost Loop holds on a stale usage reading, and releases on the next fresh one (R30) — #384
 
-- **What changed.** A Loop with a `spec.budget.maxCostUsd` cap now HOLDS when its usage reading is stale (`BudgetReadingStale=True`, F44): the operator sets `BudgetHold=True` (reason `StaleReading`) and suspends the running sandbox — the maxCost cap cannot be enforced without a fresh reading, so the Loop waits instead of running on uncapped (owner choice (b) for maxCost). The model proxy stays up (its read is the release) and the usage read keeps being retried; the hold releases on its own on the next fresh reading (`BudgetHold=False` reason `ReadingFresh`, sandbox resumed) — no restart, no manual resume. The gate is inert in Paused, in the delivery hold, and in terminal phases. Loops with only `maxTokens` (or no budget cap) are unchanged: stale readings are still surfaced but never hold. UPGRADE (behaviour change; nothing to do — see "A maxCost Loop holds when its usage reading is stale (D77)") and a TROUBLESHOOTING entry for `BudgetHold=True` / `StaleReading` (check the model proxy pod and its usage endpoint) landed with it (this PR).
+- **What changed.** A Loop with a `spec.budget.maxCostUsd` cap now HOLDS when its usage reading is stale (`BudgetReadingStale=True`, F44): the operator sets `BudgetHold=True` (reason `StaleReading`) and suspends the running sandbox — the maxCost cap cannot be enforced without a fresh reading, so the Loop waits instead of running on uncapped (owner choice (b) for maxCost). The model proxy stays up (its read is the release) and the usage read keeps being retried; the hold releases on its own on the next fresh reading (`BudgetHold=False` reason `ReadingFresh`, sandbox resumed) — no restart, no manual resume. The gate is inert in Paused, in the delivery hold, and in terminal phases. Loops with only `maxTokens` (or no budget cap) are unchanged: stale readings are still surfaced but never hold. UPGRADE (behaviour change; nothing to do — see "A maxCost Loop holds when its usage reading is stale (D77)") and a TROUBLESHOOTING entry for `BudgetHold=True` / `StaleReading` (check the model proxy pod and its usage endpoint) landed with it — #384 (`618bfba`).
 
 ### F16: the memory-writer Job's NetworkPolicy now denies all — #184
 
@@ -370,6 +370,12 @@ The memory-writer Job's NetworkPolicy carried one empty ingress rule and one emp
 The static write policy's credential-assignment rule (the one that drops a lesson containing `password=`, `token=`, and the like) only matched lower-case keys, so a lesson written with `PASSWORD=` or `ApiKey=` slipped through to the memory PVC. The rule is now case-insensitive, and two new rules cover credential assignment via the `Authorization` HTTP header and AWS secret keys. The screening runs in the memory-writer Job before a lesson is persisted, and on `cox memory import`. Nothing to do; existing memory files are not re-screened (a re-import screens them). — #187 (`669be17`)
 
 ## Other changes
+
+### F94: a repo with no tests no longer wedges `Verifying` — #383
+
+- **What was wrong.** A Go repo with no `*_test.go` made the verify canary exit 44 (`VerifyCanaryUnavailable`), which meant "no decision" with no bound, so the Loop held in `Verifying` forever.
+- **What changed.** Three outcomes, per the owner's 2026-11-01 decision (a)+(b)+(c). A verified commit that **removed** every test (the base commit had tests, the pin has none) fails the Loop terminally with reason `TestsRemoved`. A repo that **never** had tests proceeds to the acceptance checks with `CanarySkipped=True / NoTestsInRepo`, so the acceptance checks decide without the Go negative control. A canary that is genuinely unavailable (exit 44) is a bounded infrastructure retry (`VerifyInfraRetry` events, three runs in total) that ends `Failed` with reason `VerifyInfraFailed`. The base-commit read fails closed: a git error is "unavailable", never "the base had no tests".
+- **On upgrade.** Behaviour change, nothing to do (`docs/UPGRADE.md`, "Upgrading from v0.1.2"); Loops mid-`Verifying` pick it up on the next verify outcome read. `docs/TROUBLESHOOTING.md` has entries for `Failed: TestsRemoved` and `CanarySkipped=True / NoTestsInRepo` — #383 (`8c85890`).
 
 ### I167: the samples kustomization's loop coverage is enforced, and `loop-d61-proof.yaml` is marked applied by path only — #372
 
@@ -1015,17 +1021,23 @@ closed by the PRs named beside them. In plain words, the items still open:
   `SandboxNotStarting` forever and never reaches `Failed` (F93a; the
   unmountable-volume bound of F48b does not trip for an unschedulable pod —
   the cause is unknown, the evidence shows a 20h+ wedge with no decision).
-  Separately, the Sandbox template's BPF node affinity was not reconciled
-  when the operator's `--allow-unenforced` flag changed, so a recreated pod
-  kept the stale affinity (F93b; fixed by C2 #381 if merged before the tag).
+  With C2's `--loop-node-selector` set and no matching node, the model and
+  egress proxy pods are the first to go Pending: the Loop holds at
+  `Planning` with `ModelProxyNotReady=True`, no sandbox pod is created, and
+  the Loop never fails either. F93a (queued) bounds any unschedulable Loop
+  pod. Separately, the Sandbox template's BPF node affinity was not
+  reconciled when the operator's `--allow-unenforced` flag changed, so a
+  recreated pod kept the stale affinity (F93b; **fixed by C2** — #381
+  (`6e7b992`)).
 - **F94**: a Go repo with no `*_test.go` makes the verify canary exit 44
   (`VerifyCanaryUnavailable`), which means "no decision" — and with no bound,
   timeout or terminal path, the Loop holds in `Verifying` forever. A fix
   needs an owner decision on the base commit: had the base tests (agent
   deleted them → terminal) or not (skip the canary, decide on the
   acceptance checks, as #370 does), plus a bound so no state holds
-  `Verifying` forever. (Owner decision 2026-11-01: (a)+(b)+(c) accepted;
-  queued for b2 after F93a.)
+  `Verifying` forever. (Owner decision 2026-11-01: (a)+(b)+(c) accepted.)
+  **Fixed by #383** (`8c85890`): see "F94: a repo with no tests no longer
+  wedges `Verifying`" under Other changes.
 
 - **D85 / editor role**: a user bound to the Loop editor role can write
   the Loop's status subresource (the role grants `update` and `patch` on

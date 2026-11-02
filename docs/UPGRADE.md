@@ -263,8 +263,6 @@ unreachable), fix the proxy and its usage endpoint — see
 
 ### Memory PVC binding is now visible (P5a)
 
-### Memory PVC binding is now visible (P5a)
-
 While a Loop's new memory PVC is unbound (the class is not ReadWriteMany,
 or the provisioner has not created it yet), the Loop runs without memory —
 no lessons are seeded and nothing is written back. A Warning Event

@@ -1114,6 +1114,27 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 
 	conditionsChanged := !equality.Semantic.DeepEqual(condsBefore, loop.Status.Conditions)
 
+	// F93a: the unschedulable-Loop-pod bound. It runs BEFORE the budget step
+	// and the D77 budget-hold gate, because both return EARLY on their own
+	// paths (the hold returns budgetHoldRequeue before the shared trailing
+	// status write) and the F93a surface (the PodUnschedulable condition) and
+	// terminal failure (the Failed condition) must be persisted on the held
+	// pass too — the D77 gate's own finalizeLoopStatus call (the held pass)
+	// persists whatever this step just wrote, because it runs AFTER this
+	// point in the reconcile. The step is level-based (a pure function of
+	// the pod states + the clock annotation), so it is idempotent across the
+	// passes that run it. It is inert in Paused and in terminal phases.
+	// The step's requeue (while a pod is stuck, or while the bound's clock is
+	// running) is folded into verifyRequeue (the bool) so the shared
+	// reconcileRequeueAfter returns the short workRequeue (5s) on the stuck
+	// pass (the baseCommitSeeded carve-out: the verifyRequeue OR is the requeue
+	// the trailing return uses, and the trailing status write must run first
+	// anyway — the condition was just written in this pass).
+	if f93Changed := r.applyUnschedulableLoopPods(ctx, &loop); f93Changed {
+		changed = true
+		verifyRequeue = true
+	}
+
 	// P2d: the budget decision — the operator reads the proxy's usage endpoint
 	// (the readProxyUsage seam), folds the reading into status.budget (the
 	// boot-ID delta rules), accumulates the wall clock, and applies the caps

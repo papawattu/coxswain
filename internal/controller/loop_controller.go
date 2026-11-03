@@ -1202,13 +1202,6 @@ func (r *LoopReconciler) f84cF56Surfaces(loop *coxv1alpha1.Loop) {
 	r.surfaceRunnerAvailable(loop)
 }
 
-// d77BudgetHold is the D77 budget-hold gate step (maxCost + a stale reading
-// -> hold). It runs the gate (applyBudgetHoldGate) and, on a held pass, runs
-// the trailing status write (finalizeLoopStatus) so the BudgetHold condition
-// is persisted, then returns (true, err) so Reconcile returns
-// budgetHoldRequeue instead of the shared trailing requeue. A non-held pass
-// returns (false, nil) and Reconcile falls through to the shared finalize
-// below. Extracted to keep the top-level reconcile within the gocyclo budget.
 // f93aUnschedulableStep is the F93a unschedulable-Loop-pod bound step,
 // extracted from Reconcile to keep the top-level function within the gocyclo
 // budget. It runs the applyUnschedulableLoopPods decision and, on a true
@@ -1225,6 +1218,13 @@ func (r *LoopReconciler) f93aUnschedulableStep(ctx context.Context, loop *coxv1a
 	}
 }
 
+// d77BudgetHold is the D77 budget-hold gate step (maxCost + a stale reading
+// -> hold). It runs the gate (applyBudgetHoldGate) and, on a held pass, runs
+// the trailing status write (finalizeLoopStatus) so the BudgetHold condition
+// is persisted, then returns (true, err) so Reconcile returns
+// budgetHoldRequeue instead of the shared trailing requeue. A non-held pass
+// returns (false, nil) and Reconcile falls through to the shared finalize
+// below. Extracted to keep the top-level reconcile within the gocyclo budget.
 func (r *LoopReconciler) d77BudgetHold(ctx context.Context, loop *coxv1alpha1.Loop, changed, conditionsChanged, resumeCleared, deliverKeep bool, advancedFrom coxv1alpha1.LoopPhase) (bool, error) {
 	if !r.applyBudgetHoldGate(ctx, loop) {
 		return false, nil

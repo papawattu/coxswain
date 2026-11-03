@@ -264,36 +264,58 @@ func formatStuckPods(stuck []stuckPod) string {
 }
 
 // applyUnschedulableLoopPods is the F93a level-based decision (see the
-// package comment). It returns whether the Loop's status was mutated (the
-// caller ORs it into its own changed flag and, on a true return, also sets
-// its verifyRequeue bool to true so the shared reconcileRequeueAfter returns
-// the short workRequeue while the state is unschedulable — the bound is
-// re-checked every pass, and a node added or re-labelled resolves the state
-// well inside the bound). It never returns an error: a read error is logged
-// and the caller requeues (I49: no decision on a failed read — the caller
-// sets verifyRequeue too, so a read error also requeues), and the terminal
-// failure is written to the Loop's status in place (the caller persists it).
+// package comment). It returns true when the Loop's status or metadata was
+// mutated THIS pass (the condition was set or cleared, the annotation was
+// stamped or removed, or the terminal failure was written) — the caller ORs
+// it into its own changed flag and, on a true return, also sets its
+// verifyRequeue bool so the shared reconcileRequeueAfter returns the short
+// workRequeue (5s). A stuck pass with NO change (the condition was already
+// True with the same message, the annotation was already set) returns
+// false: no per-pass status write (the F84c discipline — the message is
+// fixed for a given stuck set, so a no-op write would cost a resourceVersion
+// bump and a 409 window for nothing). The requeue on a stuck-but-unchanged
+// pass is NOT this function's concern: the D35a gate (the proxy-pod hold)
+// or the verify step already sets verifyRequeue on the stuck pass, and the
+// bound is re-checked every pass the operator reconciles (the 5s requeue
+// from the D35a gate or the next watch event covers it). A read error is
+// no decision and no requeue of its own: the next watch event or the next
+// requeue re-runs this function (I49: a failed read is never a failure
+// decision; the condition, if set, stays as it was).
 //
-// It is inert (never fails, never sets the condition) while the Loop is
-// Paused (the owner can be fixing the node pool; a paused Loop's pods are
-// the owner's to manage) and in terminal phases (a Succeeded/Failed Loop's
-// leftover proxy pod — the C2 side effect the R46 addendum names — is not a
-// reason to fail the Loop a second time; the terminal clear is the F84c
-// class, clearModelProxyHoldForTerminal's precedent).
+// It is inert (never fails, never sets the condition) while the Loop is in
+// a terminal phase. On entry to Paused the clock annotation is REMOVED so
+// the bound measures a contiguous run while the Loop is unpaused: a Loop
+// paused for more than the bound (for example, while the owner fixes the
+// node pool) does not fail on its first pass after resume — the annotation
+// is re-stamped fresh on resume, and the bound starts ticking from that
+// moment.
 func (r *LoopReconciler) applyUnschedulableLoopPods(ctx context.Context, loop *coxv1alpha1.Loop) bool {
-	if loop.DeletionTimestamp != nil ||
-		loop.Status.Phase == coxv1alpha1.LoopPhasePaused ||
-		isTerminalPhase(loop.Status.Phase) {
+	if loop.DeletionTimestamp != nil || isTerminalPhase(loop.Status.Phase) {
+		return false
+	}
+	// On entry to Paused, remove the clock annotation (if present) so the
+	// bound measures a contiguous run while the Loop is unpaused. A Loop
+	// paused for more than the bound does not fail on resume: the annotation
+	// is re-stamped fresh on the first stuck pass after resume.
+	if loop.Status.Phase == coxv1alpha1.LoopPhasePaused {
+		if loop.Annotations[loopUnschedulableSinceAnnotation] != "" {
+			newRV := r.patchUnschedulableSinceAnnotation(ctx, loop, nil)
+			if newRV != "" {
+				loop.ResourceVersion = newRV
+				return true
+			}
+		}
 		return false
 	}
 	stuck, err := r.loopUnschedulablePods(ctx, loop)
 	if err != nil {
-		// I49: a failed read is no decision. The caller requeues (verifyRequeue
-		// is set on any true return; a read error returns false — the caller
-		// requeues via the next reconcile's own watch, and the bound's clock
-		// annotation (if set) keeps running). The condition (if set) stays as
-		// it was — it does not describe a pod state the operator can no longer
-		// read.
+		// I49: a failed read is no decision and no requeue of its own. The
+		// condition (if set) stays as it was — it does not describe a pod
+		// state the operator can no longer read. The next watch event or the
+		// next requeue re-runs this function; the bound's clock annotation
+		// (if set) keeps running in the meantime (the operator does not
+		// remove it on a read error — the bound is a safety valve, and a
+		// transient read error must not reset the clock).
 		logf.FromContext(ctx).Error(err, "F93a unschedulable-pod read failed; no decision", "loop", loop.Name)
 		return false
 	}
@@ -326,7 +348,13 @@ func (r *LoopReconciler) applyUnschedulableLoopPods(ctx context.Context, loop *c
 	// At least one Loop pod is unschedulable: surface it (the condition is
 	// True with every stuck pod named + the scheduler's message; one Warning
 	// Event on the transition to True — the message is FIXED for a given
-	// stuck set, so no per-pass status write; the F84c discipline).
+	// stuck set, so a no-op write is skipped by the DeepEqual check in
+	// finalizeLoopStatus; the F84c discipline).
+	// changed tracks whether THIS pass mutated the condition or the
+	// annotation: a stuck pass with no change returns false (no per-pass
+	// status write — the D35a gate or the verify step's requeue covers the
+	// bound's re-check).
+	changed := false
 	msg := fmt.Sprintf("Loop pod(s) unschedulable: %s; the bound is %s — check the node pool and the placement flags (--loop-node-selector / --loop-tolerations)",
 		formatStuckPods(stuck), unschedulableLoopPodsBound)
 	wasTrue := conditionTruePresent(loop, unschedulableLoopPodsCondition)
@@ -334,6 +362,15 @@ func (r *LoopReconciler) applyUnschedulableLoopPods(ctx context.Context, loop *c
 		unschedulableReasonUnschedulable, msg)
 	if !wasTrue && r.Recorder != nil {
 		r.Recorder.Eventf(loop, corev1.EventTypeWarning, unschedulableEventReason, "%s", msg)
+	}
+	// The condition was set this pass (it was not True before, or the
+	// message changed — setCondition updates LastTransitionTime on a
+	// status/message change, which the DeepEqual check in
+	// finalizeLoopStatus picks up as a change). Track it so the function
+	// returns true on the transition pass and the trailing status write
+	// persists the condition.
+	if !wasTrue {
+		changed = true
 	}
 
 	// Start (or keep) the bound's clock. The annotation is stamped on the
@@ -360,6 +397,7 @@ func (r *LoopReconciler) applyUnschedulableLoopPods(ctx context.Context, loop *c
 			// the phase change). No conflict: the status write's base is
 			// CURRENT.
 			loop.ResourceVersion = newRV
+			changed = true
 		}
 	}
 
@@ -372,7 +410,7 @@ func (r *LoopReconciler) applyUnschedulableLoopPods(ctx context.Context, loop *c
 		r.operatorNow().Sub(since.Time) >= unschedulableLoopPodsBound {
 		return r.failLoopUnschedulable(loop, stuck)
 	}
-	return true
+	return changed
 }
 
 // loopUnschedulableSince is the RFC3339 value the clock annotation carries
@@ -383,8 +421,10 @@ func (r *LoopReconciler) loopUnschedulableSince() string {
 }
 
 // patchUnschedulableSinceAnnotation stamps (or, when value is nil, removes)
-// the bound's clock annotation on the Loop's metadata. It returns true when
-// the patch did NOT land (the caller requeues; never a controller error —
+// the bound's clock annotation on the Loop's metadata. It returns the new
+// resourceVersion on success (the caller applies it to the in-memory loop so
+// the trailing status write does not conflict) or "" on failure (the caller
+// requeues via the next watch event or requeue; never a controller error —
 // the bound is a safety valve and a failed patch must not wedge the
 // reconcile the way a failed delete of the sandbox-for-retry does).
 //

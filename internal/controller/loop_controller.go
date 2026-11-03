@@ -1204,17 +1204,25 @@ func (r *LoopReconciler) f84cF56Surfaces(loop *coxv1alpha1.Loop) {
 
 // f93aUnschedulableStep is the F93a unschedulable-Loop-pod bound step,
 // extracted from Reconcile to keep the top-level function within the gocyclo
-// budget. It runs the applyUnschedulableLoopPods decision and, on a true
-// return, ORs the result into the caller's changed and verifyRequeue flags
-// (the changed flag ensures the trailing status write persists the F93a
-// condition; the verifyRequeue flag ensures the shared reconcileRequeueAfter
-// returns the short workRequeue (5s) on the stuck pass). It runs before the
-// budget step and the D77 budget-hold gate so the surface + terminal failure
-// persist on the held pass too.
+// budget. It runs the applyUnschedulableLoopPods decision and, on changed,
+// ORs into the caller's changed flag (the trailing status write persists the
+// F93a condition). On stuck, it sets the caller's verifyRequeue flag (the
+// shared reconcileRequeueAfter returns the short workRequeue (5s)) so the
+// bound is re-checked on EVERY stuck pass — including stuck-but-unchanged
+// passes where the condition is already True with the same message. A stuck
+// sandbox pod with ready proxies gets no more watch events (a Pending pod
+// is not re-scheduled once rejected), so without this requeue the 10m bound
+// may never be re-checked. It runs before the budget step and the D77
+// budget-hold gate so the surface + terminal failure persist on the held
+// pass too.
 func (r *LoopReconciler) f93aUnschedulableStep(ctx context.Context, loop *coxv1alpha1.Loop, changed, verifyRequeue *bool) {
-	if f93Changed := r.applyUnschedulableLoopPods(ctx, loop); f93Changed {
-		*changed = true
-		*verifyRequeue = true
+	if f93Changed, f93Stuck := r.applyUnschedulableLoopPods(ctx, loop); f93Changed || f93Stuck {
+		if f93Changed {
+			*changed = true
+		}
+		if f93Stuck {
+			*verifyRequeue = true
+		}
 	}
 }
 

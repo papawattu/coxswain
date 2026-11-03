@@ -41,6 +41,7 @@ import (
 	"k8s.io/client-go/tools/record"
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
 )
@@ -138,6 +139,31 @@ var _ = Describe("F93a: the unschedulable Loop pod is bounded", func() {
 		pod.Status.Conditions = append(pod.Status.Conditions, corev1.PodCondition{
 			Type: corev1.PodScheduled, Status: corev1.ConditionFalse,
 			Reason: corev1.PodReasonUnschedulable, Message: msg,
+			LastTransitionTime: metav1.Now(),
+		})
+		Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+	}
+
+	// setScheduledFalse marks the named pod with PodScheduled=False and the
+	// given reason (the spec uses this for M1: a pod the scheduler rejected
+	// with a NON-Unschedulable reason, which the F93a read must not count).
+	setScheduledFalse := func(name, nsName, reason, msg string) {
+		pod := &corev1.Pod{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: nsName}, pod)).To(Succeed())
+		for i := range pod.Status.Conditions {
+			c := &pod.Status.Conditions[i]
+			if c.Type == corev1.PodScheduled {
+				c.Status = corev1.ConditionFalse
+				c.Reason = reason
+				c.Message = msg
+				c.LastTransitionTime = metav1.Now()
+				Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+				return
+			}
+		}
+		pod.Status.Conditions = append(pod.Status.Conditions, corev1.PodCondition{
+			Type: corev1.PodScheduled, Status: corev1.ConditionFalse,
+			Reason: reason, Message: msg,
 			LastTransitionTime: metav1.Now(),
 		})
 		Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
@@ -286,16 +312,30 @@ var _ = Describe("F93a: the unschedulable Loop pod is bounded", func() {
 		Expect(loop2.Status.Phase).NotTo(Equal(coxv1alpha1.LoopPhaseFailed),
 			"the Loop is not failed while within the bound")
 
+		By("a second stuck pass (nothing changed) requeues (the P2 fix: the bound is re-checked on every stuck pass)")
+		rvBefore := loop2.ResourceVersion
+		res, err := r.Reconcile(ctx, ctrl.Request{
+			NamespacedName: types.NamespacedName{Name: name, Namespace: ns},
+		})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(res.RequeueAfter).To(BeNumerically(">", 0),
+			"the stuck-but-unchanged pass requeues (the 10m bound must be re-checked; a Pending pod gets no more watch events)")
+		// The Loop's resourceVersion is unchanged (no status write on a
+		// stuck-but-unchanged pass — the F84c discipline).
+		loop3 := f93aGetLoop(name)
+		Expect(loop3.ResourceVersion).To(Equal(rvBefore),
+			"no status write on a stuck-but-unchanged pass (the F84c discipline)")
+
 		By("the clock advances past the bound: the Loop fails with the PodUnschedulable reason")
 		clock = clock.Add(unschedulableLoopPodsBound + time.Second)
 		reconcile(r, name)
-		loop3 := f93aGetLoop(name)
-		Expect(loop3.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseFailed),
+		loop4 := f93aGetLoop(name)
+		Expect(loop4.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseFailed),
 			"the Loop is Failed past the bound (the F48b bound does not trip on a FailedScheduling pod — F93a does)")
 		var failedCond *metav1.Condition
-		for i := range loop3.Status.Conditions {
-			if loop3.Status.Conditions[i].Type == string(coxv1alpha1.LoopPhaseFailed) {
-				failedCond = &loop3.Status.Conditions[i]
+		for i := range loop4.Status.Conditions {
+			if loop4.Status.Conditions[i].Type == string(coxv1alpha1.LoopPhaseFailed) {
+				failedCond = &loop4.Status.Conditions[i]
 			}
 		}
 		Expect(failedCond).NotTo(BeNil())
@@ -349,8 +389,8 @@ var _ = Describe("F93a: the unschedulable Loop pod is bounded", func() {
 			"the clock annotation is removed (the bound's clock resets)")
 	})
 
-	// M5b: M5 — the Warning Event fires exactly once (on the transition to
-	// True, not on every stuck pass). A FakeRecorder captures the events.
+	// M5 — the Warning Event fires exactly once (on the transition to True,
+	// not on every stuck pass). A FakeRecorder captures the events.
 	It("M5: the Warning Event fires exactly once on the stuck transition, not on every pass", func() {
 		clock := time.Now()
 		name := "f93a-ev1"
@@ -368,61 +408,44 @@ var _ = Describe("F93a: the unschedulable Loop pod is bounded", func() {
 		reconcile(r, name)
 		loop := f93aGetLoop(name)
 		Expect(conditionTruePresent(loop, unschedulableLoopPodsCondition)).To(BeTrue())
-		// Drain the recorder buffer: exactly one PodUnschedulable event.
+		// Drain the recorder buffer fully: exactly one PodUnschedulable event.
 		var stuckEvents []string
-		for range 64 {
+	drain1:
+		for {
 			select {
 			case ev := <-rec.Events:
-				if ev != "" {
+				if strings.Contains(ev, unschedulableEventReason) {
 					stuckEvents = append(stuckEvents, ev)
 				}
 			default:
-				goto done
+				break drain1
 			}
 		}
-	done:
-		var matching []string
-		for _, ev := range stuckEvents {
-			if strings.Contains(ev, unschedulableEventReason) {
-				matching = append(matching, ev)
-			}
-		}
-		Expect(matching).To(HaveLen(1),
+		Expect(stuckEvents).To(HaveLen(1),
 			"exactly one PodUnschedulable Warning Event on the transition to True")
 
 		By("a second stuck pass (same stuck set) does NOT fire another event")
 		reconcile(r, name)
-		// Drain again: no new events.
-		select {
-		case ev := <-rec.Events:
-			// The buffer may still have the first event (if not fully drained
-			// above); but no NEW PodUnschedulable event should appear.
-			if strings.Contains(ev, unschedulableEventReason) {
-				// Drain everything and count.
-				count := 1
-				for {
-					select {
-					case ev2 := <-rec.Events:
-						if strings.Contains(ev2, unschedulableEventReason) {
-							count++
-						}
-					default:
-						goto done2
-					}
+		// Drain the channel fully and count PodUnschedulable events: must be 0.
+		var secondPassEvents []string
+	drain2:
+		for {
+			select {
+			case ev := <-rec.Events:
+				if strings.Contains(ev, unschedulableEventReason) {
+					secondPassEvents = append(secondPassEvents, ev)
 				}
-			done2:
-				Expect(count).To(Equal(1),
-					"still only one PodUnschedulable event after the second stuck pass")
-				return
+			default:
+				break drain2
 			}
-		default:
-			// Buffer is empty: zero events on the second pass. Correct.
 		}
-		_ = rec
+		Expect(secondPassEvents).To(BeEmpty(),
+			"no PodUnschedulable Warning Event on the second stuck pass (the event fires once, on the transition)")
 	})
 
-	// M5b: M1 — a Pending pod that is NOT unschedulable (no PodScheduled
-	// condition, or PodScheduled=True) is not counted by the F93a read.
+	// M1 — a Pending pod that is NOT unschedulable (no PodScheduled
+	// condition, or PodScheduled=True, or PodScheduled=False with a
+	// NON-Unschedulable reason) is not counted by the F93a read.
 	It("M1: a Pending pod that is NOT unschedulable is not counted by the F93a read", func() {
 		clock := time.Now()
 		name := "f93a-m1"
@@ -457,9 +480,18 @@ var _ = Describe("F93a: the unschedulable Loop pod is bounded", func() {
 		loop = f93aGetLoop(name)
 		Expect(conditionTruePresent(loop, unschedulableLoopPodsCondition)).To(BeFalse(),
 			"a Pending pod with PodScheduled=True is NOT unschedulable (M1)")
+
+		By("the pod has PodScheduled=False with Reason=SchedulingGated (not Unschedulable): still not counted (M1 discriminator)")
+		setScheduledFalse(proxyPodNameFor(name), ns, "SchedulingGated", "pod is gated by a scheduling gate")
+		reconcile(r, name)
+		loop = f93aGetLoop(name)
+		Expect(conditionTruePresent(loop, unschedulableLoopPodsCondition)).To(BeFalse(),
+			"a pod with PodScheduled=False Reason=SchedulingGated is NOT unschedulable (M1: only Reason=Unschedulable counts)")
+		Expect(loop.Annotations[loopUnschedulableSinceAnnotation]).To(BeEmpty(),
+			"the clock annotation is not stamped for a SchedulingGated pod (M1)")
 	})
 
-	// M5b: M2 — the F93a bound is inert while the Loop is Paused. The clock
+	// M2 — the F93a bound is inert while the Loop is Paused. The clock
 	// annotation is removed on entry to Paused so the bound measures a
 	// contiguous run while the Loop is unpaused.
 	It("M2: a Paused Loop's clock is reset (the annotation is removed on pause)", func() {
@@ -510,21 +542,24 @@ var _ = Describe("F93a: the unschedulable Loop pod is bounded", func() {
 			"the Loop is not failed: the bound's clock restarted on resume (M2)")
 	})
 
-	// M5b: M4 — a foreign pod (not owned by the Loop) that is unschedulable
-	// is ignored by the F93a read.
+	// M4 — a foreign pod (not owned by the Loop) that is unschedulable
+	// is ignored by the F93a read. The spec calls loopUnschedulablePods
+	// directly (no reconcile) so the operator's own proxy pod does NOT
+	// exist; the only pod with the proxy's name is the foreign one.
 	It("M4: a foreign pod that is unschedulable is not counted by the F93a read", func() {
 		clock := time.Now()
 		name := "f93a-m4"
 		r := f93aReconciler(&clock)
+		// Create the Loop but do NOT reconcile it: no operator-created pods
+		// exist. The only pod with the proxy's name is the foreign pod the
+		// spec creates.
 		f93aModelLoop(name)
-		reconcile(r, name)
 
-		By("a foreign pod (no owner references) with the same name as the proxy pod is unschedulable")
-		// Create a foreign pod that is NOT owned by the Loop. It has a
-		// different name so it doesn't collide with the operator's proxy pod.
+		By("a bare pod named proxyPodName(name) with NO ownerReferences is created and unschedulable")
+		proxyName := proxyPodNameFor(name)
 		foreignPod := &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:      "foreign-unschedulable",
+				Name:      proxyName,
 				Namespace: ns,
 			},
 			Spec: corev1.PodSpec{
@@ -533,23 +568,82 @@ var _ = Describe("F93a: the unschedulable Loop pod is bounded", func() {
 			Status: corev1.PodStatus{Phase: corev1.PodPending},
 		}
 		Expect(k8sClient.Create(ctx, foreignPod)).To(Succeed())
-		setUnschedulable("foreign-unschedulable", ns, "0/3 nodes are available")
+		setUnschedulable(proxyName, ns, "0/3 nodes are available")
 
-		By("the model proxy pod is also created by the operator and is schedulable (PodScheduled=True)")
+		By("loopUnschedulablePods returns empty (the pod is not Loop-owned)")
+		stuck, err := r.loopUnschedulablePods(ctx, f93aGetLoop(name))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(stuck).To(BeEmpty(),
+			"a pod with the proxy's name but no ownerReferences is not counted (M4: IsControlledBy check)")
+
+		By("positive control: the same pod with a controller ownerReference to the Loop IS counted")
+		loop := f93aGetLoop(name)
+		// Re-read the pod (setUnschedulable bumped the resourceVersion):
+		// the Update below must not conflict.
+		freshPod := &corev1.Pod{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: proxyName, Namespace: ns}, freshPod)).To(Succeed())
+		Expect(controllerutil.SetControllerReference(loop, freshPod, k8sClient.Scheme())).To(Succeed())
+		Expect(k8sClient.Update(ctx, freshPod)).To(Succeed())
+		stuck2, err2 := r.loopUnschedulablePods(ctx, f93aGetLoop(name))
+		Expect(err2).NotTo(HaveOccurred())
+		Expect(stuck2).To(HaveLen(1),
+			"the same pod WITH a controller ownerReference to the Loop IS counted (positive control)")
+		Expect(stuck2[0].name).To(Equal(proxyName))
+	})
+
+	// M3 — the egress proxy pod is bounded. A Loop with an external repo
+	// (which creates the egress proxy) has its egress pod wedged.
+	It("M3: the egress proxy pod is surfaced and bounded", func() {
+		clock := time.Now()
+		name := "f93a-m3"
+		r := f93aReconciler(&clock)
+		// A Loop with an external repo (the shape that creates the egress
+		// proxy) and no endpoint (no model proxy — the egress proxy is the
+		// only proxy). The workspace repo is external (git-clone requires
+		// the egress proxy).
+		loop := &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec: coxv1alpha1.LoopSpec{
+				Goal:      loopGoal,
+				Workspace: coxv1alpha1.Workspace{Repo: githubRepoURL, Ref: loopRef},
+				Agent:     coxv1alpha1.AgentConfig{Image: runnerImage, Model: testModel},
+			},
+		}
+		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
+		reconcile(r, name)
+
+		By("the egress proxy pod exists")
+		egressName := egressProxyPodName(name)
 		pod := &corev1.Pod{}
 		Eventually(func() error {
-			return k8sClient.Get(ctx, types.NamespacedName{Name: proxyPodNameFor(name), Namespace: ns}, pod)
+			return k8sClient.Get(ctx, types.NamespacedName{Name: egressName, Namespace: ns}, pod)
 		}, "10s").Should(Succeed())
-		// The operator's own proxy pod has no scheduler verdict in envtest.
-		// F93a must not see the foreign pod (which it can't anyway because
-		// it has a different name), but the spec also asserts that an
-		// unschedulable pod that is NOT owned by the Loop does not trigger
-		// the condition even when it has the right name shape.
+
+		By("the scheduler marks the egress proxy pod unschedulable")
+		setUnschedulable(egressName, ns, "0/3 nodes are available: 3 node(s) didn't match Pod's node affinity/selector")
 		reconcile(r, name)
-		loop := f93aGetLoop(name)
-		Expect(conditionTruePresent(loop, unschedulableLoopPodsCondition)).To(BeFalse(),
-			"a foreign unschedulable pod does not trigger F93a (M4)")
-		Expect(loop.Annotations[loopUnschedulableSinceAnnotation]).To(BeEmpty())
+		loop2 := f93aGetLoop(name)
+		Expect(conditionTruePresent(loop2, unschedulableLoopPodsCondition)).To(BeTrue(),
+			"the PodUnschedulable condition is True for the unschedulable egress proxy pod (M3)")
+		Expect(loop2.Annotations[loopUnschedulableSinceAnnotation]).ToNot(BeEmpty(),
+			"the clock annotation is stamped (M3)")
+		// The condition message names the egress proxy pod.
+		var stuckCond *metav1.Condition
+		for i := range loop2.Status.Conditions {
+			if loop2.Status.Conditions[i].Type == unschedulableLoopPodsCondition {
+				stuckCond = &loop2.Status.Conditions[i]
+			}
+		}
+		Expect(stuckCond).NotTo(BeNil())
+		Expect(stuckCond.Message).To(ContainSubstring(egressName),
+			"the condition message names the stuck egress proxy pod (M3)")
+
+		By("the clock advances past the bound: the Loop fails")
+		clock = clock.Add(unschedulableLoopPodsBound + time.Second)
+		reconcile(r, name)
+		loop3 := f93aGetLoop(name)
+		Expect(loop3.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseFailed),
+			"the Loop is Failed past the bound for the unschedulable egress proxy (M3)")
 	})
 })
 

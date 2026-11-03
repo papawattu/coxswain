@@ -64,7 +64,7 @@ override is yours to pin.
 ### C2: pinning Loops to a node pool — operator flags `--loop-node-selector` and `--loop-tolerations` — #381
 
 - **What changed.** Two operator flags pin every operator-owned Loop workload (the sandbox, the model/egress/tool proxy pods, and the verify, deliver and memory-writer Jobs) to a dedicated node pool (C2/D101): `--loop-node-selector key=value[,key=value]` and `--loop-tolerations key:op:effect[:value[:seconds]]` (op `Equal` or `Exists`; `Exists` takes no value, and a seconds-only Exists token keeps the value slot empty: `key:Exists:NoExecute::30`). Empty (the default) means no placement — today's behaviour. A malformed token is a STARTUP error that names the bad token, never a silent drop. `kubectl label node <n> coxswain.io/pool=loops` + `kubectl taint node <n> coxswain.io/pool=loops:NoSchedule` + the matching flags is the documented workflow (docs/OPERATOR.md, new section "Pinning Loops to a node pool (C2)").
-- **On upgrade.** Nothing required; the flags default to empty, so an install that does not set them behaves exactly as before. With the flags set but no matching node, the model proxy and egress proxy pods sit Pending with FailedScheduling events, the Loop holds at `Planning` with `ModelProxyNotReady=True` (no sandbox pod is created, so `SandboxNotStarting` never appears), and the Loop does not yet fail on its own — F93a, a later slice.
+- **On upgrade.** Nothing required; the flags default to empty, so an install that does not set them behaves exactly as before. With the flags set but no matching node, the model proxy and egress proxy pods sit Pending with FailedScheduling events, the Loop holds at `Planning` with `ModelProxyNotReady=True` (no sandbox pod is created, so `SandboxNotStarting` never appears), and after 10 minutes the Loop fails with `reason=PodUnschedulable` (the F93a bound; docs/TROUBLESHOOTING.md, "PodUnschedulable=True").
 
 
 ### Shared memory per repository: lessons learned by one Loop are available to the next — #179, plus the memory-writer Job (P5b, `f12d2dc`)
@@ -370,6 +370,11 @@ The memory-writer Job's NetworkPolicy carried one empty ingress rule and one emp
 The static write policy's credential-assignment rule (the one that drops a lesson containing `password=`, `token=`, and the like) only matched lower-case keys, so a lesson written with `PASSWORD=` or `ApiKey=` slipped through to the memory PVC. The rule is now case-insensitive, and two new rules cover credential assignment via the `Authorization` HTTP header and AWS secret keys. The screening runs in the memory-writer Job before a lesson is persisted, and on `cox memory import`. Nothing to do; existing memory files are not re-screened (a re-import screens them). — #187 (`669be17`)
 
 ## Other changes
+
+### F93a: a Loop with an unschedulable pod fails after 10 minutes instead of wedging forever — #387
+
+- **What changed.** When at least one of a Loop's pods (sandbox, model proxy, egress proxy, or tool proxy) is unschedulable (`PodScheduled=False`, `Reason=Unschedulable`), the operator surfaces the `PodUnschedulable` condition (True, naming every stuck pod + the scheduler's message), stamps the `coxswain.io/loop-unschedulable-since` annotation, and requeues every 5s while stuck. Once the stuck state lasts 10 minutes the Loop fails with `reason=PodUnschedulable` (phase `Failed`). The clock resets the moment every pod is schedulable or gone, and is also removed on entry to `Paused` so a pause does not count against the bound. One Warning Event fires on the transition to True.
+- **On upgrade.** New behaviour; no operator changes required. The new condition (`PodUnschedulable`) and the terminal `Failed reason=PodUnschedulable` are additive. See `docs/TROUBLESHOOTING.md` ("PodUnschedulable=True") for the diagnosis and the node-selector/tolerations fix.
 
 ### F94: a repo with no tests no longer wedges `Verifying` — #383
 
@@ -1024,8 +1029,9 @@ closed by the PRs named beside them. In plain words, the items still open:
   With C2's `--loop-node-selector` set and no matching node, the model and
   egress proxy pods are the first to go Pending: the Loop holds at
   `Planning` with `ModelProxyNotReady=True`, no sandbox pod is created, and
-  the Loop never fails either. F93a (queued) bounds any unschedulable Loop
-  pod. Separately, the Sandbox template's BPF node affinity was not
+  the Loop fails after 10 minutes with `reason=PodUnschedulable` (the F93a
+  bound; docs/TROUBLESHOOTING.md, "PodUnschedulable=True"). Separately, the
+  Sandbox template's BPF node affinity was not
   reconciled when the operator's `--allow-unenforced` flag changed, so a
   recreated pod kept the stale affinity (F93b; **fixed by C2** — #381
   (`6e7b992`)).

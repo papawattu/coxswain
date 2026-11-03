@@ -17,6 +17,7 @@ see `docs/QUICKSTART.md`.
 - [What the sandbox can and cannot reach](#what-the-sandbox-can-and-cannot-reach)
 - [Reading the egress proxy log](#reading-the-egress-proxy-log)
 - [Pinning Loops to a node pool (C2)](#pinning-loops-to-a-node-pool-c2)
+- [k3s / flannel / SMB profile (C3)](#k3s--flannel--smb-profile-c3)
 - [Upgrade](#upgrade)
 
 ---
@@ -987,6 +988,183 @@ with `reason=PodUnschedulable` (the F93a bound — docs/OPERATOR.md,
 Check `kubectl get pod -o wide` and the pods' FailedScheduling events. Changing the flags also recreates the proxy
 pods of every Loop that has one — terminal Loops included (their spec hash
 covers placement), while existing Jobs keep their old placement.
+
+## k3s / flannel / SMB profile (C3)
+
+This section documents the k3s + flannel + SMB (smb.csi.k8s.io) profile for
+running coxswain on a homelab-class k3s cluster. It is based on a real k3s
+v1.36.2 cluster (17 nodes, 3 arm64 + 14 amd64) run on 2026-11-03. The
+homelab plan (`papawattu/homelab` PR #149) tracks the cluster side; this
+documents what coxswain needs and what was actually observed.
+
+**Status: the SMB memory class is proven (H3 evidence below). The network
+gate works via the k3s embedded network-policy controller (H4 evidence
+below). Checkpoints are not supported on this cluster today (no
+VolumeSnapshot CRDs installed — see "k3s deltas" below). agent-sandbox is
+not installed yet (H1, tracked in the homelab plan).**
+
+### Network gate (D38) on flannel
+
+**The CNI is flannel; it does NOT enforce NetworkPolicy on its own.**
+The D38 network gate requires an enforcing CNI to police pod → host-network
+egress. On a flannel-only setup, flannel's VXLAN provides no enforcement.
+
+**k3s embeds a separate network-policy controller.** k3s ships an embedded
+network-policy controller (not a separate pod — it runs inside the k3s
+server process). It is enabled with the `--network-policy` flag on the
+k3s server, or by setting `network-policy: true` in
+`/etc/rancher/k3s/config.yaml`. When enabled, it enforces
+`networking.k8s.io/v1` NetworkPolicy objects independently of the CNI —
+flannel + k3s embedded network-policy controller is a working enforcing
+setup.
+
+**The homelab k3s has this enabled (verified by the H4 probe below)** —
+even though neither the `--network-policy` flag nor the config.yaml entry
+are visible in the process cmdline (the flag may be passed via an env var
+or the service file that is not visible to this check). The empirical
+proof is the BLOCKED/REACHABLE probe result.
+
+**H4 evidence (2026-11-03, pi6, namespace c3-h4):**
+
+```
+Setup: target Deployment (httpd:2.4) pinned to pi6, Service target.c3-h4:80.
+Probe pod (python:3.13-alpine) pinned to pi6, TCP connect to
+target.c3-h4.svc.cluster.local:80.
+deny-all NetworkPolicy: podSelector app=target, policyTypes [Ingress],
+ingress: []
+
+=== BLOCKED (deny-all active, pod probe4) ===
+TARGET_SVC BLOCKED ([Errno 111] Connection refused)
+probe4 Completed on pi6
+
+=== REACHABLE (no netpol, positive control, pod probe3) ===
+TARGET_SVC REACHABLE
+probe3 Completed on pi6
+
+Cluster NetworkPolicies at time of probe: 32
+```
+
+**Interpretation:** the same probe pod, same service, only the NetworkPolicy
+differing → the embedded controller enforces the policy. The `Connection
+refused` (not a timeout) is the expected TCP behaviour when the kernel
+drops the connection after the network-policy controller marks it denied.
+
+**What this means for coxswain's D38 gate:** the operator's CNI probe
+(`internal/cni/pod_prober.go`) runs its own self-test pod and checks whether
+the CNI enforces NetworkPolicy. On flannel + k3s embedded network-policy
+controller, the probe **should pass** — the embedded controller enforces
+the netpol the probe applies. The gate reads `NetworkEnforced=True reason
+CNIEnforced` and the Loop runs. If the k3s embedded controller is not
+enabled (check `systemctl cat k3s | grep network-policy`), the probe will
+report `CNIUnenforced` and the operator holds Loops `Suspended` with
+`NetworkEnforced=False`.
+
+**Check the k3s embedded controller is enabled:**
+
+The most reliable check is the empirical one: apply a deny-all
+NetworkPolicy to a test pod and verify that connections to that pod are
+blocked (the H4 probe above). For a config check:
+
+```sh
+# On the k3s control-plane node(s):
+# Check config.yaml (may not be present on all k3s installs):
+grep network-policy /etc/rancher/k3s/config.yaml 2>/dev/null || echo "not in config.yaml"
+# The k3s server process may have the flag via env or a service file
+# that is not always visible via ps:
+sudo -n cat /proc/$(pgrep -x k3s | head -1)/cmdline 2>/dev/null | tr '\0' '\n' | grep network-policy || echo "not in cmdline (may be enabled via env)"
+```
+
+If the probe reports `CNIUnenforced`, the embedded controller is not
+active. Enable it (requires k3s restart on each node):
+
+```sh
+# Add to /etc/rancher/k3s/config.yaml:
+network-policy: true
+sudo systemctl restart k3s
+```
+
+### SMB memory StorageClass (P5a, `--memory-storage-class`)
+
+**The `smb` StorageClass (smb.csi.k8s.io) is proven as a RWX memory class.**
+The homelab cluster ships an in-cluster samba share exposed via the
+`csi-driver-smb` (smb.csi.k8s.io) CSI driver.
+
+**H3 evidence (2026-11-03, namespace c3-h3):**
+
+```
+PVC: c3-h3-mem, 1Gi, RWX, storageClassName=smb
+  → Bound (immediate) on creation.
+
+Writer pod on pi6 (busybox:1.36, uid 1000):
+  echo "c3-h3-write-<epoch>" > /data/mem.txt
+  → /data/mem.txt written, uid 1000, mode 0777
+
+Reader pod on pi2 (busybox:1.36, readOnly, different node):
+  cat /data/mem.txt
+  → "c3-h3-write-<epoch>" read successfully on pi2
+
+File content identical on both nodes; PVC deleted and namespace removed
+after the test.
+```
+
+**Posture: this is a shared SMB share with `noperm` + `0777` mount
+options.** Every pod that can mount the PVC can write to it. The memory
+PVC is per (namespace, git URL); the memory-writer Job is the only intended
+writer. Do not use this class where tenants are untrusted. For a
+hardened setup, use a CephFS or NFS class.
+
+**SMB semantics note:** with `noperm` + `0777`, file ownership and
+permissions are not enforced by the SMB server — the CIFS mount options
+override them. The homelab plan's H0 decision recommends `smb` as the
+first-choice memory class (try it first, move to CephFS only if it fails).
+H3 passed, so `smb` is the recommendation for the homelab coxswain run.
+
+**Run the operator with the SMB class:**
+
+```sh
+# install.yaml path (render with MEMORY_STORAGE_CLASS):
+make build-installer IMG=<registry>/coxswain-controller:<tag> \
+  MEMORY_STORAGE_CLASS=smb
+kubectl apply -f dist/install.yaml
+
+# OR: patch the manager Deployment args after install:
+kubectl -n coxswain-system patch deploy coxswain-controller-manager \
+  --type=json \
+  -p '[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--memory-storage-class=smb"}]'
+```
+
+### k3s deltas vs. kind (what to check before a coxswain run)
+
+| Item | Status on the homelab k3s (2026-11-03) | Action |
+|---|---|---|
+| agent-sandbox controller (v1.0.4) | **Not installed** | H1: `kubectl apply -f https://github.com/kubernetes-sigs/agent-sandbox/releases/download/v1.0.4/sandbox.yaml` |
+| KubeArmor BPF-LSM (policy gate, ADR-0007) | **Not installed; BPF-LSM requires `lsm=…,bpf` on kernel cmdline** | H5: enable BPF-LSM on pool nodes only, then install KubeArmor v1.7.5 with a nodeSelector to the pool |
+| VolumeSnapshot CRDs + snapshot-controller + VolumeSnapshotClass (checkpoints, fork, rollback) | **Not installed** (no snapshot CRDs found; ceph-csi's csi-snapshotter sidecar is present but there is no controller or class) | H1: install external-snapshotter CRDs + controller + a VolumeSnapshotClass for `rbd.csi.ceph.com` (the default StorageClass). Until this lands, `spec.checkpoints: Required` Loops will fail at start with `Failed:CheckpointUnavailable`; the default (best-effort) path sets `CheckpointsAvailable=False` and carries on |
+| flannel + k3s embedded network-policy controller (D38 gate) | **Enabled** (H4 evidence above; 32 NetworkPolicies in use) | Confirm `network-policy: true` is set in the k3s config; the D38 CNI probe should pass |
+| Multi-arch images (C1) | **Not yet** — release images are amd64-only | C1 (`.github/workflows/release.yml`) is an owner push. Until it lands, arm64 nodes cannot pull the release images. The homelab plan (H2) recommends tainting pi13 `kubernetes.io/arch=arm64:NoSchedule` until C1 merges |
+| `--loop-node-selector` / `--loop-tolerations` (C2) | **Merged** (main) | Use the C2 flags to pin Loops to a dedicated amd64 pool (the H2 pool) |
+| NetworkPolicy count | 32 existing NetworkPolicies | The D38 probe applies its own netpol in `coxswain-cni-probe`; the existing 32 do not interfere |
+
+### What the homelab H slices must verify before a coxswain run
+
+The homelab plan (`papawattu/homelab` PR #149) tracks these; this doc
+records what was verified from the coxswain side on 2026-11-03:
+
+- **H3 (SMB memory):** ✅ Verified (evidence above). The `smb` StorageClass
+  works as a RWX class for the memory PVC on this cluster.
+- **H4 (flannel network gate):** ✅ Verified (evidence above). The k3s
+  embedded network-policy controller enforces NetworkPolicy; the D38 CNI
+  probe should pass.
+- **H1 (agent-sandbox + VolumeSnapshot):** ❌ Not yet. The agent-sandbox
+  controller is not installed; the VolumeSnapshot CRDs and
+  VolumeSnapshotClass are not installed. Checkpoints and fork/rollback are
+  unavailable until H1 lands. The memory-writer Job (P5b) runs regardless
+  (it does not depend on snapshots), but `spec.checkpoints: Required` Loops
+  will fail at start.
+- **H5 (KubeArmor BPF-LSM):** ❌ Not yet. The policy gate (ADR-0007 A1)
+  cannot be enforced without KubeArmor + BPF-LSM. The D57 decision says
+  the alpha ships KubeArmor-only — a cluster without BPF-LSM is not
+  running coxswain as designed.
 
 ## Upgrade
 

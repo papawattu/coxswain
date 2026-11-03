@@ -343,6 +343,68 @@ var _ = Describe("F93a: the unschedulable Loop pod is bounded", func() {
 			"the Failed condition's reason is PodUnschedulable")
 	})
 
+	// M9: the f93aUnschedulableStep helper sets verifyRequeue on stuck and
+	// changed on changed — directly, with no other gate to mask the bug.
+	It("M9: f93aUnschedulableStep sets verifyRequeue on a stuck-but-unchanged pass (direct call)", func() {
+		clock := time.Now()
+		name := "f93a-m9"
+		r := f93aReconciler(&clock)
+		// No endpointSecretRef: the D35a gate is skipped, so the sandbox is
+		// created (the shape the F48 specs use).
+		loop := &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec: coxv1alpha1.LoopSpec{
+				Goal:      loopGoal,
+				Workspace: testWorkspace(),
+			},
+		}
+		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
+		reconcile(r, name)
+
+		By("the sandbox pod exists")
+		sb := &sandboxv1beta1.Sandbox{}
+		Eventually(func() error {
+			return k8sClient.Get(ctx, types.NamespacedName{Name: sandboxName(name), Namespace: ns}, sb)
+		}, "10s").Should(Succeed())
+		pod := &corev1.Pod{}
+		err := k8sClient.Get(ctx, types.NamespacedName{Name: sandboxName(name), Namespace: ns}, pod)
+		if apierrors.IsNotFound(err) {
+			pod = &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      sandboxName(name),
+					Namespace: ns,
+					OwnerReferences: []metav1.OwnerReference{{
+						APIVersion: sandboxv1beta1.GroupVersion.String(),
+						Kind:       "Sandbox",
+						Name:       sandboxName(name),
+						UID:        sb.UID,
+						Controller: func() *bool { b := true; return &b }(),
+					}},
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{Name: "sandbox", Image: runnerImage}},
+				},
+				Status: corev1.PodStatus{Phase: corev1.PodPending},
+			}
+			Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+		}
+
+		By("the scheduler marks the sandbox pod unschedulable: the first reconcile stamps the condition + annotation")
+		setUnschedulable(sandboxName(name), ns, "0/3 nodes are available")
+		reconcile(r, name)
+		loop2 := f93aGetLoop(name)
+		Expect(conditionTruePresent(loop2, unschedulableLoopPodsCondition)).To(BeTrue())
+		Expect(loop2.Annotations[loopUnschedulableSinceAnnotation]).ToNot(BeEmpty())
+
+		By("a direct call to f93aUnschedulableStep on a stuck-but-unchanged pass: verifyRequeue=true, changed=false")
+		var changed, vr bool
+		r.f93aUnschedulableStep(ctx, f93aGetLoop(name), &changed, &vr)
+		Expect(vr).To(BeTrue(),
+			"f93aUnschedulableStep sets verifyRequeue on a stuck pass (M9: the requeue is this step's job, not another gate's)")
+		Expect(changed).To(BeFalse(),
+			"f93aUnschedulableStep does NOT set changed on a stuck-but-unchanged pass (M9: no per-pass status write)")
+	})
+
 	It("the bound does NOT trip within the window, and a pod that becomes schedulable again clears the condition + resets the clock", func() {
 		clock := time.Now()
 		name := "f93a-clear"

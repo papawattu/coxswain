@@ -1026,6 +1026,9 @@ closed by the PRs named beside them. In plain words, the items still open:
   `SandboxNotStarting` forever and never reaches `Failed` (F93a; the
   unmountable-volume bound of F48b does not trip for an unschedulable pod —
   the cause is unknown, the evidence shows a 20h+ wedge with no decision).
+  **Fixed by F93a (#387)**: any unschedulable Loop pod (sandbox, model,
+  egress, or tool proxy) is surfaced with the `PodUnschedulable` condition
+  and the Loop fails with `reason=PodUnschedulable` after 10 minutes.
   With C2's `--loop-node-selector` set and no matching node, the model and
   egress proxy pods are the first to go Pending: the Loop holds at
   `Planning` with `ModelProxyNotReady=True`, no sandbox pod is created, and

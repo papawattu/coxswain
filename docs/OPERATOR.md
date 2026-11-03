@@ -471,6 +471,7 @@ and why the hold ended.
 | `SecretsUsable=False reason=NamespaceNotEnabled` | The namespace has no D102 `RoleBinding` for the `coxswain-secret-reader` ClusterRole; the Loop is held (no sandbox) until it is added (Secret opt-in, below). |
 | `SecretsUsable=False reason=SecretNotOptedIn` | A named Secret is missing the `coxswain.io/usable: "true"` label; the message names the Secret and the field that references it. |
 | `SecretsUsable=False reason=SecretNotFound` | A named Secret does not exist in the Loop's namespace. |
+| `PodUnschedulable=True reason=Unschedulable` | A Loop pod (proxy or sandbox) is rejected by the scheduler (`PodScheduled=False` with reason `Unschedulable`). The message names the stuck pod and the scheduler's own message. The Loop is held while the stuck state lasts less than 10 minutes; past the bound, the Loop **fails** with `reason=PodUnschedulable` (phase `Failed`). While the Loop is Paused, the bound's clock is reset (a paused Loop does not fail on resume). |
 
 ### Secret opt-in (D76/D102)
 
@@ -980,9 +981,10 @@ matching them, the model proxy and egress proxy pods sit Pending with
 FailedScheduling events; the Loop holds at `Planning` with
 `ModelProxyNotReady=True`; no sandbox pod is created (the template update
 suspends the Sandbox, and with no Ready proxy pod it is not restarted), so
-`SandboxNotStarting` never appears; and the Loop does not yet fail on its
-own — that is F93a, a later slice. Check `kubectl get pod -o wide` and the
-pods' FailedScheduling events. Changing the flags also recreates the proxy
+`SandboxNotStarting` never appears; and the Loop fails after 10 minutes
+with `reason=PodUnschedulable` (the F93a bound — docs/OPERATOR.md,
+"PodUnschedulable=True" in Key conditions, and docs/TROUBLESHOOTING.md).
+Check `kubectl get pod -o wide` and the pods' FailedScheduling events. Changing the flags also recreates the proxy
 pods of every Loop that has one — terminal Loops included (their spec hash
 covers placement), while existing Jobs keep their old placement.
 

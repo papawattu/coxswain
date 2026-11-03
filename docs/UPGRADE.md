@@ -583,3 +583,38 @@ RoleBinding) re-holds the Loop on its next reconcile (fail-closed). The
 `kubectl describe loop` `SecretsUsable` condition names the blocking Secret
 and the field; the same condition appears in `docs/OPERATOR.md` (Key
 conditions to watch) and `docs/TROUBLESHOOTING.md`.
+
+## F93a: the unschedulable Loop pod is bounded (10 minutes)
+
+Previously, a Loop whose proxy pod (model, egress, or tool) or sandbox pod
+was rejected by the scheduler (`PodScheduled=False` with reason
+`Unschedulable`) sat forever with no decision. The sandbox case sat
+`SandboxNotStarting` for 20h+ (the F48b unmountable-volume bound only counts
+mount Events, so it never trips on a `FailedScheduling` pod), and with the
+C2 placement flags (`--loop-node-selector` / `--loop-tolerations`) a Loop
+with no matching node held at Planning with `ModelProxyNotReady=True`
+forever.
+
+Now the operator surfaces the stuck pod with a `PodUnschedulable` condition
+(Warning, naming the pod + the scheduler's own message) and a Warning Event
+on the transition. If the stuck state lasts more than **10 minutes** (the
+bound: `unschedulableLoopPodsBound`), the Loop **fails** with the
+`PodUnschedulable` reason (Failed condition, phase Failed). The clock is the
+operator's own clock, measured by a metadata annotation
+(`coxswain.io/loop-unschedulable-since`) stamped on the transition into the
+stuck state. When the scheduler succeeds (the node pool is fixed), the
+condition clears (Normal, `reason=AllSchedulable`) and the annotation is
+removed — the Loop proceeds. While the Loop is Paused, the annotation is
+removed (the bound measures a contiguous run while unpaused; a Loop paused
+for more than 10 minutes does not fail on resume).
+
+This is a **new failure mode** for Loops that were previously stuck
+forever. If you run a cluster where Loops are routinely unschedulable (a
+small cluster, or a placement flag that matches no node), the 10-minute
+bound will now fail them instead of holding them. Adjust the node pool or
+the placement flags; the bound is not configurable (it is a safety valve,
+like the other Loop bounds).
+
+The same behavior is documented in `docs/OPERATOR.md` (the `PodUnschedulable`
+condition in Key conditions to watch) and `docs/TROUBLESHOOTING.md` (how to
+clear it).

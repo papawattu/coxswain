@@ -1114,6 +1114,11 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 
 	conditionsChanged := !equality.Semantic.DeepEqual(condsBefore, loop.Status.Conditions)
 
+	// F93a: the unschedulable-Loop-pod bound (the applyUnschedulableLoopPods
+	// step, called before the budget step and the D77 budget-hold gate so the
+	// surface + terminal failure persist on the held pass too).
+	r.f93aUnschedulableStep(ctx, &loop, &changed, &verifyRequeue)
+
 	// P2d: the budget decision — the operator reads the proxy's usage endpoint
 	// (the readProxyUsage seam), folds the reading into status.budget (the
 	// boot-ID delta rules), accumulates the wall clock, and applies the caps
@@ -1195,6 +1200,30 @@ func (r *LoopReconciler) reconcileFinal(ctx context.Context, loop *coxv1alpha1.L
 func (r *LoopReconciler) f84cF56Surfaces(loop *coxv1alpha1.Loop) {
 	_ = clearModelProxyHoldForTerminal(loop)
 	r.surfaceRunnerAvailable(loop)
+}
+
+// f93aUnschedulableStep is the F93a unschedulable-Loop-pod bound step,
+// extracted from Reconcile to keep the top-level function within the gocyclo
+// budget. It runs the applyUnschedulableLoopPods decision and, on changed,
+// ORs into the caller's changed flag (the trailing status write persists the
+// F93a condition). On stuck, it sets the caller's verifyRequeue flag (the
+// shared reconcileRequeueAfter returns the short workRequeue (5s)) so the
+// bound is re-checked on EVERY stuck pass — including stuck-but-unchanged
+// passes where the condition is already True with the same message. A stuck
+// sandbox pod with ready proxies gets no more watch events (a Pending pod
+// is not re-scheduled once rejected), so without this requeue the 10m bound
+// may never be re-checked. It runs before the budget step and the D77
+// budget-hold gate so the surface + terminal failure persist on the held
+// pass too.
+func (r *LoopReconciler) f93aUnschedulableStep(ctx context.Context, loop *coxv1alpha1.Loop, changed, verifyRequeue *bool) {
+	if f93Changed, f93Stuck := r.applyUnschedulableLoopPods(ctx, loop); f93Changed || f93Stuck {
+		if f93Changed {
+			*changed = true
+		}
+		if f93Stuck {
+			*verifyRequeue = true
+		}
+	}
 }
 
 // d77BudgetHold is the D77 budget-hold gate step (maxCost + a stale reading

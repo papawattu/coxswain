@@ -1479,3 +1479,39 @@ the reading stays stale the hold re-queues every 30s; once one read succeeds
 the hold clears on the next reconcile. See `docs/UPGRADE.md` (the "Upgrading
 from v0.1.2" section) for the behaviour change and the F44 stale-reading
 surfacing that the hold builds on.
+
+### PodUnschedulable=True — a Loop pod cannot be scheduled (F93a)
+
+The `PodUnschedulable` condition is `True` when at least one of the Loop's
+pods (sandbox, model proxy, egress proxy, or tool proxy) has
+`PodScheduled=False` with `Reason=Unschedulable` — the scheduler has
+explicitly rejected it. The condition message names every stuck pod and the
+scheduler's own message (usually "0/N nodes are available: …").
+
+**What it means.** The node pool has no node that can schedule the pod:
+no node matches the `--loop-node-selector` / `--loop-tolerations` flags, all
+matching nodes are tainted or cordoned, or the node pool is empty. The
+operator cannot fix the cluster; only a cluster change (a node added or
+labelled, a taint removed, or the flags corrected) resolves the state.
+
+**Diagnosis.**
+
+1. `kubectl describe pod <pod-name> -n <ns>` — the `FailedScheduling`
+   event carries the scheduler's exact reason (which nodes were considered
+   and why each was rejected).
+2. `kubectl get events -n <ns> --sort-by='.lastTimestamp'` — the
+   `PodUnschedulable` Warning Event fires once on the transition.
+3. Check the operator's flags: `kubectl get deploy -n coxswain-system
+   coxswain-controller-manager -o jsonpath='{.spec.template.spec.containers[0].args}'`
+   — look for `--loop-node-selector` and `--loop-tolerations` and confirm
+   at least one node matches: `kubectl get nodes -l <selector>`.
+4. If the selector is correct and nodes exist, check for untolerated taints:
+   `kubectl describe node <node> | grep -A5 Taints`.
+
+**Resolution and the 10-minute bound.** Once the stuck state lasts 10
+minutes the Loop fails with `reason=PodUnschedulable` (phase `Failed`).
+The bound's clock resets when the Loop enters `Paused` (the annotation is
+removed), so pausing the Loop while the owner fixes the node pool prevents
+the failure; the clock re-starts on the first stuck pass after resume.
+Fixing the node pool (adding or labelling a node) clears the condition on
+the next reconcile before the bound trips.

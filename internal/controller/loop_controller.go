@@ -663,7 +663,7 @@ func (r *LoopReconciler) agentPoliciesValid(ctx context.Context, loop *coxv1alph
 		// Clean pass: set PolicyValid=True (R15 round 3: nothing ever set it
 		// True before, so a fixed path left the old False condition forever).
 		if len(loop.Spec.PolicyRefs) > 0 {
-			setCondition(loop, "PolicyValid", metav1.ConditionTrue, "Valid", "all referenced AgentPolicies are valid")
+			setCondition(loop, "PolicyValid", metav1.ConditionTrue, "Valid", "all referenced policies (AgentPolicy / ClusterAgentPolicy) are valid")
 		}
 		// P6a (D98): surface a policyRefs name that names BOTH a namespaced
 		// AgentPolicy and a ClusterAgentPolicy (namespaced wins). The set is

@@ -17,6 +17,14 @@ _(none yet)_
 
 ## Other changes
 
+### I208: PolicyValid's message names both policy kinds — #TBD
+
+A Loop whose `spec.policyRefs` resolves to a `ClusterAgentPolicy` (P6a) was
+left with `PolicyValid=True` and the message "all referenced AgentPolicies
+are valid" — the message named the wrong kind for a cluster-only ref. The
+True message is now kind-neutral ("all referenced policies (AgentPolicy /
+ClusterAgentPolicy) are valid"); the reason stays `Valid`.
+
 ### I212: a runner Loop with no model endpoint is held — #396
 
 **What was wrong:** A Loop on the operator's runner (`spec.agent.image` empty
@@ -29,8 +37,7 @@ the three samples ship the model fields commented out).
 
 **What changed:** The operator now holds such a Loop pre-sandbox with
 `ModelConfigValid=False reason=NoModelEndpoint` (the D34 pair check's
-`MissingModelEndpoint` is unchanged); no sandbox, no model-proxy, no
-ever-proxy objects are created. A non-runner `spec.agent.image` is not held.
+`MissingModelEndpoint` is unchanged); no sandbox, no model-proxy, no egress-proxy objects are created. A non-runner `spec.agent.image` is not held.
 The three sample comments now say the model fields are required before
 applying. `docs/OPERATOR.md` lists the new reason under the key conditions.
 

@@ -75,7 +75,8 @@ func init() {
 // so what it runs must not change under the operator between two Loops. The
 // digest is the registry's multi-arch manifest-list digest (resolved with
 // `docker buildx imagetools inspect <ref>`; the values are listed in
-// docs/RELEASE-NOTES-next.md). The tag stays in the reference for humans and for
+// the release notes of the release that pinned them
+// (docs/RELEASE-NOTES-v<version>.md, e.g. v0.1.3). The tag stays in the reference for humans and for
 // `kind load`/preload lists, which match on the tag.
 const (
 	defaultSecretOptIn = true // D76/D102: the Secret opt-in gate is fail-closed by default

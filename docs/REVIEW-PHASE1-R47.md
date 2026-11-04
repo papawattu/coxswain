@@ -126,7 +126,7 @@ Ticked in `docs/REVIEW-PHASE1-R46.md` by this commit:
     an expectation, not evidence.
 
   **Fix:** the homelab side (the homelab Claude's H slices) finds out why a pod on pi3 cannot
-  reach pi12's host ports even with no policy. The owner then decides D104 (below).
+  reach pi12's host ports even with no policy. D104 (below) is decided as (a), so pi12's rows stay UNRESOLVED until that is explained.
 
   **Acceptance:** either a homelab `verify-cni` verdict of PASS, or of a named UNPROVEN whose only
   unmeasurable rows are of a type D104 excludes. And the first deployed-operator run on k3s records
@@ -215,7 +215,7 @@ Ticked in `docs/REVIEW-PHASE1-R46.md` by this commit:
 
 ## Owner decisions
 
-**D104 (open): how should a target the no-policy control pod cannot reach be counted?** pi12's
+**D104 (decided by the owner, 2026-11-04 ~19:00Z: (a)): how should a target the no-policy control pod cannot reach be counted?** pi12's
 two rows are the case: policy `REFUSED`, control `BLOCKED(OSError)` (I213). Both probe pods run
 on one node (`pi3` in this run) and target every node's IP. So these rows are the path from a pod
 on pi3 to pi12's ports, and that path is closed **even with no policy**. Today the combine table
@@ -234,7 +234,7 @@ maps this to UNRESOLVED, and one such row makes the cluster verdict UNPROVEN.
   (unschedulable)` and never PASS (R25 I84). That is wrong for reach: a Loop on another node can
   still target a cordoned node's ports, and this would stop measuring that.
 
-**Recommendation: (a) for now, with the homelab side explaining pi12 (I213).** The cause of
+**Decided: (a), with the homelab side explaining pi12 (I213); the owner's answer was "D104 a".** The cause of
 `BLOCKED(OSError)` is unknown. Adopting (b) before knowing it would build a rule on an unshown
 fault (R28 I92). If pi12 proves to be a deliberate host firewall, (b) is the right general rule,
 and it becomes a small D-slice across the three combine tables.
@@ -248,7 +248,8 @@ and it becomes a small D-slice across the three combine tables.
   held no `.samples/` evidence.
 - **v0.1.3** went in the order R46 recorded: D103 merged → notes renamed (#393) → the pre-tag
   smoke passed → the reviewer pushed the tag → the release run and artifacts were confirmed.
-- **R47 before the I208 / I211 / older queue** (owner, 11-04 ~19:05Z: "R47 first").
+- **R47 before the I208 / I211 / older queue** (owner, 11-04 ~19:05Z: "R47 first"); then
+  **I212 next** (owner, with the D104 answer: "D104 a, then I212 next").
 
 ## What I did not verify
 

@@ -512,6 +512,14 @@ combine_line() { # $1 = policy line, $2 = control line
     *) echo "UNRESOLVED" ;;
   esac
 }
+# The per-row return code contract (D103): 0 = the combined verdict is
+# BLOCKED (the fence dropped the connect: policy BLOCKED, or policy REFUSED
+# + control REACHABLE); 1 = a NOT_LISTENING note (nothing listens there —
+# not a pass, but not a failure of the fence); 2 = a bad (REACHABLE, a
+# missing line, or an UNRESOLVED/unmeasurable connect). The e2e uses only
+# the exit 0/!=0 split via `&& *_OK=1`; the selftest re-derives PASS/FAIL
+# from the captured output, so only the F:/NOTE: lines and this contract
+# matter.
 assert_blocked() { # $1 = label, $2 = human description
   # The two passes emit exactly one of pod_prober.go's verdicts (D103, F51b):
   #   RESULT <label> REACHABLE / BLOCKED(<reason>) / REFUSED / UNRESOLVED(<why>)
@@ -524,18 +532,19 @@ assert_blocked() { # $1 = label, $2 = human description
   cline=$(control_line "$1")
   combined=$(combine_line "$line" "$cline")
   case "$combined" in
-    "REACHABLE") bad "$2: REACHABLE — the enforcing CNI failed to block it" ;;
-    "BLOCKED") ok "$2 (blocked: policy ${line} + control ${cline})" ;;
+    "REACHABLE") bad "$2: REACHABLE — the enforcing CNI failed to block it"; return 2 ;;
+    "BLOCKED") ok "$2 (blocked: policy ${line} + control ${cline})"; return 0 ;;
     "NOT_LISTENING")
       NOT_LISTENING_COUNT=${NOT_LISTENING_COUNT:-0}
       NOT_LISTENING_COUNT=$((NOT_LISTENING_COUNT + 1))
-      echo "    NOTE: $2: NOT_LISTENING (policy REFUSED + control REFUSED — nothing listens there; not a measurement of the fence)" ;;
+      echo "    NOTE: $2: NOT_LISTENING (policy REFUSED + control REFUSED — nothing listens there; not a measurement of the fence)"; return 1 ;;
     *)
       if echo "$line" | grep -q '^[[:space:]]*RESULT [A-Z_0-9]* MISSING'; then
         bad "$2: probe line missing from output"
       else
         bad "$2: UNRESOLVED — $(echo "$line" | sed 's/^RESULT [A-Z_0-9]* //'); the connect was not dropped, so the fence is UNPROVEN here (not a pass)"
-      fi ;;
+      fi
+      return 2 ;;
   esac
 }
 # The host-network verdict (D103): after the 5 calls, APISERVER_SVC must be
@@ -545,6 +554,14 @@ assert_blocked() { # $1 = label, $2 = human description
 APISERVER_SVC_OK=0
 APISERVER_NODE_OK=0
 KUBELET_NODE_OK=0
+# The host-network verdict as a function so the selftest can drive the SAME
+# code the e2e runs (R47 P2-1): reads the per-label ok flags set by the
+# 5 assert_blocked calls and the NOT_LISTENING counter.
+d38_hostnet_verdict() {
+  if [ "$APISERVER_SVC_OK" -ne 1 ] || { [ "$APISERVER_NODE_OK" -ne 1 ] && [ "$KUBELET_NODE_OK" -ne 1 ]; }; then
+    bad "no host-network target was measurable (UNPROVEN): APISERVER_SVC ok=$APISERVER_SVC_OK APISERVER_NODE ok=$APISERVER_NODE_OK KUBELET_NODE ok=$KUBELET_NODE_OK, NOT_LISTENING rows=$NOT_LISTENING_COUNT"
+  fi
+}
 # <<< assert_blocked
 echo "  (C1) apiserver service IP $APISERVER_SVC_IP:443"
 APISERVER_SVC_OK=0
@@ -562,9 +579,7 @@ assert_blocked EXTERNAL "disallowed external $GH_IP:443"
 # D103 verdict (the host-network measurable rule): the combined BLOCKED proof
 # above must include APISERVER_SVC and at least one host-network target
 # (REFUSED + control REACHABLE counts as BLOCKED); NOT_LISTENING rows do not.
-if [ "$APISERVER_SVC_OK" -ne 1 ] || { [ "$APISERVER_NODE_OK" -ne 1 ] && [ "$KUBELET_NODE_OK" -ne 1 ]; }; then
-  bad "no host-network target was measurable (UNPROVEN): APISERVER_SVC ok=$APISERVER_SVC_OK APISERVER_NODE ok=$APISERVER_NODE_OK KUBELET_NODE ok=$KUBELET_NODE_OK, NOT_LISTENING rows=$NOT_LISTENING_COUNT"
-fi
+d38_hostnet_verdict
 
 # C8: the operator's OWN CNI self-test (D38 design point 3: the
 # NetworkEnforced condition on the Loop) must agree with what the e2e

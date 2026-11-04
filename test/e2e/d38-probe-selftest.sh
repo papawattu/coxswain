@@ -178,44 +178,64 @@ fi
 . "$T/classify.sh"
 
 # run_case <want PASS|FAIL> <PROBE_OUT> <CONTROL_OUT> <case name>
-# Sources the REAL assert_blocked, then drives it for ALL FIVE e2e labels —
-# exactly the way the e2e does: the extracted block's verdict check runs
-# against the per-label ok flags of the five calls (APISERVER_SVC ok + at
-# least one of APISERVER_NODE / KUBELET_NODE ok).
+# Sources the REAL assert_blocked AND the REAL d38_hostnet_verdict (both
+# extracted verbatim from the e2e between the same sentinels), then drives
+# them for ALL FIVE e2e labels — exactly the way the e2e does: the 5
+# assert_blocked calls set the per-label ok flags (the e2e's
+# `assert_blocked ... && *_OK=1`), and d38_hostnet_verdict reads them.
+# The WHOLE run (the 5 calls and the verdict function) is captured into $out:
+# got=PASS only when not a single F: line was printed — the per-row FAILs
+# (REACHABLE, UNRESOLVED, a missing line) and the verdict's own bad all land
+# there, so a broken combine_line or a mutated verdict cannot pass a want
+# case (R47 P2-2).
 run_case() {
   local want="$1" pout="$2" cout="$3" name="$4"
-  local out got svcok nodeok kubok
+  local out
   PROBE_OUT="$pout" CONTROL_OUT="$cout"
-  ok() { echo "    P: $*"; }
-  bad() { echo "    F: $*"; }
-  APISERVER_SVC_OK=0 APISERVER_NODE_OK=0 KUBELET_NODE_OK=0
-  NOT_LISTENING_COUNT=0
-  assert_blocked APISERVER_SVC "case: $name (APISERVER_SVC)" && APISERVER_SVC_OK=1
-  assert_blocked APISERVER_NODE "case: $name (APISERVER_NODE)" && APISERVER_NODE_OK=1
-  assert_blocked KUBELET_NODE "case: $name (KUBELET_NODE)" && KUBELET_NODE_OK=1
-  assert_blocked INTERNAL_POD "case: $name (INTERNAL_POD)"
-  assert_blocked EXTERNAL "case: $name (EXTERNAL)"
-  # The D103 host-network verdict, exactly the way the e2e runs it: the 5
-  # calls above, then the measured target check (the bad lands in $out below).
   out="$(
-    if [ "$APISERVER_SVC_OK" -ne 1 ] || { [ "$APISERVER_NODE_OK" -ne 1 ] && [ "$KUBELET_NODE_OK" -ne 1 ]; }; then
-      bad "no host-network target was measurable (UNPROVEN): APISERVER_SVC ok=$APISERVER_SVC_OK APISERVER_NODE ok=$APISERVER_NODE_OK KUBELET_NODE ok=$KUBELET_NODE_OK, NOT_LISTENING rows=$NOT_LISTENING_COUNT"
-    fi
+    ok() { echo "    P: $*"; }
+    bad() { echo "    F: $*"; }
+    APISERVER_SVC_OK=0 APISERVER_NODE_OK=0 KUBELET_NODE_OK=0
+    NOT_LISTENING_COUNT=0
+    # The e2e sets *_OK from `&& assert_blocked`'s exit 0/!=0 split (the
+    # NOT_LISTENING rows count as not-ok there too); this case wants
+    # PASS only when ALL FIVE rows are combined-BLOCKED (only those return
+    # 0), and d38_hostnet_verdict still runs on the 3 flags regardless.
+    assert_blocked APISERVER_SVC "case: $name (APISERVER_SVC)" && APISERVER_SVC_OK=1
+    assert_blocked APISERVER_NODE "case: $name (APISERVER_NODE)" && APISERVER_NODE_OK=1
+    assert_blocked KUBELET_NODE "case: $name (KUBELET_NODE)" && KUBELET_NODE_OK=1
+    assert_blocked INTERNAL_POD "case: $name (INTERNAL_POD)"
+    assert_blocked EXTERNAL "case: $name (EXTERNAL)"
+    # The D103 host-network verdict, the REAL function the e2e calls after
+    # its 5 assert_blocked calls.
+    d38_hostnet_verdict
   )"
-  # ok() (a combined BLOCKED row) is the only way a case PASSes, and only
-  # for a fully measurable case: a NOT_LISTENING note, an UNRESOLVED/
-  # REACHABLE bad, a missing line, or the host-network verdict's bad all
-  # leave no P: line. The case names below never contain "P: ".
+  # A NOT_LISTENING note is not a bad, but it is not a full PASS either
+  # (the e2e never PASSes a NOT_LISTENING row; R25 I84: no PASS for an
+  # unproven step). Count the NOTE lines in the captured output.
+  nl=$(printf '%s\n' "$out" | grep -c "^    NOTE: .*NOT_LISTENING" || true)
   case "$out" in
-    *"P: "*) got=PASS ;;
-    *) got=FAIL ;;
+    *"F: "*) got=FAIL ;;
+    *) got=PASS ;;
   esac
+  [ "$nl" -ge 1 ] && got=FAIL
   if [ "$got" = "$want" ]; then
     ok "$name -> $got (want $want)"
   else
     bad "$name -> $got (want $want): $out"
   fi
 }
+
+# Direct table test of the REAL combine_line (R47 P2-2): each cell of the
+# D103 combine table asserts the exact output, so a wrong cell (e.g.
+# REFUSED + control REACHABLE -> UNRESOLVED) fails here, not only through a
+# whole-case run.
+expect_exact "REACHABLE" "$(combine_line 'RESULT X REACHABLE' 'RESULT X REACHABLE')" "combine_line: policy REACHABLE / control REACHABLE"
+expect_exact "BLOCKED" "$(combine_line 'RESULT X BLOCKED' '')" "combine_line: policy BLOCKED / control missing"
+expect_exact "BLOCKED" "$(combine_line 'RESULT X REFUSED' 'RESULT X REACHABLE')" "combine_line: policy REFUSED / control REACHABLE"
+expect_exact "NOT_LISTENING" "$(combine_line 'RESULT X REFUSED' 'RESULT X REFUSED')" "combine_line: policy REFUSED / control REFUSED"
+expect_exact "UNRESOLVED" "$(combine_line 'RESULT X REFUSED' 'RESULT X BLOCKED(TimeoutError)')" "combine_line: policy REFUSED / control BLOCKED"
+expect_exact "UNRESOLVED" "$(combine_line 'RESULT X UNRESOLVED(no-address)' 'RESULT X REACHABLE')" "combine_line: policy UNRESOLVED / control REACHABLE"
 
 # The full five-label tables for the five e2e labels (the d38 probe's fixed
 # targets), one policy and one control line per label.
@@ -264,16 +284,14 @@ tbl5() { # <policy-verdict> <control-verdict|GONE> <want-status-substring>
     c="${D5_BLOCKED_C/APISERVER_SVC BLOCKED(TimeoutError)/APISERVER_SVC $2}"
   fi
   # The REFUSED/REFUSED cell is the NOT_LISTENING row: it prints a NOTE
-  # line (never a P:/F:) and must count in NOT_LISTENING_COUNT. Drive the
-  # REAL run_case with all five labels REFUSED in both passes — the
-  # NOT_LISTENING rows (all five) must not produce a P: line, and the
-  # counter must have ticked at least once.
+  # line (never an F: line) and the NOT_LISTENING rows must not produce a
+  # PASS. Drive the REAL run_case with all five labels REFUSED in both
+  # passes; the NOTE count is re-derived from the NOTE lines by run_case
+  # itself (run_case's capture is a subshell, so the in-subshell
+  # NOT_LISTENING counter can't be read here — it is shown in the verdict's
+  # bad line, as in the real e2e).
   if [ "$want" = "FAIL" ] && [ "$1" = "REFUSED" ] && [ "$2" = "REFUSED" ]; then
-    NOT_LISTENING_COUNT=0
-    run_case FAIL "$D5_REFUSED_P" "$D5_REFUSED_C" "combine: policy APISERVER_SVC $1 / control $2 (NOT_LISTENING, counted)"
-    [ "${NOT_LISTENING_COUNT:-0}" -ge 1 ] \
-      && ok "combine: NOT_LISTENING counted (NOT_LISTENING_COUNT=$NOT_LISTENING_COUNT)" \
-      || bad "combine: NOT_LISTENING not counted (NOT_LISTENING_COUNT=${NOT_LISTENING_COUNT:-unset})"
+    run_case FAIL "$D5_REFUSED_P" "$D5_REFUSED_C" "combine: policy APISERVER_SVC $1 / control $2 (NOT_LISTENING, not a pass)"
     return 0
   fi
   run_case "$want" "$p" "$c" "combine: policy APISERVER_SVC $1 / control ${2}"

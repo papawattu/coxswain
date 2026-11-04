@@ -47,10 +47,10 @@ AGENTS I68).
 - **The v0.1.3 scope is set by the owner (D103 window):** P6a (+ #389 follow-ups) + F93a + D103,
   release notes renamed per release, the reviewer tags and runs the pre-tag kind smoke
   (owner decision, 2026-11-04; memory `owner-decisions-20261104.md`). The lab `make d38-cni-e2e`
-  exposed a Makefile regression from the I85 fix (I206) on the first run.
-- **The reviewer's merge role is new:** after #388 the owner said "no you merge" — pis never merge,
-  the reviewer merges on OK + green CI + evidence (owner decision, 2026-11-04; first exercised on
-  #389).
+  exposed a Makefile regression from the I85 fix (I205) on the first run.
+- **The reviewer's merge role is new:** while #388 was merging, the owner said "no you merge": pis
+  never merge, and the reviewer merges on OK + green CI + evidence (owner decision, 2026-11-04). The
+  reviewer merged #388 on the owner's "merge 388", then #389 under the standing rule.
 - **The b2/b3/b4 qwen sessions kept slipping the R45 class of rules:** a fourth `git stash` (I201), an
   uncommitted-tree kind image (I202), a claimed mutation never run (I203), a focused-specs-only run
   that missed a full-suite CI failure (I204), and a `git stash` + `git checkout -- .` in the

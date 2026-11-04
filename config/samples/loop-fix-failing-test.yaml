@@ -64,7 +64,8 @@ spec:
     image: docker.io/library/golang:1.26
   agent:
     # image omitted: the operator's --runner-image flag supplies it.
-    # endpointSecretRef + modelEndpoint + model point at your model backend.
+    # Required: set endpointSecretRef + modelEndpoint + model before applying;
+    # without them the Loop is held with ModelConfigValid=False (I212).
     # For the dev cluster's vLLM:
     #   endpointSecretRef: vllm-no-auth
     #   modelEndpoint: 192.168.1.20:8000

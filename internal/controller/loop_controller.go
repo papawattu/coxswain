@@ -7183,7 +7183,7 @@ func isNonCanonicalPath(p string) bool {
 }
 
 // nonCanonicalExecMessage is the NonCanonicalExecPath PolicyValid gate's
-// message. It names the RESOLVED kind (an agentPolicy ref that has no
+// message. It names the RESOLVED kind (a `policyRefs` name with no
 // namespaced AgentPolicy resolves to a ClusterAgentPolicy — the message must
 // say which one; see P6a follow-ups, reviewer's finding K) and is a pure
 // helper so the kind-naming is unit-testable without an API server (the

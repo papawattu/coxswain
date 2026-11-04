@@ -15,6 +15,7 @@ see `docs/QUICKSTART.md`.
 - [Debugging a stuck Loop](#debugging-a-stuck-loop)
 - [Uninstall](#uninstall)
 - [What the sandbox can and cannot reach](#what-the-sandbox-can-and-cannot-reach)
+  - [ClusterAgentPolicy (P6a)](#clusteragentpolicy-p6a)
 - [Reading the egress proxy log](#reading-the-egress-proxy-log)
 - [Pinning Loops to a node pool (C2)](#pinning-loops-to-a-node-pool-c2)
 - [Upgrade](#upgrade)
@@ -748,6 +749,56 @@ Reference policies ship in `config/samples/policies/`: a minimal `default-deny`
 and a `go-toolchain` network allow list. They are ordinary AgentPolicy objects
 (inert until a Loop references one via `spec.policyRefs`) and are included in
 `kubectl apply -k config/samples`.
+
+### ClusterAgentPolicy (P6a)
+
+A `ClusterAgentPolicy` is the cluster-scoped companion to `AgentPolicy`: the
+same spec (`AgentPolicySpec` is reused), one object, reference-able by Loops in
+**any** namespace — for an org-wide allow that would otherwise be copied into
+every namespace. It is inert until a Loop references it, exactly like an
+`AgentPolicy`.
+
+```yaml
+apiVersion: coxswain.wattu.com/v1alpha1
+kind: ClusterAgentPolicy
+metadata:
+  name: org-go-toolchain
+spec:
+  network:
+    - api.golang.org:443
+```
+
+**Resolution order.** A `spec.policyRefs` name is resolved in the Loop's
+namespace first, then cluster-wide (`resolvePolicyRefs`):
+
+1. a namespaced `AgentPolicy` of that name in the Loop's namespace, or
+2. else a `ClusterAgentPolicy` of that name (the fallback), or
+3. else `PolicyValid=False` with reason `PolicyNotFound` (fail closed).
+
+The effective policy is the union of the allows across every referenced
+policy, namespaced and cluster-scoped alike.
+
+**Name collision (as implemented).** When a ref name matches **both** a
+namespaced `AgentPolicy` (in the Loop's namespace) and a `ClusterAgentPolicy`,
+the **namespaced one wins** (the author's explicit choice); the operator never
+rejects the Loop for a collision. The operator fires ONE `PolicyNameCollision`
+Warning Event per change of the collision set (not per reconcile pass) and
+records the sorted set in the Loop's `coxswain.io/policy-collisions`
+annotation (removed when the set becomes empty). See it with:
+
+```sh
+kubectl -n <ns> get events --field-selector reason=PolicyNameCollision
+kubectl -n <ns> get loop <name> -o jsonpath='{.metadata.annotations.coxswain\.io/policy-collisions}'
+```
+
+Which scope wins on a collision is the open owner question D98; the
+namespaced-wins behaviour above is the current implementation.
+
+**Operator RBAC.** The operator's ClusterRole has `get;list;watch` on
+`clusteragentpolicies` (read-only — the operator never writes a policy), and
+it **watches** the kind: an edit to a `ClusterAgentPolicy` re-reconciles every
+Loop in every namespace that names it, including a narrowing edit (the
+watch's map, `clusterAgentPolicyToLoopRequests`, lists all namespaces).
 
 ### What the sandbox cannot reach
 

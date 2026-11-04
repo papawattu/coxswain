@@ -1861,7 +1861,14 @@ func (r *LoopReconciler) updateLoopAnnotations(ctx context.Context, loop *coxv1a
 	// annotation back onto the in-memory loop so the rest of this pass (and
 	// the transition gate's read of the durable surface) sees the written
 	// value.
-	loop.Annotations[key] = updated.Annotations[key]
+	if loop.Annotations == nil {
+		loop.Annotations = make(map[string]string)
+	}
+	if v, ok := updated.Annotations[key]; ok {
+		loop.Annotations[key] = v
+	} else {
+		delete(loop.Annotations, key)
+	}
 	return nil
 }
 
@@ -6735,7 +6742,7 @@ func (r *LoopReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	// namespaces, so the map lists ALL namespaces (a ClusterAgentPolicy edit,
 	// including a narrowing one, must refresh every referencing Loop's
 	// recorded hash).
-	b.Watches(&coxv1alpha1.ClusterAgentPolicy{}, handler.EnqueueRequestsFromMapFunc(
+	b = b.Watches(&coxv1alpha1.ClusterAgentPolicy{}, handler.EnqueueRequestsFromMapFunc(
 		r.clusterAgentPolicyToLoopRequests))
 	// The operator owns the per-Loop KubeArmorPolicy (A1/D52 fact 3, name
 	// "coxswain-<loop>"). Watch it so a tamper (a spec change after the

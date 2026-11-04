@@ -17,6 +17,7 @@ package cni
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"strings"
@@ -24,7 +25,10 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -85,98 +89,93 @@ func TestProbeCommandShape(t *testing.T) {
 	}
 }
 
-// D38 design point 4: strict validation. A termination message with the wrong
-// line count, an unknown label, an unknown verdict, or a non-zero pod exit is
-// ProbeUnavailable — never a false pass.
-func TestProbeParseStrictValidation(t *testing.T) {
-	p := NewPodProber(PodProberConfig{Namespace: probePodName, ProbeImage: probeTestImage})
-	// The normal PASS case: all four expected-BLOCKED targets BLOCKED
-	// (APISERVER_SVC, NODE_API, KUBELET_NODE, EXTERNAL) and the positive
-	// control (DNS_POSITIVE) REACHABLE -> CNIEnforced.
-	allBlocked := "RESULT APISERVER_SVC BLOCKED\nRESULT NODE_API BLOCKED\nRESULT KUBELET_NODE BLOCKED\nRESULT EXTERNAL BLOCKED\nRESULT DNS_POSITIVE REACHABLE\nDONE"
-	res, err := p.parse(allBlocked, pod(allBlocked, 0))
-	if err != nil {
-		t.Fatalf("parse: %v", err)
-	}
-	if res.Reason != ReasonCNIEnforced {
-		t.Fatalf("all expected-BLOCKED targets BLOCKED + control REACHABLE -> CNIEnforced, got %v", res)
-	}
-
-	oneReachable := "RESULT APISERVER_SVC REACHABLE\nRESULT NODE_API BLOCKED\nRESULT KUBELET_NODE BLOCKED\nRESULT EXTERNAL BLOCKED\nRESULT DNS_POSITIVE REACHABLE\nDONE"
-	res, err = p.parse(oneReachable, pod(oneReachable, 0))
-	if err != nil {
-		t.Fatalf("parse: %v", err)
-	}
-	if res.Reason != ReasonCNIUnenforced {
-		t.Fatalf("one expected-BLOCKED target REACHABLE -> CNIUnenforced, got %v", res)
-	}
-	// The Event/condition message renders "REACHABLE targets: " + Detail, so
-	// Detail must carry the reachable expected-BLOCKED label (otherwise the
-	// message reads "REACHABLE targets: " with nothing after it).
-	if res.Detail != "APISERVER_SVC" {
-		t.Fatalf("CNIUnenforced Detail must list the reachable expected-BLOCKED labels, got %q", res.Detail)
-	}
-
-	for _, tc := range []struct {
-		name, msg string
-		exit      int32
-	}{
-		// The positive control (DNS_POSITIVE) is what the probe netpol
-		// ALLOWS (kube-dns :53). A BLOCKED control means the probe has no
-		// network -> ProbeUnavailable, never CNIEnforced on an unproven fence.
-		{"BLOCKED control -> ProbeUnavailable", "RESULT APISERVER_SVC BLOCKED\nRESULT NODE_API BLOCKED\nRESULT KUBELET_NODE BLOCKED\nRESULT EXTERNAL BLOCKED\nRESULT DNS_POSITIVE BLOCKED\nDONE", 0},
-		// EXTERNAL is now an expected-BLOCKED target (not in the DNS-only
-		// allow list). EXTERNAL REACHABLE (e.g. on a non-enforcing CNI like
-		// kindnet) -> CNIUnenforced, NOT a control failure.
-		{"EXTERNAL REACHABLE -> CNIUnenforced", "RESULT APISERVER_SVC BLOCKED\nRESULT NODE_API BLOCKED\nRESULT KUBELET_NODE BLOCKED\nRESULT EXTERNAL REACHABLE\nRESULT DNS_POSITIVE REACHABLE\nDONE", 0},
-		{"missing RESULT line", "RESULT APISERVER_SVC BLOCKED\nDONE", 0},
-		{"unknown label", "RESULT APISERVER_SVC BLOCKED\nRESULT NODE_API BLOCKED\nRESULT KUBELET_NODE BLOCKED\nRESULT EXTERNAL BLOCKED\nRESULT WHATEVER BLOCKED\nDONE", 0},
-		{"unknown verdict", "RESULT APISERVER_SVC MEDIUM\nRESULT KUBELET_NODE BLOCKED\nRESULT KUBELET_NODE BLOCKED\nRESULT EXTERNAL REACHABLE\nRESULT DNS_POSITIVE REACHABLE\nDONE", 0},
-		{"non-zero exit", allBlocked, 1},
-		{"empty message", "", 0},
-		// F51 P2-2: an UNRESOLVED row is a missing measurement, not a
-		// verdict. It must never be CNIEnforced (the fence would look
-		// proven) and never CNIUnenforced (a resolution failure would look
-		// like a fence bypass), whichever target it is.
-		{"UNRESOLVED expected-BLOCKED target -> ProbeUnavailable", "RESULT APISERVER_SVC UNRESOLVED\nRESULT NODE_API BLOCKED\nRESULT KUBELET_NODE BLOCKED\nRESULT EXTERNAL BLOCKED\nRESULT DNS_POSITIVE REACHABLE\nDONE", 0},
-		{"UNRESOLVED positive control -> ProbeUnavailable", "RESULT APISERVER_SVC BLOCKED\nRESULT NODE_API BLOCKED\nRESULT KUBELET_NODE BLOCKED\nRESULT EXTERNAL BLOCKED\nRESULT DNS_POSITIVE UNRESOLVED\nDONE", 0},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			res, err := p.parse(tc.msg, pod(tc.msg, tc.exit))
-			if err != nil {
-				t.Fatalf("parse: %v", err)
-			}
-			if tc.name == "EXTERNAL REACHABLE -> CNIUnenforced" {
-				if res.Reason != ReasonCNIUnenforced {
-					t.Fatalf("want CNIUnenforced, got %v (detail=%q)", res.Reason, res.Detail)
+// D103 (slice B): the non-zero-exit check stays for BOTH passes. A pass that
+// exits non-zero is ProbeUnavailable (detail names the pass) even if the
+// message looks valid — never a verdict about the fence.
+func TestProbeNonZeroExitInEitherPassIsUnavailable(t *testing.T) {
+	okMsg := "RESULT APISERVER_SVC BLOCKED\nRESULT NODE_API BLOCKED\nRESULT KUBELET_NODE BLOCKED\nRESULT EXTERNAL BLOCKED\nRESULT DNS_POSITIVE REACHABLE\nDONE"
+	for _, pass := range []string{"control", "policy"} {
+		t.Run(pass+" pass", func(t *testing.T) {
+			cl := newProbeFakeClient(t)
+			p := NewPodProber(PodProberConfig{Namespace: probePodName, ProbeImage: probeTestImage, ProbeTimeout: 30 * time.Second, Client: cl, Reader: cl})
+			if pass == "control" {
+				p.run = func(ctx context.Context, pod *corev1.Pod) (string, string, error) {
+					return "", "", fmt.Errorf("%s pod: probe exited non-zero: 3", pod.Name)
+				}
+				res, _ := p.Probe(context.Background())
+				if res.Reason != ReasonProbeUnavailable || !strings.Contains(res.Detail, "control pass") {
+					t.Fatalf("want ProbeUnavailable naming the control pass, got %v %q", res.Reason, res.Detail)
 				}
 				return
 			}
-			if res.Reason != ReasonProbeUnavailable {
-				t.Fatalf("want ProbeUnavailable, got %v (detail=%q)", res.Reason, res.Detail)
+			// Policy pass exits non-zero, control pass fine.
+			calls := 0
+			p.run = func(ctx context.Context, pod *corev1.Pod) (string, string, error) {
+				calls++
+				if calls == 1 {
+					return okMsg, "n1", nil
+				}
+				return "", "", fmt.Errorf("%s pod: probe exited non-zero: 3", pod.Name)
+			}
+			res, _ := p.Probe(context.Background())
+			if res.Reason != ReasonProbeUnavailable || !strings.Contains(res.Detail, "policy pass") {
+				t.Fatalf("want ProbeUnavailable naming the policy pass, got %v %q", res.Reason, res.Detail)
 			}
 		})
 	}
 }
 
-// F51 P2-2: UNRESOLVED is not a verdict about the fence. The result must be
-// ProbeUnavailable, and its Detail must name the target that could not be
-// resolved instead of the CNIUnenforced rendering ("REACHABLE targets: …").
-func TestProbeParseUnresolvedIsUnavailableNotAVerdict(t *testing.T) {
-	p := NewPodProber(PodProberConfig{Namespace: probePodName, ProbeImage: probeTestImage})
-	msg := "RESULT APISERVER_SVC BLOCKED\nRESULT NODE_API UNRESOLVED\nRESULT KUBELET_NODE BLOCKED\nRESULT EXTERNAL BLOCKED\nRESULT DNS_POSITIVE REACHABLE\nDONE"
-	res, err := p.parse(msg, pod(msg, 0))
+func runTwoPasses(t *testing.T, p *PodProber, controlMsg, policyMsg string) CNIProbeResult {
+	t.Helper()
+	if p.cfg.Client == nil {
+		cl := newProbeFakeClient(t)
+		p.cfg.Client = cl
+		p.cfg.Reader = cl
+	}
+	calls := 0
+	p.run = func(ctx context.Context, pod *corev1.Pod) (string, string, error) {
+		calls++
+		if calls == 1 {
+			return controlMsg, "n1", nil
+		}
+		return policyMsg, "n1", nil
+	}
+	res, err := p.Probe(context.Background())
 	if err != nil {
-		t.Fatalf("parse: %v", err)
+		t.Fatalf("Probe: %v", err)
 	}
-	if res.Reason != ReasonProbeUnavailable {
-		t.Fatalf("an UNRESOLVED target must be ProbeUnavailable, got %v", res.Reason)
-	}
-	if !strings.Contains(res.Detail, "NODE_API") {
-		t.Fatalf("the Detail must name the unresolved target, got %q", res.Detail)
-	}
-	if got := res.Describe(); strings.Contains(got, "REACHABLE targets") {
-		t.Fatalf("an unresolved target must not render as a fence bypass, got %q", got)
+	return res
+}
+
+// F51 P2-2 / D103: UNRESOLVED is not a verdict about the fence. A combined
+// UNRESOLVED row must make the result ProbeUnavailable, and its Detail must
+// name the target that could not be resolved instead of the CNIUnenforced
+// rendering ("REACHABLE targets: …").
+func TestProbeUnresolvedIsUnavailableNotAVerdict(t *testing.T) {
+	// Both passes must carry the UNRESOLVED row: combineVerdicts is policy-
+	// first (policy UNRESOLVED dominates the cell), so a control-only
+	// UNRESOLVED would combine to the policy pass's BLOCKED.
+	unresolvedMsg := "RESULT APISERVER_SVC BLOCKED\nRESULT NODE_API UNRESOLVED\nRESULT KUBELET_NODE BLOCKED\nRESULT EXTERNAL BLOCKED\nRESULT DNS_POSITIVE REACHABLE\nDONE"
+	for _, tc := range []struct {
+		name string
+		c, p string
+	}{
+		{"policy pass UNRESOLVED", unresolvedMsg, unresolvedMsg},
+		{"control pass UNRESOLVED", unresolvedMsg, unresolvedMsg},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cl := newProbeFakeClient(t)
+			res := runTwoPasses(t, NewPodProber(PodProberConfig{Namespace: probePodName, ProbeImage: probeTestImage, Client: cl, Reader: cl}), tc.c, tc.p)
+			if res.Reason != ReasonProbeUnavailable {
+				t.Fatalf("a combined UNRESOLVED target must be ProbeUnavailable, got %v", res.Reason)
+			}
+			if !strings.Contains(res.Detail, "NODE_API") {
+				t.Fatalf("the Detail must name the unresolved target, got %q", res.Detail)
+			}
+			if got := res.Describe(); strings.Contains(got, "REACHABLE targets") {
+				t.Fatalf("an unresolved target must not render as a fence bypass, got %q", got)
+			}
+		})
 	}
 }
 
@@ -422,13 +421,13 @@ func aroundSplice(script string) string {
 	return script[i:min(i+160, len(script))]
 }
 
-// D38s3 (Calico run): the holder must be written ONLY by probeOnce (the
-// Runnable). parse() must NOT call Holder().Set — if it did, probeOnce's own
-// Holder().Set(newResult) would read changed=false and skip the re-gate
-// (no log, no metric, no GenericEvent), so Loops would keep the stale Unknown
-// condition forever. This test drives parse() directly and asserts the holder
-// is untouched (still Unknown, the pre-parse state).
-func TestParseDoesNotWriteTheHolder(t *testing.T) {
+// D38s3 (Calico run) / D103: the holder must be written ONLY by probeOnce (the
+// Runnable). Probe() must NOT call Holder().Set — if it did, probeOnce's own
+// Holder().Set(newResult) would read changed=false and skip the re-gate (no
+// log, no metric, no GenericEvent), so Loops would keep the stale Unknown
+// condition forever. This test drives Probe() (two stubbed passes) directly
+// and asserts the holder is untouched (still Unknown, the pre-Probe state).
+func TestProbeDoesNotWriteTheHolder(t *testing.T) {
 	ResetForTest()
 	t.Cleanup(ResetForTest)
 
@@ -437,16 +436,17 @@ func TestParseDoesNotWriteTheHolder(t *testing.T) {
 		t.Fatalf("precondition: holder should start at Unknown, got %v", got)
 	}
 
-	p := NewPodProber(PodProberConfig{Namespace: probePodName, ProbeImage: probeTestImage})
-	allBlocked := "RESULT APISERVER_SVC BLOCKED\nRESULT NODE_API BLOCKED\nRESULT KUBELET_NODE BLOCKED\nRESULT EXTERNAL REACHABLE\nDONE"
-	// parse() returns CNIEnforced for all-BLOCKED — but it must NOT write the
-	// holder. probeOnce (the Runnable) is the only writer.
-	if _, err := p.parse(allBlocked, pod(allBlocked, 0)); err != nil {
-		t.Fatalf("parse: %v", err)
+	okMsg := "RESULT APISERVER_SVC BLOCKED\nRESULT NODE_API BLOCKED\nRESULT KUBELET_NODE BLOCKED\nRESULT EXTERNAL BLOCKED\nRESULT DNS_POSITIVE REACHABLE\nDONE"
+	// Probe() returns CNIEnforced for all-BLOCKED passes — but it must NOT
+	// write the holder. probeOnce (the Runnable) is the only writer.
+	cl := newProbeFakeClient(t)
+	res := runTwoPasses(t, NewPodProber(PodProberConfig{Namespace: probePodName, ProbeImage: probeTestImage, Client: cl, Reader: cl}), okMsg, okMsg)
+	if res.Reason != ReasonCNIEnforced {
+		t.Fatalf("two all-BLOCKED passes must be CNIEnforced, got %v", res.Reason)
 	}
-	// The holder must STILL be Unknown: parse() must not have written it.
+	// The holder must STILL be Unknown: Probe() must not have written it.
 	if got := Holder().Result().Reason; got != ReasonUnknown {
-		t.Fatalf("parse() wrote the holder (reason=%v); the holder must only be written by probeOnce (the Runnable)", got)
+		t.Fatalf("Probe() wrote the holder (reason=%v); the holder must only be written by probeOnce (the Runnable)", got)
 	}
 }
 
@@ -459,23 +459,50 @@ func TestParseDoesNotWriteTheHolder(t *testing.T) {
 // termination message).
 //
 // Mutation: delete the ImagePullPolicy field from buildPod → this test fails.
+// D103 (slice B): the table now covers BOTH pod builders (the policy pod and
+// the no-policy control pod) — same image, command, env, security context and
+// token-automount=false for both, different name and probe label value.
 func TestBuildPodIsPinnedAndCredentialFree(t *testing.T) {
 	p := NewPodProber(PodProberConfig{
 		Namespace:  probePodName,
 		ProbeImage: probeTestImage,
 	})
-	pod := p.buildPod()
-	if len(pod.Spec.Containers) != 1 {
-		t.Fatalf("probe pod has %d containers, want 1", len(pod.Spec.Containers))
-	}
-	if got := pod.Spec.Containers[0].ImagePullPolicy; got != corev1.PullIfNotPresent {
-		t.Errorf("probe container ImagePullPolicy = %q, want %q (explicit: a pinned image must not be re-resolved)", got, corev1.PullIfNotPresent)
-	}
-	if pod.Spec.AutomountServiceAccountToken == nil || *pod.Spec.AutomountServiceAccountToken {
-		t.Error("the probe pod must not mount a service-account token (it needs no API access, ADR-0006)")
-	}
-	if pod.Spec.Containers[0].Image == "" {
-		t.Error("the probe container must carry the configured image")
+	for _, tc := range []struct {
+		name       string
+		pod        *corev1.Pod
+		wantName   string
+		wantLabel  string
+		wantPinned string // "" = no node constraint
+	}{
+		{"policy pod", p.buildPod(probePodName, probeLabelValue, ""), probePodName, probeLabelValue, ""},
+		{"policy pod pinned to the control node", p.buildPod(probePodName, probeLabelValue, "n1"), probePodName, probeLabelValue, "n1"},
+		{"control pod", p.buildPod(probeControlPod, probeControlLabelVal, ""), probeControlPod, probeControlLabelVal, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := tc.pod
+			if c.Name != tc.wantName {
+				t.Fatalf("pod name = %q, want %q", c.Name, tc.wantName)
+			}
+			if got := c.Labels[probeLabelKey]; got != tc.wantLabel {
+				t.Errorf("pod label %s = %q, want %q", probeLabelKey, got, tc.wantLabel)
+			}
+			if len(c.Spec.Containers) != 1 {
+				t.Fatalf("probe pod has %d containers, want 1", len(c.Spec.Containers))
+			}
+			if got := c.Spec.Containers[0].ImagePullPolicy; got != corev1.PullIfNotPresent {
+				t.Errorf("probe container ImagePullPolicy = %q, want %q (explicit: a pinned image must not be re-resolved)", got, corev1.PullIfNotPresent)
+			}
+			if c.Spec.AutomountServiceAccountToken == nil || *c.Spec.AutomountServiceAccountToken {
+				t.Error("the probe pod must not mount a service-account token (it needs no API access, ADR-0006)")
+			}
+			if c.Spec.Containers[0].Image == "" {
+				t.Error("the probe container must carry the configured image")
+			}
+			pin := c.Spec.NodeSelector["kubernetes.io/hostname"]
+			if pin != tc.wantPinned {
+				t.Errorf("NodeSelector[\"kubernetes.io/hostname\"] = %q, want %q", pin, tc.wantPinned)
+			}
+		})
 	}
 }
 
@@ -730,5 +757,243 @@ func TestParsePassRejectsDuplicateLabel(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "duplicate") {
 		t.Fatalf("error %q must name the duplicate label", err.Error())
+	}
+}
+
+func newProbeFakeClient(t *testing.T) client.Client {
+	t.Helper()
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = networkingv1.AddToScheme(scheme)
+	return fake.NewClientBuilder().WithScheme(scheme).Build()
+}
+
+const (
+	controlOK = "RESULT APISERVER_SVC BLOCKED\nRESULT NODE_API BLOCKED\nRESULT KUBELET_NODE BLOCKED\nRESULT EXTERNAL BLOCKED\nRESULT DNS_POSITIVE REACHABLE\nDONE"
+	policyOK  = "RESULT APISERVER_SVC BLOCKED\nRESULT NODE_API BLOCKED\nRESULT KUBELET_NODE BLOCKED\nRESULT EXTERNAL BLOCKED\nRESULT DNS_POSITIVE REACHABLE\nDONE"
+)
+
+// D103 (slice B): the control pod must NOT be selected by the probe
+// NetworkPolicy — that is what makes it a no-policy baseline. Convert the
+// netpol's PodSelector with metav1.LabelSelectorAsSelector and assert it
+// matches the policy pod's labels and does NOT match the control pod's.
+// Reviewer mutation M-B1 (the control pod gets the probe label) must fail this.
+func TestControlPodNotSelectedByProbeNetpol(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = networkingv1.AddToScheme(scheme)
+	cl := fake.NewClientBuilder().WithScheme(scheme).Build()
+	p := NewPodProber(PodProberConfig{
+		Namespace:  probePodName,
+		ProbeImage: probeTestImage,
+		Client:     cl,
+		Reader:     cl,
+	})
+	ctx := context.Background()
+	if err := p.ensureNetpol(ctx); err != nil {
+		t.Fatalf("ensureNetpol: %v", err)
+	}
+	got := &networkingv1.NetworkPolicy{}
+	if err := cl.Get(ctx, client.ObjectKey{Namespace: probePodName, Name: probeNetpolName}, got); err != nil {
+		t.Fatalf("get netpol: %v", err)
+	}
+	sel, err := metav1.LabelSelectorAsSelector(&got.Spec.PodSelector)
+	if err != nil {
+		t.Fatalf("the netpol podSelector must convert: %v", err)
+	}
+	policyPod := p.buildPod(probePodName, probeLabelValue, "")
+	controlPod := p.buildPod(probeControlPod, probeControlLabelVal, "")
+	if !sel.Matches(labels.Set(policyPod.Labels)) {
+		t.Fatalf("the probe netpol must SELECT the policy pod (labels %v)", policyPod.Labels)
+	}
+	if sel.Matches(labels.Set(controlPod.Labels)) {
+		t.Fatalf("the probe netpol must NOT select the control pod (labels %v) — it would run under the very policy the control pass exists to bypass", controlPod.Labels)
+	}
+}
+
+// D103 (slice B): the policy pod is pinned to the control pod's node so
+// NODE_IP (downward status.hostIP) names the same node in both passes. A stub
+// run returning node n1 for the control pod must produce a second call whose
+// policy pod carries NodeSelector kubernetes.io/hostname=n1. Reviewer
+// mutation M-B2 (drop the pin) must fail this.
+func TestPolicyPodPinnedToControlNode(t *testing.T) {
+	cl := newProbeFakeClient(t)
+	p := NewPodProber(PodProberConfig{Namespace: probePodName, ProbeImage: probeTestImage, ProbeTimeout: 30 * time.Second, Client: cl, Reader: cl})
+	var policyPod *corev1.Pod
+	calls := 0
+	p.run = func(ctx context.Context, pod *corev1.Pod) (string, string, error) {
+		calls++
+		if calls == 1 {
+			// The control pass: report the node the policy pass must pin to.
+			return controlOK, "n1", nil
+		}
+		policyPod = pod
+		return policyOK, pod.Spec.NodeName, nil
+	}
+	res, _ := p.Probe(context.Background())
+	if res.Reason != ReasonCNIEnforced {
+		t.Fatalf("two all-BLOCKED/REACHABLE passes must be CNIEnforced, got %v %q", res.Reason, res.Detail)
+	}
+	if calls != 2 {
+		t.Fatalf("the probe must run exactly two passes, ran %d", calls)
+	}
+	if policyPod == nil {
+		t.Fatal("the policy pod was never built (the policy pass never ran)")
+	}
+	if got := policyPod.Name; got != probePodName {
+		t.Fatalf("the second pass must be the policy pod %q, got %q", probePodName, got)
+	}
+	if got := policyPod.Labels[probeLabelKey]; got != probeLabelValue {
+		t.Fatalf("the policy pod must carry the netpol-selected label %s=%q", probeLabelKey, got)
+	}
+	if got := policyPod.Spec.NodeSelector["kubernetes.io/hostname"]; got != "n1" {
+		t.Fatalf("the policy pod must be pinned to the control pod's node via NodeSelector kubernetes.io/hostname=n1, got NodeSelector %v", policyPod.Spec.NodeSelector)
+	}
+}
+
+// D103 (slice B): the homelab case, end-to-end through the seam. Control
+// (no policy): all REACHABLE except NODE_API REFUSED (no apiserver on the
+// worker node). Policy (netpol, a REJECT-style controller): all REFUSED
+// except DNS_POSITIVE REACHABLE. REFUSED+REACHABLE combines to BLOCKED,
+// REFUSED+REFUSED to NOT_LISTENING -> CNIEnforced.
+func TestProbeTwoPassHomelabIsEnforced(t *testing.T) {
+	control := "RESULT APISERVER_SVC REACHABLE\nRESULT NODE_API REFUSED\nRESULT KUBELET_NODE REACHABLE\nRESULT EXTERNAL REACHABLE\nRESULT DNS_POSITIVE REACHABLE\nDONE"
+	policy := "RESULT APISERVER_SVC REFUSED\nRESULT NODE_API REFUSED\nRESULT KUBELET_NODE REFUSED\nRESULT EXTERNAL REFUSED\nRESULT DNS_POSITIVE REACHABLE\nDONE"
+	cl := newProbeFakeClient(t)
+	res := runTwoPasses(t, NewPodProber(PodProberConfig{Namespace: probePodName, ProbeImage: probeTestImage, Client: cl, Reader: cl}), control, policy)
+	if res.Reason != ReasonCNIEnforced {
+		t.Fatalf("the homelab (REJECT-style) case must be CNIEnforced, got %v %q", res.Reason, res.Detail)
+	}
+	// Rows carry every label's combined verdict, NOT_LISTENING included.
+	want := map[string]string{"APISERVER_SVC": verdictBlocked, "NODE_API": verdictNotListening, "KUBELET_NODE": verdictBlocked, "EXTERNAL": verdictBlocked, "DNS_POSITIVE": verdictReachable}
+	if len(res.Rows) != len(want) {
+		t.Fatalf("Rows must carry all %d labels, got %d", len(want), len(res.Rows))
+	}
+	for _, row := range res.Rows {
+		if want[row.Label] != row.Verdict {
+			t.Errorf("combined %s = %s, want %s (rows %+v)", row.Label, row.Verdict, want[row.Label], res.Rows)
+		}
+	}
+}
+
+// D103 (slice B): the kindnet case, end-to-end through the seam. kindnet does
+// not enforce NetworkPolicy: the policy pass is REACHABLE, which stays
+// REACHABLE in the combined pass -> CNIUnenforced (as today).
+func TestProbeTwoPassKindnetIsUnenforced(t *testing.T) {
+	allReachable := "RESULT APISERVER_SVC REACHABLE\nRESULT NODE_API REACHABLE\nRESULT KUBELET_NODE REACHABLE\nRESULT EXTERNAL REACHABLE\nRESULT DNS_POSITIVE REACHABLE\nDONE"
+	cl := newProbeFakeClient(t)
+	res := runTwoPasses(t, NewPodProber(PodProberConfig{Namespace: probePodName, ProbeImage: probeTestImage, Client: cl, Reader: cl}), allReachable, allReachable)
+	// The control (no-policy) baseline is all REACHABLE on kindnet, and so
+	// is the policy pass (kindnet does not enforce the netpol) -> CNIUnenforced.
+	if res.Reason != ReasonCNIUnenforced {
+		t.Fatalf("kindnet (policy REACHABLE) must be CNIUnenforced, got %v %q", res.Reason, res.Detail)
+	}
+	if !strings.Contains(res.Detail, "APISERVER_SVC") || !strings.Contains(res.Detail, "EXTERNAL") {
+		t.Fatalf("CNIUnenforced Detail must list the reachable expected-BLOCKED labels, got %q", res.Detail)
+	}
+}
+
+// D103 (slice B): a failed control pass is ProbeUnavailable naming the
+// control pass, and the policy pod is NEVER run (no fence measurement is
+// possible without the baseline, and running the policy pod would leak no
+// information but burn the timeout).
+func TestProbeControlFailureIsUnavailable(t *testing.T) {
+	cl := newProbeFakeClient(t)
+	p := NewPodProber(PodProberConfig{Namespace: probePodName, ProbeImage: probeTestImage, ProbeTimeout: 30 * time.Second, Client: cl, Reader: cl})
+	calls := 0
+	p.run = func(ctx context.Context, pod *corev1.Pod) (string, string, error) {
+		calls++
+		if calls == 1 {
+			return "", "", fmt.Errorf("control pod timed out (probe pod not Ready within timeout)")
+		}
+		t.Error("the policy pod must never be run after a control pass failure")
+		return "", "", nil
+	}
+	res, _ := p.Probe(context.Background())
+	if res.Reason != ReasonProbeUnavailable {
+		t.Fatalf("a failed control pass must be ProbeUnavailable, got %v %q", res.Reason, res.Detail)
+	}
+	if !strings.Contains(res.Detail, "control pass") {
+		t.Fatalf("the Detail must name the control pass, got %q", res.Detail)
+	}
+	if calls != 1 {
+		t.Fatalf("the policy pod must never be run after a control failure, run was called %d times", calls)
+	}
+}
+
+// D103 (slice B): cleanup deletes BOTH probe pods (policy and control — a
+// stale control pod from a previous run must go too, or the next run's
+// create collides) and the netpol.
+func TestCleanupDeletesBothPods(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = networkingv1.AddToScheme(scheme)
+	policy := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: probePodName, Namespace: probePodName}}
+	control := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: probeControlPod, Namespace: probePodName}}
+	netpol := &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: probeNetpolName, Namespace: probePodName}}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(policy, control, netpol).Build()
+	p := NewPodProber(PodProberConfig{
+		Namespace:  probePodName,
+		ProbeImage: probeTestImage,
+		Client:     cl,
+		Reader:     cl,
+	})
+	if err := p.cleanup(context.Background()); err != nil {
+		t.Fatalf("cleanup: %v", err)
+	}
+	for _, obj := range []client.Object{policy, control, netpol} {
+		fresh := obj.DeepCopyObject().(client.Object)
+		err := cl.Get(context.Background(), client.ObjectKeyFromObject(obj), fresh)
+		if !apierrors.IsNotFound(err) {
+			t.Errorf("cleanup must delete %v, still present (get err=%v)", obj.GetName(), err)
+		}
+	}
+}
+
+// D103 (slice B): a control pod that terminated on an UNBOUND node
+// (spec.nodeName empty — e.g. the scheduler has not placed it yet when a
+// message somehow surfaced, or a stub that reports no node) is
+// ProbeUnavailable: the policy pod cannot be pinned without a node.
+func TestProbeControlPodWithoutNodeIsUnavailable(t *testing.T) {
+	cl := newProbeFakeClient(t)
+	p := NewPodProber(PodProberConfig{Namespace: probePodName, ProbeImage: probeTestImage, ProbeTimeout: 30 * time.Second, Client: cl, Reader: cl})
+	calls := 0
+	p.run = func(ctx context.Context, pod *corev1.Pod) (string, string, error) {
+		calls++
+		if calls == 1 {
+			return controlOK, "", nil // no node
+		}
+		t.Error("the policy pod must never be run when the control pod has no node")
+		return "", "", nil
+	}
+	res, _ := p.Probe(context.Background())
+	if res.Reason != ReasonProbeUnavailable || !strings.Contains(res.Detail, "no node") {
+		t.Fatalf("a control pod with an empty nodeName must be ProbeUnavailable naming the missing node, got %v %q", res.Reason, res.Detail)
+	}
+	if calls != 1 {
+		t.Fatalf("the policy pod must never be run when the control pod has no node, run was called %d times", calls)
+	}
+}
+
+// D103 (slice B): an invalid termination message on EITHER pass (a wrong line
+// shape, an unknown label, a short table) is ProbeUnavailable naming the
+// pass — never a verdict about the fence.
+func TestProbeEitherPassInvalidMessageIsUnavailable(t *testing.T) {
+	ok := "RESULT APISERVER_SVC BLOCKED\nRESULT NODE_API BLOCKED\nRESULT KUBELET_NODE BLOCKED\nRESULT EXTERNAL BLOCKED\nRESULT DNS_POSITIVE REACHABLE\nDONE"
+	bad := "RESULT APISERVER_SVC BLOCKED\nDONE" // short table
+	for _, tc := range []struct {
+		name, c, p string
+		pass       string
+	}{
+		{"policy pass invalid", ok, bad, "policy pass"},
+		{"control pass invalid", bad, ok, "control pass"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cl := newProbeFakeClient(t)
+			res := runTwoPasses(t, NewPodProber(PodProberConfig{Namespace: probePodName, ProbeImage: probeTestImage, Client: cl, Reader: cl}), tc.c, tc.p)
+			if res.Reason != ReasonProbeUnavailable || !strings.Contains(res.Detail, tc.pass) {
+				t.Fatalf("want ProbeUnavailable naming %s, got %v %q", tc.pass, res.Reason, res.Detail)
+			}
+		})
 	}
 }

@@ -61,6 +61,12 @@ type PodProberConfig struct {
 // PodProber is the real CNIProber.
 type PodProber struct {
 	cfg PodProberConfig
+	// run is the per-pass seam: it creates one probe pod, waits for its
+	// termination message within the per-run timeout, and deletes the pod.
+	// Probe() calls it through this field (set in NewPodProber to runPod) so
+	// a test can replace it with a stub and drive the two-pass decision
+	// without touching the API.
+	run func(ctx context.Context, pod *corev1.Pod) (msg string, nodeName string, err error)
 }
 
 // NewPodProber returns a real CNIProber.
@@ -68,27 +74,36 @@ func NewPodProber(cfg PodProberConfig) *PodProber {
 	if cfg.ClusterDomain == "" {
 		cfg.ClusterDomain = "cluster.local"
 	}
-	return &PodProber{cfg: cfg}
+	pp := &PodProber{cfg: cfg}
+	pp.run = pp.runPod // the per-pass seam; tests replace pp.run with a stub
+	return pp
 }
 
 const (
-	probePodName      = "coxswain-cni-probe"
-	probeNetpolName   = "coxswain-cni-probe-netpol"
-	probeLabelKey     = "coxswain.io/probe"
-	expectedResultLen = 5 // 4 expected-BLOCKED (APISERVER_SVC, NODE_API, KUBELET_NODE, EXTERNAL) + 1 positive control (DNS_POSITIVE)
-	verdictReachable  = "REACHABLE"
-	verdictBlocked    = "BLOCKED"
+	probePodName    = "coxswain-cni-probe"
+	probeControlPod = "coxswain-cni-probe-control"
+	probeNetpolName = "coxswain-cni-probe-netpol"
+	probeLabelKey   = "coxswain.io/probe"
+	// probeLabelValue is the policy pass's probe label value: the probe
+	// NetworkPolicy selects exactly coxswain.io/probe=cni-probe, so the control
+	// pass (cni-probe-control) runs with NO policy applied (D103).
+	probeLabelValue      = "cni-probe"
+	probeControlLabelVal = "cni-probe-control"
+	expectedResultLen    = 5 // 4 expected-BLOCKED (APISERVER_SVC, NODE_API, KUBELET_NODE, EXTERNAL) + 1 positive control (DNS_POSITIVE)
+	verdictReachable     = "REACHABLE"
+	verdictBlocked       = "BLOCKED"
 	// verdictUnresolved: the target's hostname could not be resolved, so the
 	// probe has no evidence either way. It is never Enforced and never
-	// Unenforced: parse() maps any UNRESOLVED row to ProbeUnavailable (F51
-	// P2-2 — the old script reported a resolution failure as REACHABLE, i.e.
-	// an unresolvable expected-BLOCKED target counted as a fence bypass).
+	// Unenforced: a combined UNRESOLVED row makes the probe
+	// ProbeUnavailable (F51 P2-2 — the old script reported a resolution
+	// failure as REACHABLE, i.e. an unresolvable expected-BLOCKED target
+	// counted as a fence bypass).
 	verdictUnresolved = "UNRESOLVED"
 	// verdictRefused: the connection reached the host and was actively
 	// rejected (ConnectionRefusedError). It is not by itself evidence of a
 	// policy drop (nothing may listen there) — combineVerdicts resolves it
-	// against the no-policy control pass (D103). Until that pass exists, a
-	// REFUSED row maps to ProbeUnavailable like UNRESOLVED.
+	// against the no-policy control pass (D103): a control REACHABLE makes
+	// it BLOCKED, a control REFUSED makes it NOT_LISTENING.
 	verdictRefused = "REFUSED"
 	// verdictNotListening: the combined verdict for a target refused in BOTH
 	// passes — nothing listens there. It carries no verdict about the fence
@@ -276,35 +291,79 @@ except Exception as exc:
 	}
 }
 
-// Probe runs one probe: it cleans up any stale probe objects, creates the
-// probe NetworkPolicy + pod, waits for the termination message within the
-// timeout, validates the RESULT lines strictly, deletes the pod, and reports
-// the result. Any failure (timeout, not-Ready, non-zero exit, wrong/unknown
+// Probe runs one probe (D103: two passes, both within cfg.ProbeTimeout):
+// it cleans up any stale probe objects, creates the probe NetworkPolicy,
+// runs the no-policy CONTROL pod (same spec, a label the netpol does NOT
+// select) and reads its node, then runs the POLICY pod (netpol-selected)
+// pinned to the SAME node so NODE_IP names the same node in both passes.
+// The two RESULT tables are combined per label (combineVerdicts) and the
+// verdict comes from decide(). Any failure (stale cleanup, netpol create,
+// a pass that times out / goes not-Ready / exits non-zero, wrong/unknown
 // RESULT lines) returns ReasonProbeUnavailable.
 func (p *PodProber) Probe(ctx context.Context) (CNIProbeResult, error) {
 	probeCtx, cancel := context.WithTimeout(ctx, p.cfg.ProbeTimeout)
 	defer cancel()
 
 	// Stale cleanup at startup (the PR #38 leak): delete any leftover probe
-	// pod / NetworkPolicy from a previous run.
+	// pod (both passes) / NetworkPolicy from a previous run.
 	if err := p.cleanup(probeCtx); err != nil {
 		return unavailable("stale cleanup failed: " + err.Error()), nil
 	}
 
-	// Create the NetworkPolicy (the agent-shaped allow: dns 53/tcp + the four
-	// target IPs only). The netpol is what the probe measures against — the
-	// CNI's enforcement is exactly whether this netpol is obeyed.
+	// Create the probe NetworkPolicy (the DNS-only allow). It is what the
+	// probe measures against — the CNI's enforcement is exactly whether this
+	// netpol is obeyed — and its podSelector selects ONLY the policy pod.
 	if err := p.ensureNetpol(probeCtx); err != nil {
 		return unavailable("netpol create failed: " + err.Error()), nil
 	}
 
-	// Create the probe pod. The probe pod is operator-level state (not
-	// owner-ref'd to a Loop — there is no Loop to reference); it is cleaned up
-	// by name at the start of the next probe and on operator shutdown.
-	pod := p.buildPod()
-	if err := p.cfg.Client.Create(probeCtx, pod); err != nil {
-		return unavailable("probe pod create failed: " + err.Error()), nil
+	// Pass 1: the no-policy control pod. Same spec as the policy pod, a
+	// label the probe netpol does NOT select (so no policy applies to it),
+	// no node constraint. Its RESULT lines are the baseline (what each
+	// target looks like with no policy) and its spec.nodeName is where the
+	// policy pod is pinned, so NODE_IP (downward status.hostIP) names the
+	// same node in both passes.
+	controlPod := p.buildPod(probeControlPod, probeControlLabelVal, "")
+	cmsg, node, err := p.run(probeCtx, controlPod)
+	if err != nil {
+		return unavailable("control pass: " + err.Error()), nil
 	}
+	if node == "" {
+		return unavailable("control pod has no node (spec.nodeName empty): the policy pass cannot be pinned to it"), nil
+	}
+
+	// Pass 2: the policy pod, netpol-selected, pinned to the control pod's
+	// node so both passes measure the same node's host-network targets.
+	policyPod := p.buildPod(probePodName, probeLabelValue, node)
+	pmsg, _, err := p.run(probeCtx, policyPod)
+	if err != nil {
+		return unavailable("policy pass: " + err.Error()), nil
+	}
+
+	// Combine the two passes per label and apply the D103 verdict rules.
+	policyPass, err := parsePass(pmsg)
+	if err != nil {
+		return unavailable("policy pass: " + err.Error()), nil
+	}
+	controlPass, err := parsePass(cmsg)
+	if err != nil {
+		return unavailable("control pass: " + err.Error()), nil
+	}
+	combined := combineVerdicts(policyPass, controlPass)
+	return decide(policyPass, controlPass, combined), nil
+}
+
+// runPod is the per-pass seam implementation: it Creates the pod, waits for
+// the termination message within the per-run timeout, reads spec.nodeName
+// off the terminated pod, and Deletes the pod (best effort — the stale
+// cleanup at the start of the next probe is the backstop). The probe pods
+// are operator-level state (not owner-ref'd to a Loop — there is no Loop to
+// reference); they are cleaned up by name at the start of the next probe.
+func (p *PodProber) runPod(ctx context.Context, pod *corev1.Pod) (string, string, error) {
+	if err := p.cfg.Client.Create(ctx, pod); err != nil {
+		return "", "", fmt.Errorf("%s pod create: %w", pod.Name, err)
+	}
+	msg, err := p.waitForTermination(ctx, pod)
 	// Best-effort pod deletion on any exit path (the stale cleanup at the
 	// start of the next probe is the backstop).
 	defer func() {
@@ -312,16 +371,10 @@ func (p *PodProber) Probe(ctx context.Context) (CNIProbeResult, error) {
 			p.cfg.Client.Scheme() // no-op; the error is logged by the caller
 		}
 	}()
-
-	// Wait for the termination message (or the pod to go not-Ready / time out).
-	msg, err := p.waitForTermination(probeCtx, pod)
 	if err != nil {
-		return unavailable(err.Error()), nil
+		return "", "", fmt.Errorf("%s pod: %w", pod.Name, err)
 	}
-
-	// Strict validation: exactly 4 RESULT lines, each a known label, no
-	// unknown lines. A non-zero pod exit also maps to ProbeUnavailable.
-	return p.parse(msg, pod)
+	return msg, pod.Spec.NodeName, nil
 }
 
 // LatestResult implements CNIProber: it returns the holder's cached result
@@ -330,12 +383,15 @@ func (p *PodProber) LatestResult() CNIProbeResult {
 	return Holder().Result()
 }
 
-// cleanup deletes any leftover probe pod / NetworkPolicy (stale from a
-// previous run — the PR #38 leak).
+// cleanup deletes any leftover probe pods (BOTH passes — policy and control;
+// D103) and the probe NetworkPolicy (stale from a previous run — the PR #38
+// leak).
 func (p *PodProber) cleanup(ctx context.Context) error {
-	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: probePodName, Namespace: p.cfg.Namespace}}
-	if err := p.cfg.Client.Delete(ctx, pod); err != nil && !apierrors.IsNotFound(err) {
-		return err
+	for _, name := range []string{probePodName, probeControlPod} {
+		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: p.cfg.Namespace}}
+		if err := p.cfg.Client.Delete(ctx, pod); err != nil && !apierrors.IsNotFound(err) {
+			return err
+		}
 	}
 	netpol := &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: probeNetpolName, Namespace: p.cfg.Namespace}}
 	if err := p.cfg.Client.Delete(ctx, netpol); err != nil && !apierrors.IsNotFound(err) {
@@ -358,7 +414,10 @@ func (p *PodProber) ensureNetpol(ctx context.Context) error {
 	want := &networkingv1.NetworkPolicy{
 		ObjectMeta: metav1.ObjectMeta{Name: probeNetpolName, Namespace: p.cfg.Namespace},
 		Spec: networkingv1.NetworkPolicySpec{
-			PodSelector: metav1.LabelSelector{MatchLabels: map[string]string{probeLabelKey: "cni-probe"}},
+			// Selects ONLY the policy pass: the control pod's label value
+			// (cni-probe-control) must NOT match, or it would run under the
+			// very policy the control pass exists to bypass (D103).
+			PodSelector: metav1.LabelSelector{MatchLabels: map[string]string{probeLabelKey: probeLabelValue}},
 			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeEgress},
 			Egress: []networkingv1.NetworkPolicyEgressRule{
 				// DNS 53 (UDP+TCP) to the cluster's kube-dns only — the exact
@@ -392,16 +451,20 @@ func (p *PodProber) ensureNetpol(ctx context.Context) error {
 	return p.cfg.Client.Update(ctx, want)
 }
 
-// buildPod returns the probe pod (the agent's command, the termination
+// buildPod returns one probe-pass pod (the agent's command, the termination
 // message, the non-root/priv-dropped hardening — the same shape as the sandbox
-// pod, D38 design point 2).
-func (p *PodProber) buildPod() *corev1.Pod {
+// pod, D38 design point 2). Both passes share the shape (same image, command,
+// env, security context, no token automount); they differ in name, the probe
+// label value (the netpol selects only probeLabelValue) and node pinning (the
+// policy pass is pinned to the control pod's node via kubernetes.io/hostname
+// when nodeName != "", so both passes measure the same node — D103).
+func (p *PodProber) buildPod(name, probeLabelValue, nodeName string) *corev1.Pod {
 	nonRoot := int64(65532)
-	return &corev1.Pod{
+	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      probePodName,
+			Name:      name,
 			Namespace: p.cfg.Namespace,
-			Labels:    map[string]string{probeLabelKey: "cni-probe"},
+			Labels:    map[string]string{probeLabelKey: probeLabelValue},
 		},
 		Spec: corev1.PodSpec{
 			RestartPolicy:      corev1.RestartPolicyNever,
@@ -450,6 +513,10 @@ func (p *PodProber) buildPod() *corev1.Pod {
 			AutomountServiceAccountToken: new(bool),
 		},
 	}
+	if nodeName != "" {
+		pod.Spec.NodeSelector = map[string]string{"kubernetes.io/hostname": nodeName}
+	}
+	return pod
 }
 
 // containerTerminationMessage returns the probe container's termination
@@ -504,72 +571,6 @@ func (p *PodProber) waitForTermination(ctx context.Context, pod *corev1.Pod) (st
 	}
 }
 
-// parse strictly validates the termination message: exactly expectedResultLen
-// RESULT lines, each a known label, every line consumed. A non-zero pod exit or
-// any deviation returns ProbeUnavailable. CNIUnenforced = any expected-BLOCKED
-// target (apiserver svc, node :6443, node :10250, EXTERNAL 1.1.1.1:443)
-// REACHABLE; the positive control (DNS_POSITIVE, the cluster's kube-dns :53)
-// is NOT expected-blocked — a BLOCKED control means the probe has no network
-// and the result is ProbeUnavailable (never CNIEnforced on an unproven fence,
-// never CNIUnenforced on a healthy CNI). An UNRESOLVED row (no address) or a
-// REFUSED row (single pass — until slice B's control pass distinguishes a
-// policy drop from nothing listening) is also ProbeUnavailable: it is a
-// missing measurement, not a verdict about the fence (F51 P2-2).
-func (p *PodProber) parse(msg string, pod *corev1.Pod) (CNIProbeResult, error) {
-	// A non-zero exit (container terminated with a non-zero code) is
-	// ProbeUnavailable even if the message looks valid.
-	for _, cs := range pod.Status.ContainerStatuses {
-		if cs.State.Terminated != nil && cs.State.Terminated.ExitCode != 0 {
-			return unavailable("probe exited non-zero: " + fmt.Sprint(cs.State.Terminated.ExitCode)), nil
-		}
-	}
-	pass, err := parsePass(msg)
-	if err != nil {
-		return unavailable(err.Error()), nil
-	}
-	// Until the no-policy control pass (D103 slice B), a REFUSED row means the
-	// same thing an UNRESOLVED row did: the target was not measurable — a
-	// refusal alone cannot tell a policy drop from nothing listening — so it
-	// makes the whole probe ProbeUnavailable with the same detail text. Any
-	// UNRESOLVED row (name did not resolve) is the same.
-	for _, label := range passLabels {
-		if v := pass[label]; v == verdictUnresolved || v == verdictRefused {
-			return unavailable("probe target was not measurable: " + label), nil
-		}
-	}
-	// The positive control (DNS_POSITIVE) must be REACHABLE: the probe
-	// NetworkPolicy allows egress to the cluster's kube-dns on 53. A BLOCKED
-	// control means the probe has no network at all (e.g. the node's own CNI
-	// is down) — the fence is unproven, so the result is ProbeUnavailable.
-	if pass[positiveControlLabel] != verdictReachable {
-		return unavailable(positiveControlLabel + " control not REACHABLE: the probe has no network; the fence is unproven"), nil
-	}
-	rows, reachable := passToRows(pass)
-	var unenforced []string
-	for _, label := range reachable {
-		if expectedBlockedLabels[label] {
-			unenforced = append(unenforced, label)
-		}
-	}
-	res := CNIProbeResult{Rows: rows}
-	if len(unenforced) > 0 {
-		res.Reason = ReasonCNIUnenforced
-		// The Event/condition message renders "REACHABLE targets: " + Detail,
-		// so Detail carries the reachable expected-BLOCKED labels (a
-		// CNIUnenforced result without them reads "REACHABLE targets: " with
-		// nothing after it).
-		res.Detail = strings.Join(unenforced, ", ")
-	} else {
-		res.Reason = ReasonCNIEnforced
-	}
-	// Record the result in the holder — no: probeOnce (the Runnable) is the
-	// ONLY writer to the holder. If parse() wrote it here, probeOnce's
-	// Holder().Set(newResult) would read changed=false (the value is already
-	// set) and skip retage (no log, no metric, no re-gate GenericEvent), so
-	// Loops would never be re-reconciled on the new result.
-	return res, nil
-}
-
 // parsePass does the strict line validation of one probe pass's termination
 // message: exactly expectedResultLen lines of "RESULT <label> <verdict>" (any
 // other line shape is an error), each label a known probe label, each verdict
@@ -608,19 +609,6 @@ func parsePass(msg string) (map[string]string, error) {
 		return nil, fmt.Errorf("expected %d RESULT lines, got %d", expectedResultLen, seen)
 	}
 	return pass, nil
-}
-
-// passToRows renders a one-pass verdict map as Rows (in passLabels order) and
-// the ordered list of REACHABLE labels.
-func passToRows(pass map[string]string) (rows []TargetRow, reachable []string) {
-	for _, label := range passLabels {
-		verdict := pass[label]
-		rows = append(rows, TargetRow{Label: label, Verdict: verdict})
-		if verdict == verdictReachable {
-			reachable = append(reachable, label)
-		}
-	}
-	return rows, reachable
 }
 
 // combineVerdicts combines the policy pass and the no-policy control pass per

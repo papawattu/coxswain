@@ -102,7 +102,9 @@ type ProbeRunnable struct {
 	Recorder record.EventRecorder
 	// Interval is the probe period (default 10m; --cni-check-interval).
 	Interval time.Duration
-	// Timeout is the per-run probe timeout (default 60s; --cni-probe-timeout).
+	// Timeout is the per-run probe timeout (default 120s; --cni-probe-timeout).
+	// It covers BOTH probe passes (the no-policy control pod and the policy
+	// pod — D103), not a single pod.
 	Timeout time.Duration
 	// Ch is the source channel the Loop controller watches; a nil channel
 	// (tests) skips the re-gate send.

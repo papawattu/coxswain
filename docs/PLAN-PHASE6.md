@@ -255,10 +255,10 @@ to the node pool.
     the `AuditOnly` spec FAILS.
 - **Decisions needed:** (decided, owner 2026-11-04, D99) the audit-only
   posture is a field on the `AgentPolicy` (and so the `ClusterAgentPolicy`),
-  not on the Loop; open: the condition shape if a Loop references both an
-  enforcing and an audit-only policy (recommendation: the condition reflects
-  the *enforcing* policies; the audit subset is recorded in
-  `status.policy` + an Event).
+  not on the Loop; (decided, owner 2026-11-04, D105) the condition shape if
+  a Loop references both an enforcing and an audit-only policy: the
+  condition reflects the *enforcing* policies; the audit-only subset is
+  recorded separately (`status.policy` + an Event).
 - **Done when:** a human can run an agent image once in audit-only and get a
   reviewable starting policy instead of trial and error.
 
@@ -457,6 +457,7 @@ to the node pool.
 | D99 | **P6b opt-in location:** the audit-only posture on the `AgentPolicy` (recommended — the engine mode is per-policy) or on the Loop (`spec.policyAuditOnly`)? | Policy field: the posture describes what the *policy* does to its allows, and a Loop that references it inherits the decision in one place. | The P6b audit-only posture is a **field on the `AgentPolicy`** (and so the `ClusterAgentPolicy`), not on the Loop (owner, 2026-11-04). |
 | D100 | **P6d retry bound:** unbounded explicit retries (recommended — human intent, audited) or a per-Loop cap (e.g. 3, then the Loop needs a fork)? | Unbounded + audited: the retry refuses every reason except `SandboxFailed`, which by the F48b design says nothing about the agent's work; the per-episode attempt bound still applies. A cap would force a fork (losing status) for a transient infra class the owner can fix. | The P6d explicit retry is **unbounded and audited**, only for `SandboxFailed`; the per-episode attempt bound still applies (owner, 2026-11-04). |
 | D101 | **C2 proxy pod placement:** the per-Loop model-proxy pod is operator-owned (its usage endpoint is read by the operator, `loop_controller.go:577`) — does it join the dedicated pool (recommended), or stay on the default pool as operator-side infrastructure? | Join the pool: a reader who sets the placement flags expects every object the Loop creates to land there; a proxy pod silently on the default pool is the same class of surprise the D38 NetworkPolicy carve-outs exist to document. | (decided 2026-11-01) The C2 placement flags pin every Loop pod (owner, 2026-11-01). Shipped in #381. |
+| D105 | **P6b condition shape:** a Loop that references both an enforcing and an audit-only policy — what does the `PolicyEnforced` condition reflect? | The condition reflects the *enforcing* policies; the audit-only subset is recorded separately (`status.policy` + an Event). | (decided, owner 2026-11-04) The condition reflects the enforcing policies; the audit-only subset is recorded separately (`status.policy` + an Event). |
 
 ## Estimate
 

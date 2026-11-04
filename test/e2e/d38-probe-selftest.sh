@@ -277,6 +277,85 @@ vp() { # <policy-body> <control-body> <want-substring> <case name>
   esac
 }
 
+# Multi-node case (D103 C1, multi-node fix): vc_run pins NODE_IPS="10.0.0.1",
+# which collides with the full per-node labels of a 3-node run, so drive the
+# extracted block directly with NODE_IPS="10.0.0.1 10.0.0.2 10.0.0.3"
+# (EXPECTED_TOTAL = 3 + 2*3 = 9 RESULT lines per file). A truncated label
+# (cut at `(`) would exit 2 on "duplicate label APISERVER_NODE" here; the
+# control lookup by full label is what lets each node's row combine against
+# ITS OWN control verdict, not the first node's.
+vm_run() { # <policy-body> <control-body>; sets VC_OUT and VC_RC
+  local vt_dir="$VT" classify="$T/classify-verify.sh"
+  printf '%s\n' "$1" > "$VT/results.txt"
+  printf '%s\n' "$2" > "$VT/results-control.txt"
+  VC_OUT="$(TMPDIR="$vt_dir" NODE_IPS="10.0.0.1 10.0.0.2 10.0.0.3" NS=selftest CTX=selftest PROBE_POD=selftest \
+    bash -c 'source "'$classify'"; printf "SUMMARY total=%s reach=%s unres=%s nolist=%s enforce=%s\\n" "$TOTAL" "$REACHABLE_COUNT" "$UNRESOLVED_COUNT" "$NOT_LISTENING_COUNT" "$CNI_ENFORCED"' \
+    2>&1)" || VC_RC=$?
+  VC_RC=${VC_RC:-0}
+}
+# 9 labels per file, 3 nodes.
+MN_POLICY='RESULT APISERVER_SVC REFUSED
+RESULT APISERVER_NODE(10.0.0.1) REFUSED
+RESULT APISERVER_NODE(10.0.0.2) REFUSED
+RESULT APISERVER_NODE(10.0.0.3) REFUSED
+RESULT KUBELET_NODE(10.0.0.1) REFUSED
+RESULT KUBELET_NODE(10.0.0.2) REFUSED
+RESULT KUBELET_NODE(10.0.0.3) REFUSED
+RESULT CROSS_NS_POD(kube-dns) REFUSED
+RESULT EXTERNAL REFUSED'
+MN_CONTROL='RESULT APISERVER_SVC REACHABLE
+RESULT APISERVER_NODE(10.0.0.1) REACHABLE
+RESULT APISERVER_NODE(10.0.0.2) REFUSED
+RESULT APISERVER_NODE(10.0.0.3) REACHABLE
+RESULT KUBELET_NODE(10.0.0.1) REACHABLE
+RESULT KUBELET_NODE(10.0.0.2) REACHABLE
+RESULT KUBELET_NODE(10.0.0.3) REACHABLE
+RESULT CROSS_NS_POD(kube-dns) REACHABLE
+RESULT EXTERNAL REACHABLE'
+vm_run "$MN_POLICY" "$MN_CONTROL"
+if [ "$VC_RC" -ne 0 ]; then
+  bad "multi-node: a 3-node run (9 rows per file) must not exit 2, got rc=$VC_RC: $(printf '%s' "$VC_OUT" | tr '\n' ' ')"
+else
+  ok "multi-node: a 3-node run (9 rows per file) exits 0 (no duplicate-label FATAL)"
+fi
+if printf '%s' "$VC_OUT" | grep -qi 'duplicate'; then
+  bad "multi-node: stderr must not name a duplicate label: $(printf '%s' "$VC_OUT" | tr '\n' ' ')"
+else
+  ok "multi-node: no duplicate-label error"
+fi
+case "$VC_OUT" in
+  *"APISERVER_NODE(10.0.0.2)"*"NOT_LISTENING"*) ok "multi-node: APISERVER_NODE(10.0.0.2) combines per-node to NOT_LISTENING" ;;
+  *) bad "multi-node: want APISERVER_NODE(10.0.0.2) NOT_LISTENING, got: $(printf '%s' "$VC_OUT" | tr '\n' ' ')" ;;
+esac
+case "$VC_OUT" in
+  *"APISERVER_NODE(10.0.0.1)"*"BLOCKED"*) ok "multi-node: APISERVER_NODE(10.0.0.1) combines per-node to BLOCKED (control REACHABLE)" ;;
+  *) bad "multi-node: want APISERVER_NODE(10.0.0.1) BLOCKED, got: $(printf '%s' "$VC_OUT" | tr '\n' ' ')" ;;
+esac
+case "$VC_OUT" in
+  *"SUMMARY total=9 reach=0 unres=0 nolist=1 enforce=1"*) ok "multi-node: per-node combine gives the enforced PASS (SUMMARY total=9 reach=0 unres=0 nolist=1 enforce=1)" ;;
+  *) bad "multi-node: want enforced PASS summary, got: $(printf '%s' "$VC_OUT" | tr '\n' ' ')" ;;
+esac
+# Second multi-node case: node 3's KUBELET_NODE REACHABLE under the policy ->
+# the CNI let it through: FAIL with 1 REACHABLE.
+MN_POLICY_REACHABLE3="${MN_POLICY/KUBELET_NODE(10.0.0.3) REFUSED/KUBELET_NODE(10.0.0.3) REACHABLE}"
+vm_run "$MN_POLICY_REACHABLE3" "$MN_CONTROL"
+case "$VC_OUT" in
+  *"KUBELET_NODE(10.0.0.3)"*"REACHABLE"*) ok "multi-node: a REACHABLE KUBELET_NODE(10.0.0.3) row is shown in the table" ;;
+  *) bad "multi-node: want a REACHABLE row for KUBELET_NODE(10.0.0.3), got: $(printf '%s' "$VC_OUT" | tr '\n' ' ')" ;;
+esac
+case "$VC_OUT" in
+  *"SUMMARY total=9 reach=1 unres=0 nolist=1 enforce=0"*) ok "multi-node: 1 REACHABLE row -> not enforced (SUMMARY total=9 reach=1 unres=0 nolist=1 enforce=0)" ;;
+  *) bad "multi-node: want FAIL summary (1 REACHABLE), got: $(printf '%s' "$VC_OUT" | tr '\n' ' ')" ;;
+esac
+# The verdict section that prints the FAIL line sits OUTSIDE the extracted
+# verify-cni-classify block, so the extracted block's FAIL evidence is the
+# SUMMARY line: reach=1 (the CNI let it through) and enforce=0.
+if printf '%s' "$VC_OUT" | grep -q 'SUMMARY total=9 reach=1 unres=0 nolist=1 enforce=0'; then
+  ok "multi-node: the FAIL wording counts the REACHABLE row (SUMMARY reach=1 enforce=0)"
+else
+  bad "multi-node: want the FAIL summary (1 REACHABLE), got: $(printf '%s' "$VC_OUT" | tr '\n' ' ')"
+fi
+
 VP() { # <policy-body> <control-body> <want-substring> <case name>
   vc_run "$1" "$2"
   case "$VC_OUT" in

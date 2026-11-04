@@ -458,7 +458,13 @@ parse_pass() {
   while IFS= read -r line; do
     case "$line" in
       RESULT\ *)
-        label=$(echo "$line" | awk '{print $2}' | cut -d'(' -f1)
+        # D103 (C1, multi-node): keep the FULL label (e.g.
+        # APISERVER_NODE(10.0.0.2)) as the identity. Truncating at `(` made
+        # every node's label collide ("duplicate label APISERVER_NODE" on any
+        # multi-node cluster) and made the control lookup return the first
+        # node's control verdict for every node. The host-network test below
+        # uses `$1 ~ /^APISERVER_NODE/`, which works on the full label.
+        label=$(echo "$line" | awk '{print $2}')
         verdict=$(echo "$line" | awk '{print $3}')
         t=$((t + 1))
         if printf '%s\n' "$seen" | grep -qxF "$label"; then

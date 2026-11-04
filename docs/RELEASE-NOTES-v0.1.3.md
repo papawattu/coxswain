@@ -1,0 +1,1156 @@
+# Release notes: v0.1.3
+
+For an operator upgrading from v0.1.2. All items are verified against the
+merged code on `main` (as of `a6f469b` = PR #392); each claim cites its
+merged PR and the squash commit it landed as.
+
+## Upgrade
+
+Must-do items for an operator upgrading from v0.1.2; each points to
+`docs/UPGRADE.md` (section "Upgrading from v0.1.2").
+
+- If your RBAC is managed outside `install.yaml`, apply the new
+  `serviceaccounts` (create, get, list, watch) rule to the operator's
+  ClusterRole (F29, #199). A standard install picks it up automatically.
+- If your RBAC is managed outside `install.yaml`, apply the new `pods/log`
+  (`get`) subresource rule to the operator's ClusterRole (F62/F63, #324). A
+  standard install picks it up automatically. Note this is a cluster-wide
+  grant: the alert relay follows the engine agent pods and the operator's own
+  proxy pods' logs by namespace, and the design's alternative (namespaced
+  Roles) cannot cover Loop namespaces created later (PR #324).
+- Set `--memory-writer-image` to the operator image if your install is not
+  `config/default` (PR #182); set `--memory-storage-class` to a
+  ReadWriteMany-capable StorageClass if your cluster's default does not
+  support ReadWriteMany (PR #191).
+
+Nothing else to do: `spec.workspace.restoreFrom` is now immutable (F35,
+#215); the agent NetworkPolicy is always created (F42, #213); the sandbox
+waits for the egress proxy for the init clone (F55, #220); the memory
+lesson cap is 100 per PVC (F32, #233); the memory-writer audit records the
+trimmed lesson text (F33, #234); a stale lessons file no longer
+survives into a later iteration (F34, #238); a pinned commit that does not
+descend from the base is refused with a new terminal `PinNotDescendant`
+reason (F43, #244); and an unmetered request or a stale usage reading is
+surfaced, not skipped silently (F44, #248). F48 (#256) added stricter
+Secret-name validation on `spec.agent.gitCredentialSecret` and
+`spec.agent.endpointSecretRef` (MaxLength 253 + DNS-1123 subdomain): a
+Loop with a malformed Secret name is now rejected at the API server —
+existing Loops are unaffected, but new ones are.
+
+## Supply chain: the operator's default images are digest-pinned (F65)
+
+The three images the operator pulls at RUN TIME now carry a registry digest
+next to their tag, so what runs cannot change under the operator between two
+Loops (a tag is mutable; the workspace-git image handles the git credential):
+
+| flag | default |
+|---|---|
+| `--cni-probe-image` | `docker.io/library/python:3.13-alpine@sha256:bf12ecc0bea3f171d55145dd02c78b5eeb09f30ee2ac9cc2b4c9e4e8f5e30741` |
+| `--workspace-git-image` | `docker.io/alpine/git:v2.54.0@sha256:e8ceedc73bd80992ae8d58a7d24c58b8322146c354f1d2e81a97db4452068ec0` |
+| `--verify-image` | `docker.io/library/golang:1.26@sha256:672c944cfd07599b5f1bb179869270cdc94c6254e41db4d431259693cb286b82` |
+
+The digests are the registries' multi-arch manifest-list digests, resolved with
+an anonymous registry HEAD on the tag (`GET /v2/<repo>/manifests/<tag>` with an
+index `Accept` list, reading `Docker-Content-Digest`) — the exact command and
+its output are in `.samples/f65/registry-digests.txt`. The CNI probe image also
+moved off the floating `python:3-alpine` minor tag to a version-exact
+`python:3.13-alpine` (P2-2), and the probe container now sets
+`ImagePullPolicy: IfNotPresent` explicitly instead of leaving it derived from the
+reference shape. Nothing to do unless you override one of the three flags — an
+override is yours to pin.
+
+## New features
+
+### P6a: ClusterAgentPolicy, a cluster-scoped policy a Loop may name — #386, #389
+
+- **What it is.** A new `ClusterAgentPolicy` kind (cluster-scoped; `scope: Cluster` in the CRD, `config/crd/bases/coxswain.wattu.com_clusteragentpolicies.yaml:15`) with the same spec as `AgentPolicy` (the same `AgentPolicySpec` type is reused). Like an `AgentPolicy`, it is inert until a Loop references it via `spec.policyRefs`; the same controller-side validation applies (canonical exec paths, in-cluster network rejects, tool rules).
+- **How `spec.policyRefs` resolves.** For each ref name the operator looks for a namespaced `AgentPolicy` in the Loop's namespace first, then a `ClusterAgentPolicy` (`resolvePolicyRefs`, `internal/controller/loop_controller.go:1767`): the namespaced policy is used when it exists and no cluster policy shares the name, the cluster policy is the fallback when only it exists, and a name in neither scope fails closed with `PolicyValid=False / PolicyNotFound` (`loop_controller.go:1790`). The effective policy is the union of the allows across every referenced policy (`effectivePolicy`, `loop_controller.go:1721-1733`).
+- **A CAP edit re-reconciles every referencing Loop.** The operator watches `ClusterAgentPolicy` (`loop_controller.go:6753`); the watch's map lists Loops in ALL namespaces whose `spec.policyRefs` contain the name (`clusterAgentPolicyToLoopRequests`, `loop_controller.go:6882`), so an edit — including a narrowing one — refreshes every Loop that names it, in every namespace, and re-checks the recorded policy hash.
+- **Name collision, as implemented.** When a ref names both a namespaced `AgentPolicy` and a `ClusterAgentPolicy`, the namespaced one wins (the author's explicit choice) and the operator fires ONE `PolicyNameCollision` Warning Event per change of the collision set (transition-gated, not per pass — `emitPolicyNameCollision`, `loop_controller.go:1810`), recording the sorted set in the Loop's `coxswain.io/policy-collisions` annotation (removed when the set becomes empty). D98 (owner decision, 2026-11-04): the namespaced policy wins.
+- **On upgrade.** See docs/UPGRADE.md, "New CRD: ClusterAgentPolicy (P6a)": the operator's ClusterRole gains `get;list;watch` on `clusteragentpolicies`, and the operator now watches the kind, so the CRD must be installed (helm or `install.yaml`) before the new manager starts.
+
+### C2: pinning Loops to a node pool — operator flags `--loop-node-selector` and `--loop-tolerations` — #381
+
+- **What changed.** Two operator flags pin every operator-owned Loop workload (the sandbox, the model/egress/tool proxy pods, and the verify, deliver and memory-writer Jobs) to a dedicated node pool (C2/D101): `--loop-node-selector key=value[,key=value]` and `--loop-tolerations key:op:effect[:value[:seconds]]` (op `Equal` or `Exists`; `Exists` takes no value, and a seconds-only Exists token keeps the value slot empty: `key:Exists:NoExecute::30`). Empty (the default) means no placement — today's behaviour. A malformed token is a STARTUP error that names the bad token, never a silent drop. `kubectl label node <n> coxswain.io/pool=loops` + `kubectl taint node <n> coxswain.io/pool=loops:NoSchedule` + the matching flags is the documented workflow (docs/OPERATOR.md, new section "Pinning Loops to a node pool (C2)").
+- **On upgrade.** Nothing required; the flags default to empty, so an install that does not set them behaves exactly as before. With the flags set but no matching node, the model proxy and egress proxy pods sit Pending with FailedScheduling events, the Loop holds at `Planning` with `ModelProxyNotReady=True` (no sandbox pod is created, so `SandboxNotStarting` never appears), and after 10 minutes the Loop fails with `reason=PodUnschedulable` (the F93a bound; docs/TROUBLESHOOTING.md, "PodUnschedulable=True").
+
+
+### Shared memory per repository: lessons learned by one Loop are available to the next — #179, plus the memory-writer Job (P5b, `f12d2dc`)
+
+A Loop now works against a shared memory PVC keyed per (namespace, git URL): the operator ensures the PVC (`--memory-storage-class` names the StorageClass, empty = cluster default), a copy-in init container copies the lessons into the workspace, and the implementing prompt carries a lessons section so the agent sees what earlier runs of the same repo learned. After a successful run the agent proposes the lessons it learned (`LESSON:` lines) into a file in the workspace; the operator runs a memory-writer Job (its own `coxswain-memory-write` binary, gated on `Succeeded` or `Failed:Stalled` and the run having reported lessons) that screens those lessons against a static write policy — secrets patterns (AWS keys, OpenAI `sk-` keys, GitHub tokens, Anthropic keys, JWTs, Kubernetes basic-auth tokens, Slack bot tokens, Google API keys, Bearer tokens, PEM blocks, secret files, credential assignments, high-entropy tokens), a size cap, single-line shape, a path-or-error-signature rule, and SHA-256 dedup — and persists the survivors to the memory PVC. The outcome is on the `MemoryWriteDone` condition (`MemoryWritten` / `MemoryWriteFailed` / `MemoryWriteSkipped`); a failed write never fails the Loop (memory is best-effort). The writer Job's container is hardened: the operator's image runs the binary directly (no shell), non-root with an explicit UID/GID, drop-all-caps, seccomp, read-only rootfs, a deny-all NetworkPolicy, and no ServiceAccount token (the dedicated ServiceAccount is ensured in the Loop's namespace with `automountServiceAccountToken: false`).
+
+### `cox memory`: export, import, and delete — #186, #202, #203
+
+`cox memory export` and `cox memory import` move the shared memory PVC's lessons between clusters as a tarball: export reads the PVC's files; import screens each lesson with the same static write policy as the memory-writer Job (screened-out lessons are skipped, not dropped, and the screen result is reported) and writes the survivors, with `--storage-class` to name the target StorageClass. The CLI's pods carry no ServiceAccount token and run a pinned image. `cox memory delete` wipes a repo's memory PVC, and refuses while a terminal Loop's memory write is still pending, so a delete never races a writer Job that is about to persist lessons. The memory PVC's lifecycle (who creates it, when it is garbage-collected, what delete does) is documented in `docs/OPERATOR.md`. — #186 (`a57b947`), #202 (`8a5940b`), #203 (`04472d5`)
+
+### RWX storage for the memory PVC on kind: `hack/rwx-storage.sh` — #189, #193
+
+A kind cluster's default StorageClass (rancher.io/local-path) is RWO-only, so the memory PVC (`ReadWriteMany`) can never bind and the copy-in init never runs. `hack/rwx-storage.sh` installs a second pinned local-path provisioner with a shared filesystem path and an RWX StorageClass for it (the class's `bindingMode` is `Immediate` — `WaitForFirstConsumer` never binds the memory PVC, whose consumer is decided per pod); the script takes the shared path and provisioner image as validated flags, runs a helper pod without a ServiceAccount token, and rolls the provisioner pod when its config changes. Set `--memory-storage-class` to the installed class (or point it at any RWX-capable class on your cluster). — #189 (`c911357`), #193 (`cf788e6`)
+
+### The delivery PR title and commit subject come from `spec.goal` — #174
+
+The delivered PR's title and the commit subject it carries are derived from the Loop's `spec.goal` (first line, trimmed, capped at 72 runes) instead of a constant subject: the operator hands the derived title to the sandbox as `COX_DELIVERY_TITLE` and to the deliver Job as the PR title, so the commit subject and the PR title match by construction. Nothing to do; existing Loops get the derived title on their next delivery. — #174 (`407cbf8`)
+
+### The plan-hash check at the start of Implementing — #172
+
+The runner re-checks the approved plan hash BEFORE any agent work at the start of an Implementing run: an edit to `PLAN.md` after approval (or a missing `PLAN.md` with an approved hash on file) blocks the run — no agent call, no commit — and the operator clears `PlanApproved`, sets the `PlanMismatch` condition and the `PlanHashMismatch` Warning Event (both visible via `kubectl cox describe`), and re-enters the `AwaitingApproval` hold until you re-approve the current plan. Re-approving clears the condition. A stale claim left over from before a pause is discarded on resume, so a pause/resume cannot advance the phase on a pre-pause result. — #172 (`1902f8e`)
+
+### Behaviour change: `Succeeded` now waits until delivery is terminal — #198 (D64)
+
+The Loop now holds `Succeeded` until the `Delivered` condition is terminal. Before this, `Succeeded` was set as soon as verify passed and delivery ran afterwards — so a user or script waiting for `Succeeded` could read the Loop before its PR existed. You may notice it: a Loop that passed verify stays at phase `Verifying` (the `Verifying` condition's reason is `Delivering`) until the deliver Job ends, and only then moves to `Succeeded`. A failed delivery still ends `Succeeded`, with `Delivered=False` — a delivery failure does not change the work's verdict, only the delivery's (D64). The budget stops counting during the hold. Nothing to do. — #198 (`a84b7c9`)
+
+## Security fixes
+
+### D76/D102: Secrets are opt-in — the operator has no cluster-wide Secret read, and a named Secret must be labelled before the Loop can use it — PR #380
+
+- **What was wrong.** A Loop author could name ANY Secret in their namespace
+  (`spec.workspace.gitCredentialSecret`, `spec.agent.endpointSecretRef`, or
+  the AgentPolicy tools' `credentialSecretRef`), and the operator mounted it
+  and presented it to a host the SAME author chose (e.g. the model endpoint).
+  The operator was a confused deputy: any author could read any Secret in
+  their namespace by routing it to their own host.
+- **What changed.** Two gates, both checked in `validateStep` BEFORE the
+  sandbox is created (no sandbox, no verify/deliver Job, no proxy objects
+  while held; requeue until fixed — the hold releases on the SAME Loop's next
+  reconcile, no restart):
+  1. **D102 (per-namespace opt-in).** The operator's ClusterRole has NO
+     `secrets` rule at all (the RBAC coverage test asserts it). A new
+     `coxswain-secret-reader` ClusterRole (`get` on secrets ONLY) ships with
+     NO binding (config/rbac/ + the chart). An admin enables a namespace by
+     creating a RoleBinding from that ClusterRole to the operator's
+     ServiceAccount (the command is in `docs/OPERATOR.md` + `docs/UPGRADE.md`).
+     In a disabled namespace the metadata read is Forbidden and the Loop
+     holds with `SecretsUsable=False reason=NamespaceNotEnabled`.
+  2. **D76(a) (per-Secret opt-in).** Each named Secret must carry the label
+     `coxswain.io/usable: "true"`. The operator checks METADATA only (a
+     `PartialObjectMetadata` read through the API reader — never the data).
+     An unlabelled Secret holds with `SecretsUsable=False reason=
+     SecretNotOptedIn`; a missing Secret with `SecretNotFound`.
+  The `SecretsUsable` condition is always set (never absent): `True
+  reason=NoSecrets` when the Loop names no Secret, `True reason=OptedIn`
+  when every named Secret is opted in. A True→False transition emits one
+  Warning Event. The three references are all covered (envtest specs for
+  each); unlabelling or removing the binding re-holds (fail-closed).
+- **On upgrade.** If you use Secrets in a namespace, run the RoleBinding
+  command and label the Secrets — see `docs/UPGRADE.md` ("Secret opt-in:
+  `SecretsUsable` holds Loops in namespaces without the binding") and
+  `docs/TROUBLESHOOTING.md` (`SecretsUsable=False`). A Loop that names no
+  Secret is unaffected.
+
+### F60: the verify canary, a negative control for in-process subversion — #366
+
+- **What was wrong.** The verify Job's acceptance checks and the other trusted inits run in the same pod as the agent's checkout: an agent that subverts the test harness in-process (the round-8 probe was a test that force-exited the binary with `os.Exit(0)`) could make every check exit 0 and the verify would pass with no detection (F60, PR #366, merged `fc04736`).
+- **What changed.** The verify Job now carries a canary init container (the `canary` container) that runs between the `artifact` and `check-0` inits: the init order in `buildVerifyJobSpec` is clone → import-agent → tamper → artifact → **canary** → the acceptance checks. The canary's script (`canaryCheckScript` in `internal/controller/loop_verify_job.go`) picks one of the agent's packages that has at least one `*_test.go`, copies it to its own writable scratch (post-F53 `/verify` is read-only), adds a generated `zzz_canary_test.go` that sorts last and contains a forced `t.Fatal`, and runs the package's full `go test`. Because the file sorts after the agent's test files, any in-process probe that force-exits the test binary kills it before the canary fires — which is exactly the subversion the canary is built to catch. The operator reads the canary init's exit code from the pod status (`readVerifyCanary`) and `verifyOutcome` maps it:
+  - **exit 43** — ANY tested package's canary test exited 0 (despite the forced `t.Fatal`), or exited non-zero without the token in its `-json` output: the harness is subverted in that package. The Loop is failed terminally with reason `SubvertedVerify`; no new verify Job is spawned. A decoy (an honest package plus a subverted one) cannot hide: the per-package verdict catches the subverted one.
+  - **exit 44** — the canary is unavailable: no `go` binary on PATH, every package skipped (no `go.mod` above any package), or the base commit's tree could not be read (the script fails closed on any git error instead of reading it as "the base had no tests"). It is an **infrastructure** failure: bounded verify-infra retry (`VerifyInfraRetry`, then `VerifyInfraFailed` after the bound) — a permanent 44 ends in `Failed`, never a forever-hold in `Verifying` (F94c; the pre-F94 one-shot `VerifyCanaryUnavailable` no-decision path is gone). The `*_test.go`-driven 44 was split by F94 into exit 46 (tests removed, terminal, reason `TestsRemoved`) and the exit-0 skip marker (the repo never had tests, `CanarySkipped=True / NoTestsInRepo` — session 3).
+  - **exit 45** — a tested package's `go test -json` emitted an `Action:"build-fail"` event for THAT package: **infrastructure** failure, never a subversion verdict — the *agent's* package may be what fails to build, not the canary's code. It is retried with the bounded verify-infra retry budget (`verifyInfraFailed`). The decision is on the token, not on English strings: a probe that prints `testing: warning: no tests to run` or a build-error string while exiting 0 is still 43 (the package exited 0 despite the forced `t.Fatal`), not 44/45.
+  - **exit 0** — every tested package's canary test exited non-zero AND its `-json` output contained the per-Job token: the forced `t.Fatal` fired and was reported in each package. The acceptance checks then run.
+- **Open limits (observed by the reviewer running the exact canary script outside the cluster; the four gaps below are FIXED by #371).** The pre-fix canary caught in-process subversion of a *tested* Go package but had four coverage gaps, now all closed by #371: (1) a Go repository whose tests sit in a nested package (no `go.mod` at the repo root) is now reported correctly — the whole tree is copied so the nested package's `go.mod` comes along, and each package is tested from its NEAREST ancestor holding a `go.mod` (so a multi-module repo whose `go.mod` lives only in `svc/` is judged in its own module, not read as subverted); (2) a subverted package can no longer hide behind an honest one — the per-package verdict (not one combined `go test` exit) catches ANY subverted package (the decoy case); (3) an agent-controlled probe that makes `go test` print `testing: warning: no tests to run` no longer turns a would-be 43 into a 44 — the token-based decision ignores the string (a probe printing it while exiting 0 is still 43); (4) an agent-controlled probe that prints a build-error string no longer turns a would-be 43 into a 45 — the go toolchain's own `-json` `Action:"build-fail"` event is the only 45 trigger. The non-Go repo limit (a `preset: none` repo getting 44 and staying in `Verifying` with no end) is fixed by #370: the canary is skipped for `preset: none` repos and the skip is surfaced with the `CanarySkipped=True` / `CanaryNotApplicable` condition (I90). **Still open (not fixed by #371):** a probe that *reads the generated `zzz_canary_test.go` and prints its token* while exiting non-zero — the token is written in plain text to the package dir the agent's code runs in, so a reader sees it; that reads as OK. A real fix needs a channel the agent's code cannot read (out of scope there); the per-Job random seed (`/dev/urandom`) only makes a probe that prints a *guessed* token fail.
+- **#369 (merged `5628c1f`): a wedging canary exit is now a bounded infra retry.** Before #369, a canary init that was OOM-killed or exited with an unrecognized non-zero code (anything other than 0/43/44/45) was not one of the cases `verifyOutcome` mapped, so the Loop stayed in `Verifying` with no decision and requeued forever (the wedge observed on kind: a 137 canary + check-0 waiting, requeuing indefinitely). Now `canaryGateDecision` in `internal/controller/loop_verify_outcome_gates.go` maps that case (the `default` branch: the OOMKilled reason, or any code outside 0/43/44/45) to a bounded verify-infra retry — `VerifyInfraRetry`, then `VerifyInfraFailed` after three attempts — instead of leaving the Loop in `Verifying` (F58's rule for OOM-killed checks extended to the canary init).
+
+### F68: `spec.workspace.ref` and `spec.verify.acceptanceChecks` validated at admission — #332
+
+- **What was wrong.** Both values are interpolated into the verify and deliver scripts (shell-quoted since F37), so a crafted `spec.workspace.ref` or `spec.verify.acceptanceChecks` entry reached the credentialed scripts with no gate. `ref` was unbounded in length and charset, and a dash-leading ref-shaped argument is parsed by git as an **option** — a ref of `--upload-pack=/bin/true` makes the credentialed `git fetch origin <ref>` run that program (measured in `.samples/f68/01-ref-option-parse.txt`) (F68, PR #332, merged `911d2c6`).
+- **What changed.** Admission now bounds four fields: `spec.workspace.ref` (at most 255 characters, a git ref-name charset `[A-Za-z0-9._/@+]` and `-`, no leading dash, **empty stays valid** — it means the repo's default branch); `spec.verify.acceptanceChecks[]` (at most 16 entries, each 1–4096 characters and non-blank; contents otherwise free — a check is a shell command and quoting is `shellQuote`' job); and `spec.delivery.baseBranch` / `spec.delivery.branchPrefix` (the same no-leading-dash first class, since `baseBranch` is interpolated into the deliver Job's `git fetch origin <base>`). A finalizer-removal `Update` rejected as `Invalid` (a stored spec that no longer passes admission) is surfaced with a `FinalizerRemovalBlocked` Warning Event and a slow 5-minute requeue rather than the error backoff (PR #332). The CRD schema changed (`config/crd/bases/coxswain.wattu.com_loops.yaml`, chart CRD synced, both envtest testdata copies updated).
+- **On upgrade.** Apply the new `config/crd` (or chart) so the bounds take effect; nothing is migrated and no Loop is changed by the upgrade. An existing Loop outside these bounds behaves differently by API server version: on Kubernetes 1.30+ (CRD validation ratcheting) an update that does not change the offending field is still admitted, so such a Loop keeps running and can still be deleted; on an older API server every update is rejected (422 Invalid), which freezes the Loop — its status cannot be written and on delete its checkpoint finalizer cannot be removed, so it sits in `Terminating`. The remediation is to patch the offending field to a valid value (that update is valid); see `docs/UPGRADE.md`, "Stricter `ref`, `acceptanceChecks` and delivery-branch validation (F68)" (PR #332).
+
+### F58: the verify Job's containers are resource-bounded, and an OOM-killed check is an infra failure — #322
+
+- **What was wrong.** The verify Job runs the agent's own code (the `check-*` containers run the acceptance checks, `go test` over the agent's tree) and declared no resources, so its pod was BestEffort — the first pod the kubelet evicts under node pressure, and an unbounded check could take the node with it; both emptyDirs were unbounded too (PR #322, merged `17be3ba`).
+- **Who could exploit it, and how.** A Loop author whose checks run unbounded could take the node (and the sandbox on it) under memory pressure, and a check could not be told apart from an infrastructure failure when the node had no headroom left (PR #322).
+- **What changed.** Every container in the verify Job now carries CPU and memory requests **and** limits (trusted inits `100m/128Mi` → `1/1Gi`; `check-*` `250m/256Mi`/`1Gi` → `2/2Gi`/`2Gi`; the no-op main `10m/16Mi` → `100m/64Mi`). The knob is the new `spec.verify.resources` (`*corev1.ResourceRequirements`), applied to the `check-*` containers **only** and merged **per resource name** over the operator defaults: lowering a limit lowers the matching request with it, raising a request alone changes nothing, and `claims` is accepted by the schema but ignored. Each per-check `/tmp` scratch gets a `1Gi` `SizeLimit`; the `verify` checkout emptyDir stays unbounded on purpose (its size is the user's repository) (PR #322). An OOM-killed check is now an infrastructure failure: the check scan reads `Terminated.Reason` as well as `ExitCode`, and the kubelet's `OOMKilled` maps to a bounded infra retry (`VerifyInfraRetry`, then `VerifyInfraFailed` at the bound) before the `code != 0` iterate — no iteration burned, no stall entry; the message names the applied memory limit and the field that raises it. Exit `137` with any other reason (a check that `kill -9`s itself) still iterates (PR #322).
+- **On upgrade.** `spec.verify.resources` is a new CRD field: apply the new `config/crd` (or chart) so it is available. Nothing else is required for an existing Loop whose checks fit cpu `2` / memory `2Gi` and write less than `1Gi` into `/tmp`; a heavier build sets `spec.verify.resources` (e.g. `limits.memory: 4Gi`). A check that legitimately needs more than `1Gi` of scratch cannot raise it yet — that bound is a follow-up field; write less, or clean up as you go (PR #322; `docs/UPGRADE.md`, "The verify Job's containers are resource-bounded").
+
+### F66: no ServiceAccount token in the verify and deliver Job pods — #330
+
+- **What was wrong.** The two Job pod builders left `AutomountServiceAccountToken` unset with `ServiceAccountName: ""`, which selects the namespace's **default** ServiceAccount and mounts its token at `/var/run/secrets/kubernetes.io/serviceaccount` — in the very pods whose containers run agent-chosen commands (the verify `check-*` and `import-agent` containers; the deliver `clone-base`/`import-agent`/`push` containers, beside the mounted git credential). This contradicted D12, which had already fixed the verify Job as `automountServiceAccountToken: false` with read-only clone credentials only (`docs/REVIEW-PHASE0-R4.md:130`, ADR-0005 §D12): the verify Job had carried a token it was decided not to carry, for as long as it had existed (PR #330, merged `26a831f`).
+- **Who could exploit it, and how.** A sandbox agent whose code runs in a verify or deliver container could read the namespace's default ServiceAccount token and use it for API calls the Loop should not have been able to make (PR #330).
+- **What changed.** Both builders now set `AutomountServiceAccountToken: false` explicitly (the verify Job per D12; the deliver Job as a deliberate extension of D12, whose literal text names only the verify Job, since the deliver Job also runs agent-chosen code and holds the push credential); no RBAC change, since the pods never made an API call (PR #330, merged `26a831f`).
+- **On upgrade.** Jobs created **before** the upgrade keep their token until the next iteration creates a new Job: `ensureVerifyJob` reuses the Job whose `verifyCommit` annotation matches and nothing re-creates a Job on a pod-spec change, so a Loop mid-verify or mid-deliver at upgrade time keeps the pre-upgrade Job (and its token); the next Job the operator creates is the one without it (PR #330).
+
+### F67: import-agent reads the agent's object store instead of fetching from it — #331
+
+- **What was wrong.** The `import-agent` init containers (verify and deliver) ran `git fetch file:///agent-src/.git <sha>` to pull the pinned commit from the agent's own workspace repository. That fetch's safety rested on the git version honouring the protected-config rule (`uploadpack.packObjectsHook` and the like are only respected from protected configuration) — an image detail, since the verify/deliver images are operator-configurable (`--workspace-git-image`). The deliver half additionally compared `git rev-parse <sha>` to the pinned SHA, which echoes any 40-hex string without checking the object exists — a check that asserted nothing (though the path stayed fail-closed via `set -eu`, so this is a vacuous check, not a shipped hole) (PR #331, merged `d4fe61f`).
+- **Who could exploit it, and how.** An agent that can write its own repository's `.git/config` could have the import step run a command it chose (the `uploadpack.packObjectsHook` / `core.fsmonitor` vectors), if the git version honoured it from unprotected config (PR #331).
+- **What changed.** Both `import-agent` scripts now read the agent's object store through `GIT_ALTERNATE_OBJECT_DIRECTORIES=<agent>/.git/objects` — a path, from which git reads no config — and copy the pinned commit's closure into the Job's own object store with `pack-objects`; no `fetch`, no `upload-pack`, no `protocol.file.allow` (the copy is required anyway: the alternate is an env var that dies with the init container, while `tamper` and the `check-*` containers read `/verify/.git`, and the deliver push container does not mount the agent PVC at all). The deliver Job's existence check is now `rev-parse --verify <sha>^{commit}`; the import container also loses its second `safe.directory` entry (`/agent-src/.git`) and keeps only `/verify` (PR #331, merged `d4fe61f`). The one `git fetch` that remains in each Job is `clone-base`, which fetches from `origin` — the Loop's repo on the forge, whose URL is operator-authored and whose server-side config no `git push` from the agent can write; it is out of scope.
+- **On upgrade.** Nothing required; the fix is in the operator (the generated Job scripts) — no RBAC, pod-shape, CRD or script change outside the two `import-agent` containers (PR #331).
+
+### F69: the delivered PR body's last-verify line is operator-derived — #333
+
+- **What was wrong.** The delivered PR body's facts section carried `status.progress.lastResultStatus` — a field the runner writes (the claim) on every accepted phase claim and the operator writes (the iterate path) only on the failing-check record — with no provenance recorded, so the body showed the last run's claim rather than the operator's verify verdict. And the body's plan section fenced the agent's plan with a fixed triple-backtick: a plan line of three backticks closed it, and everything after rendered as ordinary markdown in the delivered PR body — operator-looking headings, remote images, `@mentions` (which GitHub notifies from body text) (PR #333, merged `9f836ba`).
+- **Who could exploit it, and how.** An agent whose claim text reached the delivered PR body could render markdown in it (headings, images, `@mentions`); a hostile plan could break its own fence and do the same (PR #333).
+- **What changed.** The `Last verify:` line is now derived from fields the operator owns: `VerifyAccepted` (the F83e match the body already computed for the tamper arm, hoisted — `status.verify.verifiedCommit == pin && pin != ""`) → "the acceptance checks passed"; otherwise the newest recorded verify failure (the stall ring) → `the check container "<name>" failed (iteration N; see the per-iteration record)`; otherwise "no verify outcome recorded". The body no longer reads `status.progress` at all. The plan fence is now one backtick longer than the longest backtick run in the plan (`max(3, longest + 1)`), so the plan stays verbatim inside it (PR #333, merged `9f836ba`).
+- **On upgrade.** Nothing required; the fix is in the operator (the delivered PR body is generated by it) (PR #333).
+
+### F37: `shellQuote` escaped an apostrophe wrongly (command injection) — #207
+
+- **What was wrong.** `shellQuote` wrote an apostrophe `'` as three
+  apostrophes. One apostrophe left the generated script string open (a syntax
+  error); two closed the quote and ran the text between them as shell (merged
+  `7dcf262` = PR #207). It was wrong since S3.
+- **Who could exploit it, and how.** Call sites hold the git credential
+  (deliver Job: `PR_TITLE` from `spec.goal`, plus REPO, BRANCH, BASE), run
+  acceptance checks (verify Job) and write agent-influenced plan feedback
+  (phase-init). A Loop goal like `Fix the user's login` broke delivery, and a
+  goal carrying two apostrophes (e.g. `'; touch PWNED; '`) ran the text
+  between them as shell inside the Job (PR #207).
+- **What changed.** An apostrophe is now written in the POSIX close-quote,
+  backslash-apostrophe, reopen-quote form; one line (merged at
+  `7dcf262:internal/controller/loop_controller.go:5647`). The `shellQuote`
+  call sites all inherit the fix. Measured on `origin/main` (git grep counting
+  lines): 8 in `loop_verify_job.go`, 11 in `loop_deliver_job.go`, 8 in
+  `loop_controller.go` (one of them the definition at `:5647`), so 26 call
+  lines, matching PR #207's body.
+- **On upgrade.** Nothing required. The fix is in the operator; new Jobs are
+  generated with the corrected quoting. No kind run was needed because the
+  change is script text, covered by execution tests (PR #207).
+
+### F39: tamper check passed all globs as one pathspec and failed open — #210
+
+- **What was wrong.** The tamper check joined all protected-path globs into
+  one newline-separated `git diff` pathspec, which git does not split. With 2
+  or more globs — including the default `go` preset — nothing matched and the
+  gate printed "tamper: clean". A failing `git diff` also read as clean
+  (merged `dc628a5` = PR #210, reproduced with real git).
+- **Who could exploit it, and how.** A sandbox agent that edits a protected
+  path (for example weakens a test file) during implementing passes the
+  tamper gate as long as the Loop has 2+ protected-path globs, so a tampered
+  verify/deliver goes on unchallenged (merged `dc628a5` = PR #210); the kind
+  run in #210 shows an agent appending `// weakened` to `round_test.go` and
+  the fix catching it with `reason: TamperedVerify` (PR #210).
+- **What changed.** One `shellQuote`'d pathspec argument per glob; no pipe —
+  the `git diff` status is checked and a failure exits 2 (fail closed); zero
+  globs skip the diff and print `tamper: clean (no protected paths)` (PR
+  #210).
+- **On upgrade.** Nothing required; the fix is in the operator (PR #210).
+
+### F40: egress proxy followed upstream redirects to unchecked addresses (SSRF) — #212
+
+- **What was wrong.** `handlePlainHTTP` in the egress proxy used an
+  `http.Client` with no `CheckRedirect`, so an allowlisted upstream could 302
+  the proxy to an address that was never checked against the allowlist or the
+  carve-outs (for example 169.254.169.254), and the transport dialed it
+  (merged `c9a53f8` = PR #212).
+- **Who could exploit it, and how.** A sandbox agent that talks to an
+  allowlisted upstream can have that upstream redirect the proxy to a
+  non-allowlisted or carved-out address, so the allowlist and the SSRF
+  carve-outs are bypassed (merged `c9a53f8` = PR #212).
+- **What changed.** `CheckRedirect` returns `http.ErrUseLastResponse`: the
+  3xx is passed back to the agent, which re-requests through the proxy and is
+  checked like any other request (PR #212).
+- **On upgrade.** Nothing required; the fix is in the operator/egress-proxy
+  image (PR #212).
+
+### F42: a Loop with no endpoint and no network allows got no NetworkPolicy at all — #213
+
+- **What was wrong.** When `spec.agent.endpointSecretRef` was empty and the
+  effective policy had no network allows, the operator created no agent
+  NetworkPolicy. The agent netpol carries the ingress deny-all and DNS-only
+  egress, so such a Loop's agent ran with open ingress and egress (the
+  shipped sample `loop-fix-failing-test.yaml` is this shape). An absent agent
+  netpol also did not hold the sandbox Suspended (merged `b90d1db` = PR #213).
+- **Who could exploit it, and how.** Any user who could create a Loop with no
+  endpoint could run an agent with unrestricted ingress and egress, including
+  the cloud metadata address (the kind run showed an unlabelled control pod
+  reaching `http://1.1.1.1/` while the labelled one could not; PR #213).
+- **What changed.** The agent netpol is always ensured (only the model-proxy
+  egress rule is gated on the endpoint); a new `agentNetPolMissing` gate term
+  holds the sandbox Suspended while the agent netpol is absent or unreadable
+  (`b90d1db:internal/controller/loop_controller.go:4662`); the netpol is
+  ensured before the sandbox and the gate releases once the netpol is
+  visible. Note: on an upgrade of a pre-F42 Loop, the gate reads the netpol
+  through the manager's cache, so the netpol can be missing from the cache
+  for a reconcile after it is created — closed by F55 (PR #220), which
+  confirms a cached "absent" with the uncached apiReader; a failed ensure
+  sets `AgentNetworkPolicyReady=False/NetworkPolicyEnsureFailed`, emits a
+  Warning Event, and the condition is persisted before the requeue (merged
+  `b90d1db` = PR #213).
+- **On upgrade.** Nothing required; the fix is in the operator (PR #213).
+
+### F38: a re-plan after verify-failure could skip the approval gate — #214
+
+- **What was wrong.** With manual approval and `verify.onVerifyFail: Plan`,
+  the B4 re-plan (Verifying → Planning) left the stale `PlanApproved`
+  condition in place, and the `PlanChanged` clear ran after
+  `recordPhaseClaim` — whose approval gate read the stale hash and allowed
+  Planning → Implementing. An unapproved re-plan was implemented and
+  delivered (merged `daf4cd6` = PR #214). A rejection while Planning had the
+  same stale-approval problem and did not bump `planAttempt`.
+- **Who could exploit it, and how.** A user with manual approval enabled
+  could get an unapproved re-plan implemented and delivered: the gate let the
+  re-plan advance to Implementing without a fresh approval (PR #214).
+- **What changed.** The `OnVerifyFailPlan` transition now clears
+  `PlanApproved` (as the rejection path does); the `PlanChanged` clear now
+  runs before `recordPhaseClaim`, and the re-hold is surfaced as a
+  `PlanChangedReHold` Event; a Planning-phase rejection clears
+  `PlanApproved` and bumps `planAttempt` (PR #214).
+- **On upgrade.** Nothing required; the fix is in the operator (PR #214).
+
+### F35: the rollback one-shot re-ran on any spec edit — #215
+
+- **What was wrong.** The rollback one-shot marker was keyed on
+  `metadata.generation`, so any spec edit re-armed a completed restore. In
+  particular `cox pause` patches `spec.suspend`, so pausing a rolled-back
+  Loop deleted the workspace PVC and restored the old snapshot over the work
+  since (merged `628fb1a` = PR #215). `restoreFrom` was documented immutable
+  but had no CRD rule.
+- **Who could exploit it, and how.** A user who paused a Loop after a
+  rollback (or edited any other spec field) silently lost all work done since
+  the snapshot: the workspace was rolled back again (merged `628fb1a` =
+  PR #215).
+- **What changed.** The one-shot is now keyed on the restore target (the
+  spec), not the generation: the `Restored` condition's message records the
+  spec target (e.g. `[spec-target=rollback:iter-3]` or `fork:<loop>/<n>`) and
+  the marker is complete only when that key matches the current spec, so spec
+  edits (including `cox pause`) no longer re-arm it; a genuinely different
+  target does. A marker written before this change counts as complete.
+  `restoreFrom` now has a real immutability rule (a CEL `self == oldSelf`
+  transition rule; changing it is rejected with `restoreFrom is immutable`)
+  (PR #215).
+- **On upgrade.** Nothing required; the fix is in the operator and the CRD
+  (PR #215).
+
+### F36: the fork-retention label write was Forbidden, and restore progress was wrong — #216
+
+- **What was wrong.** The fork-retention label (which stops the source's GC
+  from deleting a snapshot a fork is restoring from) was written and removed
+  with `Update`, but the operator's RBAC grants only `patch` on
+  volumesnapshots, so the label write was Forbidden on every real cluster and
+  only logged at V(1) — and the source's GC could delete a snapshot a fork was
+  still restoring from. A rollback whose old PVC was still Terminating was
+  reported `Restored` instead of requeued, and a fork whose own PVC was
+  already present was not deleted and recreated from the snapshot (merged
+  `6eb74c2` = PR #216).
+- **Who could exploit it, and how.** Any user forking a Loop: the source
+  snapshot's GC could delete it mid-restore, and a fork/rollback restore could
+  report success while silently leaving the wrong (or no) workspace contents
+  (merged `6eb74c2` = PR #216).
+- **What changed.** The label is written and removed with `Patch` (a failure
+  is a Warning Event, `ForkRetentionLabelFailed` /
+  `ForkRetentionLabelRemoveFailed`); it is written before the fork PVC create
+  and removed if the restore does not complete; an AlreadyExists on a
+  Terminating PVC sets `DeletingPVC` and requeues instead of `Restored`; the
+  fork/lost-PVC branch deletes a present PVC so the restore completes from the
+  snapshot (PR #216).
+- **On upgrade.** Nothing required; the fix is in the operator (PR #216).
+
+### F55: the sandbox could start before the egress proxy the init clone depends on was ready — #220
+
+- **What was wrong.** A regression in F42's shape: for an external repo with
+  no network allows (the shape of the shipped sample
+  `config/samples/loop-fix-failing-test.yaml`), the first clone traverses the
+  egress proxy, but the sandbox gate did not wait for it — the sandbox pod
+  could start before the proxy pod was Ready, and the init clone got
+  connection refused (merged `74c56f3` = PR #220). Separately, F42's
+  `agentNetPolMissing` gate read the netpol through the manager's cache: on
+  an upgrade of a pre-F42 Loop the freshly created netpol could be missing
+  from the cache for a reconcile, falsely holding (or releasing) the sandbox
+  (PR #220).
+- **Who could exploit it, and how.** A Loop with an external repo and no
+  network allows could start its first clone before the egress proxy was
+  Ready, so the clone failed (connection refused) and the Loop stalled in the
+  workspace-init step (merged `74c56f3` = PR #220).
+- **What changed.** The sandbox gate now also waits for the egress proxy when
+  the init clone must traverse it — gated on the proxy **creation** predicate
+  (`workspaceInitProxyCreated`, shared with `ensureEgressProxy`, so the gate
+  cannot wait for a proxy that is never created, e.g. a repo URL whose host
+  parses empty) rather than the intent predicate (merged `74c56f3` = PR
+  #220). The `agentNetPolMissing` gate now confirms a cached "absent" with
+  the uncached apiReader before holding (the cache may say "present" but not
+  "absent"), and the upgrade path emits one Normal `AgentEgressFenced` Event
+  when the netpol is created for a Loop whose sandbox already exists (merged
+  `74c56f3` = PR #220).
+- **On upgrade.** Nothing required; the fix is in the operator (merged
+  `74c56f3` = PR #220). The F42 upgrade-fence note above (stale-cache gate
+  read) is closed by this fix.
+
+
+### D77: a maxCost Loop holds on a stale usage reading, and releases on the next fresh one (R30) — #384
+
+- **What changed.** A Loop with a `spec.budget.maxCostUsd` cap now HOLDS when its usage reading is stale (`BudgetReadingStale=True`, F44): the operator sets `BudgetHold=True` (reason `StaleReading`) and suspends the running sandbox — the maxCost cap cannot be enforced without a fresh reading, so the Loop waits instead of running on uncapped (owner choice (b) for maxCost). The model proxy stays up (its read is the release) and the usage read keeps being retried; the hold releases on its own on the next fresh reading (`BudgetHold=False` reason `ReadingFresh`, sandbox resumed) — no restart, no manual resume. The gate is inert in Paused, in the delivery hold, and in terminal phases. Loops with only `maxTokens` (or no budget cap) are unchanged: stale readings are still surfaced but never hold. UPGRADE (behaviour change; nothing to do — see "A maxCost Loop holds when its usage reading is stale (D77)") and a TROUBLESHOOTING entry for `BudgetHold=True` / `StaleReading` (check the model proxy pod and its usage endpoint) landed with it — #384 (`618bfba`).
+
+### F16: the memory-writer Job's NetworkPolicy now denies all — #184
+
+The memory-writer Job's NetworkPolicy carried one empty ingress rule and one empty egress rule (`{}`). In Kubernetes an empty rule matches everything, so the policy **allowed** all ingress and all egress, the opposite of the intended fence. The policy is now deny-all: both policy types, with no rules. Nothing to do; the operator recreates the policy as deny-all. — #184 (`0e49905`)
+
+### F18: the credential-assignment rule is case-insensitive, and Authorization and AWS secret-key rules are added — #187
+
+The static write policy's credential-assignment rule (the one that drops a lesson containing `password=`, `token=`, and the like) only matched lower-case keys, so a lesson written with `PASSWORD=` or `ApiKey=` slipped through to the memory PVC. The rule is now case-insensitive, and two new rules cover credential assignment via the `Authorization` HTTP header and AWS secret keys. The screening runs in the memory-writer Job before a lesson is persisted, and on `cox memory import`. Nothing to do; existing memory files are not re-screened (a re-import screens them). — #187 (`669be17`)
+
+## Other changes
+
+### D103: the D38 probe measures a REJECT-style policy controller — #392
+
+- **What was wrong.** The D38 CNI probe ran a single pod under the allow-list NetworkPolicy and read a refused connection as `UNRESOLVED(refused)` (F51, `b33cc7a`) — never as a drop. Some policy controllers refuse a policy-denied connection rather than silently dropping it — the 2026-11-04 `make verify-cni` run on the homelab k3s observed every target refused, including 1.1.1.1:443, which is consistent with such a controller, though the RST cause was not verified. On such a cluster every refused target was `UNRESOLVED`, so a refusing controller was indistinguishable from a dead cluster, and the probe could never report `CNIEnforced` for it: a refused connect is not evidence either way without knowing what the target does with no policy at all.
+- **What changed.** The probe now runs **TWO pods** in `coxswain-cni-probe`: `coxswain-cni-probe-control` (a label the probe netpol does not select, so **no NetworkPolicy applies**) first, then `coxswain-cni-probe` on the same node under the allow-list. Each pass's per-target verdicts combine: REACHABLE / BLOCKED stand as-is; REFUSED + control REACHABLE → **BLOCKED** (the policy made the CNI reject — enforcement); REFUSED + control REFUSED → **NOT_LISTENING** (nothing listens; shown, not counted); anything else → UNRESOLVED. `CNIEnforced` needs the apiserver Service (ClusterIP :443) and at least one node port (node :6443 / :10250) combined BLOCKED; `ProbeUnavailable` names the unmeasurable target (R46 I206). `verify-cni.sh` and `d38-cni-e2e.sh` run the same two passes, and `verify-cni`'s FAIL line now counts separately: N REACHABLE vs M not measurable vs K not listening (R46 I209).
+- **On upgrade.** Two probe pods now run per probe (both in `coxswain-cni-probe`; each pass's pod is deleted right after that pass, and any leftover is removed by the cleanup at the start of the next probe); `--cni-probe-timeout` defaults to **120s** (was 60s) because both passes share it. No config change is needed for a standard install; anyone who set `--cni-probe-timeout` explicitly to 60s should raise it (`docs/UPGRADE.md`, "The CNI probe runs a second, no-policy pod (D103)"). A cluster that reported `ProbeUnavailable` because every target was refused may now report `CNIEnforced` — that is the measurement working, not a behaviour change.
+
+### F93a: a Loop with an unschedulable pod fails after 10 minutes instead of wedging forever — #387
+
+- **What changed.** When at least one of a Loop's pods (sandbox, model proxy, egress proxy, or tool proxy) is unschedulable (`PodScheduled=False`, `Reason=Unschedulable`), the operator surfaces the `PodUnschedulable` condition (True, naming every stuck pod + the scheduler's message), stamps the `coxswain.io/loop-unschedulable-since` annotation, and requeues every 5s while stuck. Once the stuck state lasts 10 minutes the Loop fails with `reason=PodUnschedulable` (phase `Failed`). The clock resets the moment every pod is schedulable or gone, and is also removed on entry to `Paused` so a pause does not count against the bound. One Warning Event fires on the transition to True.
+- **On upgrade.** New behaviour; no operator changes required. The new condition (`PodUnschedulable`) and the terminal `Failed reason=PodUnschedulable` are additive. See `docs/TROUBLESHOOTING.md` ("PodUnschedulable=True") for the diagnosis and the node-selector/tolerations fix.
+
+### F94: a repo with no tests no longer wedges `Verifying` — #383
+
+- **What was wrong.** A Go repo with no `*_test.go` made the verify canary exit 44 (`VerifyCanaryUnavailable`), which meant "no decision" with no bound, so the Loop held in `Verifying` forever.
+- **What changed.** Three outcomes, per the owner's 2026-11-01 decision (a)+(b)+(c). A verified commit that **removed** every test (the base commit had tests, the pin has none) fails the Loop terminally with reason `TestsRemoved`. A repo that **never** had tests proceeds to the acceptance checks with `CanarySkipped=True / NoTestsInRepo`, so the acceptance checks decide without the Go negative control. A canary that is genuinely unavailable (exit 44) is a bounded infrastructure retry (`VerifyInfraRetry` events, three runs in total) that ends `Failed` with reason `VerifyInfraFailed`. The base-commit read fails closed: a git error is "unavailable", never "the base had no tests".
+- **On upgrade.** Behaviour change, nothing to do (`docs/UPGRADE.md`, "Upgrading from v0.1.2"); Loops mid-`Verifying` pick it up on the next verify outcome read. `docs/TROUBLESHOOTING.md` has entries for `Failed: TestsRemoved` and `CanarySkipped=True / NoTestsInRepo` — #383 (`8c85890`).
+
+### I167: the samples kustomization's loop coverage is enforced, and `loop-d61-proof.yaml` is marked applied by path only — #372
+
+- **What was wrong.** The F61 spec only required every shipped `AgentPolicy` to be listed in the samples kustomization (`config/samples/kustomization.yaml`), so a future `config/samples/*.yaml` loop sample could be added and silently omitted from the kustomization — invisible to `kubectl apply -k config/samples` (I167, PR #372, merged `f571eb9`).
+- **What changed.** The F61 spec in `loop_f61_policy_samples_test.go` (the `"lists every shipped sample in the samples kustomization, and every listed sample exists"` It block) now requires every top-level `config/samples/*.yaml` to be listed in the kustomization **unless** the file's header carries the marker `applied by path only` — a two-way check (an unlisted file and a dangling path both fail). `config/samples/loop-d61-proof.yaml` carries that marker: it names the real GitHub sandbox repo, the vLLM endpoint of the §9 VM and the two Secrets §9 Step 7 creates, so it is deliberately absent from the kustomization and applied by path only (PR #372).
+- **On upgrade.** Nothing required; the change is to the envtest spec and one sample header (no CRD, RBAC or chart change) (PR #372).
+
+### F64: `PolicyTranslationLossy` reports a port nothing carries — #325
+
+- **What was wrong.** The `PolicyTranslationLossy` condition could report a `host:PORT` allow as lost (or report none) even though no layer actually carried that port's enforcement: the decision keyed on the egress proxy being *expected* rather than on any carrier existing and ready, and the model-endpoint half was not consulted (F64, PR #325, merged `54b3786`).
+- **What changed.** `translationLossAllows` now returns the allows whose port **no layer carries**, split by cause: `ProxyPending` (the egress proxy pod is not owned by the Loop and Ready yet — a read error and a foreign pod both count as not a carrier) and `EndpointUnpinned` (the model endpoint has a port and no model-proxy NetworkPolicy rule pins it). `False/NoPortLoss` means "no port is lost" and is true of both carriers; `True` now names which cause applies, and the live and deleting paths share the single writer so status, reason and message cannot drift. A TROUBLESHOOTING entry for `PolicyTranslationLossy=True` and a kind e2e step (same allowed host on a different port must be `403` and audit-blocked) landed with it (PR #325).
+- **On upgrade.** Nothing required; the fix is in the operator (no CRD, RBAC or chart change). The condition now reports a port **nothing carries**, so a Loop whose egress proxy is Ready reads `False/NoPortLoss`, and a `True` now names the missing layer (PR #325).
+
+### F75 + F76-doc + F77-pin: restore "do now" (PR A of the F74-F82 split) — #337
+
+- **What was wrong.** A pre-F35 `Restored` marker with no target key counted as complete for **any** target (F75), so the first reconcile after an upgrade re-armed a completed pre-F35 restore and could delete the workspace PVC and re-create it from the old snapshot silently (PR #337, merged `d7311ca`). A failed fork-retention label SET was not retried although the doc says it is (F76, doc half), and a rollback's post-state was undefined (F77, pin half).
+- **What changed.** `legacyMarkerCoversSpec` now parses the target out of the marker's own text and re-arms only a marker that names a **different** target: a keyless `(rollback, iter-3)` marker with `restoreFrom: iter-3` is complete (no wipe); a keyless `(lostPVC, …)` marker against a rollback spec is not (the rollback runs — a lost-PVC restore does not vouch for a rollback); and unreadable marker text is treated as complete (a skipped rollback is recoverable, a wiped workspace is not). The F76 doc half documents the fork-retention label SET as "attempted once per pass, before each create attempt, until the PVC exists" with the observable failure and the manual remedy. The F77 pin half keeps the verify pin until the restore completion and refuses a queued deliver Job while the restore is in progress, so a delivery is never made for a commit the restored (or empty) workspace does not hold; the completion's Event announces the clear, and the hold is visible as `Delivered=False/DeliveryInProgress` while it is active (PR #337). This is partial: F74 and F77's phase/iteration half are NOT in this PR — they wait on owner decision D84 (see Known issues, F74-F77).
+- **On upgrade.** Nothing required; the fix is in the operator (no CRD, RBAC or chart change). Three deliberate behaviour changes on upgrade: a same-target legacy marker is left alone; a Loop that (pre-F35) both completed a reactive lost-PVC restore and earlier completed a rollback/fork re-runs that restore **once** after upgrade (documented in `docs/TROUBLESHOOTING.md`'s `spec.restoreFrom` section); and a `Succeeded` + delivery-enabled Loop whose workspace PVC is lost now shows a visible `Delivered=False/DeliveryInProgress` hold instead of a `Delivered=False/DeliveryFailed` Job (PR #337).
+
+### F62/F63: the engine's blocked-action count is relayed into status, and the Q4 audit lines are emitted — #324
+
+- **What was wrong.** A blocked agent action was invisible on the Loop: nothing wrote a count or a condition, so an operator could not tell that the engine had blocked the Loop's sandbox from doing something (F62). And the engine's blocked-action alerts were not recorded in any audit stream the operator could read (F63) (PR #324, merged `b3e2e00`).
+- **What changed.** A leader-elected relay follows the engine's agent pods and the operator's own egress/tool-proxy pods' `pods/log` (never a poller — a poller cannot tell a rotation gap from "nothing happened"), re-attaching with `sinceTime` = the last accepted alert (a first line later than that is a gap, never a smaller number). A count is published only when the stream is healthy **and** the Loop's sandbox pod exists on it — so `0` means "seen, nothing blocked", never "not seen". `status.policy.blockedCount` and a `PolicyBlocked` condition surface the count: `True`/`BlocksObserved` naming the latest target and the unattributed count when healthy; `Unknown` with the relay's reason (and the count cleared, never `0`) on a gap / unavailable / undecodable / no-engine; absent when the relay has no news for the Loop. A block never changes the phase, never pauses, never a terminal reason (the ADR's Q5) (F62, PR #324). Every alert, allowed and blocked, is one JSON line on the operator's stdout in the Q4 envelope (`{time, loop, namespace, iteration, source, action, target, verdict, detail}`); `iteration` is joined from the Loop status at emit time and written as `unknown` when the Loop cannot be read, so the field is never empty. The stream is unfiltered (every allowed alert is emitted); sampling/rate limiting is a follow-up (F63, PR #324). New RBAC: `pods/log` (`get` only, a subresource grant) on the operator's ServiceAccount — see the Upgrade section for a must-do line if your RBAC is managed outside `install.yaml` (PR #324).
+- **On upgrade.** A standard install (or chart) picks up the new `pods/log` grant automatically; if your RBAC is managed outside `install.yaml`, apply the rule (see above). The fix is otherwise in the operator (no CRD, chart or pod-shape change) (PR #324).
+
+### F73: the memory-writer outcome is decided from the Job before its pod — #336
+
+- **What was wrong.** A memory-writer Job the batch controller failed (e.g. `DeadlineExceeded` when `activeDeadlineSeconds` kills a pod that never became terminal, or `BackoffLimitExceeded`) with its pod still `Pending`/`Running` hot-looped at the requeue interval and never recorded `MemoryWriteDone` — the decision was made from the pod's phase, and a stuck pod's phase is never `Failed` or `Succeeded`. A `pods/list` error also short-circuited before any Job condition was read, and the `MemoryWriteFailed` Warning Event was emitted on every reconcile of the same failure (F73, PR #336, merged `83060bd`).
+- **What changed.** The Job's own `Failed` condition is now read **before** the pod, so the outcome is recorded while the stuck pod is still there (`DeadlineExceeded` keeps the hung-writer-pod wording that names `activeDeadlineSeconds`; any other reason carries the batch controller's reason and message). A `pods/list` error is "an error, not a decision": it falls through to the same Job-condition read, so a finished Job is still decided while the list keeps failing, and the no-pod path's message says the pod could not be read rather than claiming a cause. The Warning Event and the F30 metric fire only on the transition (not on every reconcile) (F73, PR #336, merged `83060bd`).
+- **On upgrade.** Nothing required; the fix is in the operator (no CRD, RBAC or chart change) (PR #336).
+
+### I152: a Paused Loop does not re-announce MemoryPVCUnbound — #329
+
+- **What was wrong.** The `MemoryPVCUnbound` surface ran while the Loop was in a non-terminal phase, and a Paused Loop requeues on the quiet window — so a parked Loop on a StorageClass without ReadWriteMany reconciled and warned every 5 minutes for the life of the cluster, with nothing it could do about the PVC (I152, PR #329, merged `8c46987`). The docs' "while the Loop runs" was the correct promise; the code was the thing not keeping it.
+- **What changed.** The `ensureSandbox` memory branch now also requires `!loopPaused(loop)`, so a paused Loop is not warned at all and does not schedule a re-announce; a resume reconciles again and re-announces if the PVC is still unbound (a pause is not a mute). The two docs' "while the Loop runs" clause is now literally true (I152, PR #329, merged `8c46987`).
+- **On upgrade.** An operator alerting on `MemoryPVCUnbound` for paused Loops loses those events while the Loop is parked — which is what both docs promise. Nothing else required; the fix is in the operator (no CRD, RBAC or chart change) (PR #329).
+
+### F79: the runner retries a transport failure — #338
+
+- **What was wrong.** The runner's model-request retry retried only a context deadline, while the comment described the class as "a model request that times out or returns a transport error" — an immediate transport failure (DNS, dial refused, no route) made one attempt, surfaced `ModelUnavailable`, and blocked the claim. The runner's and `pkg/curator`'s classifications disagreed about the same failure (F41 had already retried the class in the curator) (F79, PR #338, merged `2917675`).
+- **What changed.** The runner now retries only the transport failures that prove the request never reached the model: a context deadline, a DNS failure, or a dial failure (TCP connection never opened, so no bytes were sent). A failure **after the request was written** (EOF, reset, read error) is **not** retried — the server may have accepted and processed the completion, so re-sending it would make the model do the work twice and count the request twice in the proxy's budget counters. One log line per retry (`runner: call model: retry N/M in <backoff>: <err>`); the ladder is a `runConfig` field (`ModelRetries`/`ModelRetryBackoff`, zero = the production 3 retries at 2s) so the specs drive the real `driveModel` without sleeping (F79, PR #338, merged `2917675`).
+- **On upgrade.** Nothing required; the fix is in the runner (in the operator image; no CRD, RBAC or chart change). Note the cost the PR states: a dead endpoint now spends the full ladder per step instead of failing at once, and the timeout class is unchanged (a timed-out request may already have been accepted, so that retry can re-send it) (PR #338).
+
+### F52 (B1+B2): a Loop whose delivery FAILED is no longer "in flight", and settling the delivery hold keeps the verify record — #343
+
+- **What was wrong.** The "in flight" predicate the suspend gate used tested `status.delivery == nil`, but the deliver Job's failure paths never write `status.delivery` — only the success path does; a failed push records `Delivered=False/DeliveryFailed` instead. So on a Succeeded Loop whose delivery had **failed**, the predicate stayed true for ever and `spec.suspend=true` was refused with "suspend refused while a deliver Job is in flight" (B1). And `settleDeliveryHold` rebuilt `status.conditions` without the `Verifying` entry, so the record that the Loop passed verify (and why the hold ended) vanished from `kubectl cox describe` once the delivery completed (B2) (merged `7233293` = PR #343).
+- **What changed.** The predicate is now `!deliveryTerminal(loop)` — the same predicate the hold and the settle already use — so a failed delivery is no longer "in flight" and the suspend is accepted; the refusal message is corrected too (it claimed "phase Succeeded, delivery not recorded", and the in-flight case is now also the `Verifying`+`Delivering` hold, where the phase is Verifying and the delivery *is* recorded as InProgress) (B1, PR #343). The settle now sets the `Verifying` condition `False` instead of deleting it, carrying the `Delivered` condition's reason (`Delivered` or `DeliveryFailed`), or the `VerifySettled` reason when `spec.delivery` was cleared mid-hold and there is no `Delivered` condition to name the outcome; the hold's marker is `Verifying=True` + `reason=Delivering`, so a `False` condition releases the hold exactly as deleting the entry did (B2, PR #343). A later attempt that iterates clears the settled record with the rest of the per-pin state (PR #343).
+- **On upgrade.** Nothing required; the fix is in the operator (no CRD, RBAC or chart change). A Succeeded Loop with a failed delivery can now be suspended, and `cox describe` keeps the settled verify record (PR #343).
+
+### F53 (notes 4+5): the verify Job's deadline message names the Job's own `activeDeadlineSeconds` — #344
+
+- **What was wrong.** The verify-infrastructure-failure message for a deadline kill formatted this build's constant `verifyJobActiveDeadlineSeconds` (900), so a verify Job created by an older build — with its own `spec.activeDeadlineSeconds` — was described with a value that did not kill it (PR #344, note 4). The no-pod deadline decision also had only the unit seam (PR #344, note 5).
+- **What changed.** The deadline message now reads the Job snapshot's own `spec.activeDeadlineSeconds` when the snapshot is present, and falls back to the constant only when the Job is gone (a GC'd Job has no spec to read) (PR #344, merged `d872d6d`). The Reconcile-driven no-pod shape is added: a deadline-killed Job whose pod is gone retries through `Reconcile` (phase stays `Verifying`, `status.verify.infraAttempts` bumps, the deadline-killed Job is deleted so a fresh one is created, and the `VerifyInfraRetry` Event names `activeDeadlineSeconds`) (PR #344).
+- **On upgrade.** Nothing required; the fix is in the operator (no CRD, RBAC or chart change). A deadline-killed Job from an older build is now named with its own deadline value (PR #344).
+
+### F92 (findings 2+5): the missing-KubeArmor-CRD re-check window takes part in the earlier-of comparison — #346
+
+- **What was wrong.** The F92 branch (the 1-minute re-check while a Loop is held on a missing `KubeArmorPolicy` CRD) returned before `reconcileRequeueAfter`'s earlier-of comparison, justified by a comment claiming its window "is the shortest by construction" — false: a nearly-elapsed wall-clock budget returns its remaining time (which can be seconds), and the memory-PVC re-announce window returns the time left in its five-minute quiet window, which can also be seconds; so a held Loop that also had a sooner budget or memory window waited on the longer (1-minute) timer (PR #346, merged `78299a5`).
+- **What changed.** The F92 window now takes part in the earlier-of comparison: the re-check fires at the earlier of its one-minute window and any sooner budget (wall-clock) or memory-PVC re-announce window; the `reconcileRequeueAfter` doc states the comparison instead of the false invariant (PR #346).
+- **On upgrade.** Nothing required; the fix is in the operator (no CRD, RBAC or chart change). A Loop held on a missing KubeArmor CRD that also has a sooner budget or memory window is re-checked sooner (PR #346).
+
+### F80: the memory writer's termination-message summary is bounded at the 4096-byte cap, on whole lines, with a marker — #339
+
+- **What was wrong.** Kubernetes caps a container's termination message at **4096 bytes** and cuts anything longer silently. `emitSummary` wrote one unbounded buffer to stdout and to the termination-message path the operator reads from the pod's container status, and the only real bounds were `MaxLessonsPerWrite = 20` and the curator's 200-rune reason cut — 20 per-lesson lines plus the audit lines reach ~17 KB. A large batch therefore arrived truncated with no marker, and the operator could not tell a complete summary from a capped one (PR #339, merged `f36a8d2`).
+- **What changed.** The termination-message copy is now bounded to 4000 bytes (96 under the kubelet's cap, so the marker can never be the bytes dropped), on whole lines from the start of the summary — the counts line is first (F78), so it always survives — and when it is cut it ends with a marker, `… N more lines (M lesson lines)`, that also says how many of the cut lines were per-lesson lines (so a capped summary no longer mis-splits the curator/static-drop metric). stdout keeps the full summary on purpose (the Job log is where the complete per-lesson audit is read); an under-cap summary is written byte-identical with no marker; the doc sites that claimed a bound existed are corrected to the actual behaviour (PR #339).
+- **On upgrade.** Nothing required; the fix is in the operator and the memory-writer image (the writer's file write ships in `cmd/memory-writer`; set `--memory-writer-image` if your install is not `config/default`). A capped termination-message summary now arrives marked and complete-as-a-prefix instead of silently cut (PR #339).
+
+### F61: the reference AgentPolicies ADR-0007 promises ship under `config/samples/policies/` — #318
+
+- **What was wrong.** ADR-0007 promises "reference policies per supported
+  agent image ship under `config/samples/policies/`" (and "the sample must
+  ship with a minimal `AgentPolicy`"), but `config/samples/policies/` did not
+  exist and nothing shipped those objects (F61, merged `46a470a` = PR #318).
+- **What changed.** `config/samples/policies/` now ships two ordinary
+  `AgentPolicy` CRs — `default-deny.yaml` (`spec: {}` — the documented
+  shape, no allows) and `go-toolchain.yaml` (network allows for
+  `proxy.golang.org:443` and `sum.golang.org:443`) — both listed in the
+  samples kustomization (`config/samples/kustomization.yaml`), so
+  `kubectl apply -k config/samples` creates them like the existing Loop
+  samples (which, like the policies, carry no namespace, so the apply takes
+  one from the current context) (PR #318). `docs/OPERATOR.md`'s "What the
+  sandbox can reach" section points at them as the reference policies
+  (PR #318). Both objects are **inert until a Loop references one**
+  (`spec.policyRefs`): no existing sample is wired to them, and a policy
+  that grants network would change the Loop's egress (and the F42 fence's
+  shape), so the samples stay unwired (PR #318). An envtest spec admits
+  every shipped policy against the CRD (strict-parse into
+  `coxv1alpha1.AgentPolicy`, then create against envtest so the apiserver
+  enforces the CRD markers and CEL rules, reading the stored spec back),
+  asserts the samples kustomization lists every shipped policy and every
+  listed policy exists (two-way, so an unlisted file is invisible to
+  `kubectl apply -k` and a dangling path is caught), and keeps
+  `default-deny`'s no-allows claim true (`Exec`/`Network`/`Files`/`Tools`
+  all empty) (PR #318). No kind run: the objects are CRs with no effect
+  until referenced, and the schema is what the spec exercises (PR #318).
+- **On upgrade.** Nothing required; the policies are inert until a Loop
+  references one, and no Loop sample changes. A cluster applying
+  `-k config/samples` now also creates the two policy objects (PR #318).
+
+### F70: a completed fork's sandbox is not held for a workspace-init clone it will never run — #314
+
+- **What was wrong.** The sandbox gate waited for the egress proxy whenever the workspace-init clone would traverse it — but a fork's workspace comes from the source's snapshot and already carries the base commit, so the init script exits 0 with "workspace already initialised" before any clone. On an install where the proxy cannot come up (e.g. F56's unpullable `coxswain-egress-proxy:standin`), the fork's sandbox was held `Suspended` for ever with no condition naming it (`d9f5619` = PR #314, F70).
+- **What changed.** The egress-proxy wait for the workspace-init term now applies only while a clone will actually run: a fork whose restore is complete for its current target (`Restore=True/Restored` carrying the matching target key — an unrelated spec edit cannot re-arm the wait) starts from the restored workspace and is not held, even if the egress proxy pod is unavailable. The proxy itself is still created for the fork (the verify/deliver clone-base still traverses it for an external repo) — only whether the sandbox waits for it changes. A fresh Loop is still held until its egress proxy pod is Ready (F70).
+- **On upgrade.** Nothing required; pick up the new operator image (no CRD, RBAC or chart change). A known issue about a fork waiting on an unusable egress proxy is no longer open (PR #314).
+
+### F57: a restore whose PVC cannot be confirmed is not Restored, and the fork label stops being re-patched — #313
+
+- **What was wrong.** When restoring into an already-present workspace PVC, a read-back that failed (or found the PVC gone again) fell through to "restored", so a transient read failure could record `Restored` for a restore that never happened (F57a). And on a fork, every pass re-patched the retention label on the source snapshot — and re-emitted the `Restore=False/Rejected` Warning on every pass, for the life of a failing create (F57b) (`3a99f2e` = PR #313).
+- **What changed.** An `AlreadyExists` whose read-back cannot confirm the PVC (a failed read, or a `NotFound`) is now treated as no decision on both the fork/lost-PVC path and the rollback path: the restore is requeued and decided from a fresh read on the next pass, and its log line is unfiltered because the retry is otherwise silent (F57a). The fork-retention label on the source snapshot is written once and stays while the create is retried (a patch is skipped when the label already names this fork), and is released on completion or when the fork is deleted mid-retry — the second deleting pass is a read-only no-op once the label is gone; the `Restore=False/Rejected` Warning now fires on the transition into `Rejected` only, on both the fork/lost-PVC and the rollback paths (F57b).
+- **On upgrade.** Nothing required; pick up the new operator image (no CRD, RBAC or chart change). A F36 spec that asserted a failed fork create removes the label again now asserts the F57b guarantee instead: the label stays while the retry is live (PR #313).
+
+### F56: make deploy passes the four component-image args, and a missing runner is visible — #311
+
+- **What was wrong.** `make deploy` passed none of the four component-image args, so a deployed Loop ran the operator's `sleep infinity` stand-in (it looked Running and never advanced) and the three proxy pods pulled `…:standin`/`…:metering` tags that were never pushed; nothing on the object said so (no condition, no Event) (`64f4902` = PR #311, F56).
+- **What changed.** The two kustomize renders (`make deploy`, `dist/install.yaml`) now derive the runner and the three proxy images from `IMG` — same registry+path prefix as the manager image, `coxswain-<component>`, IMG's tag — so a registry-port IMG such as `localhost:5000/coxswain-controller:v1` works; an untagged or digest `IMG` is refused with a message. The Helm chart ships the four args as `:placeholder` defaults whose tag the release workflow stamps; a chart user on another registry overrides `manager.args`. A Loop whose runner image is unset (neither `--runner-image` nor `spec.agent.image`) now shows `RunnerAvailable=False/RunnerImageUnset` and one `RunnerUnavailable` Warning Event per observed transition into that shape (a pinned `spec.agent.image` shows `True/AgentImagePinned` — the documented debugging opt-out, not a degradation); surfacing only, the Loop is never failed or terminalised. `docs/TROUBLESHOOTING.md` gains a `RunnerAvailable=False` entry (F56).
+- **On upgrade.** `config/dev` keeps its documented stand-ins: it sets `--runner-image=coxswain-runner:dev` itself and leaves the three proxy args unset, so the operator's built-in names apply (`coxswain-proxy:metering`, `coxswain-tool-proxy:standin`, `coxswain-egress-proxy:standin`). Otherwise pick up the new operator image and re-deploy (PR #311).
+
+### F92: a missing KubeArmorPolicy CRD is surfaced on the Loop, not only in the log — #308
+
+- **What was wrong.** On a cluster with no `KubeArmorPolicy` CRD and the operator running without `--allow-unenforced`, the policy-write error was returned before any status write, so every Loop sat at an empty `status` — no phase, no condition, no Event — for ever; the only trace was the operator log (`7fd171d` = PR #308, F92).
+- **What changed.** The missing-CRD no-match is now tolerated on the write path so the condition half still runs: the Loop shows `PolicyEnforced=False` with a message naming the missing CRD (the reason is whatever the engine observation reports — on kind: `NodeNotEnforcing`), one `PolicyEnforcementUnavailable` Warning Event (one per transition, not re-announced), the sandbox created and held `Suspended` with the workspace PVC, and a 1-minute re-check while held — a terminal Loop takes no such window, and a Loop that has never cloned takes the ordinary 5s work requeue first (F92).
+- **On upgrade.** Nothing required; pick up the new operator image (no CRD, RBAC or chart change). If a Loop is held this way, recovery is installing KubeArmor — installing only the CRD is not enough (the engine still reports the node not enforcing) — or restarting the operator with `--allow-unenforced` (PR #308; `docs/TROUBLESHOOTING.md` gains the F92 section).
+
+### F53: the verify checkout is read-only to the checks, and the verify Job has a deadline — #306
+
+- **What was wrong.** Every `check-*` container in the verify Job mounted the checked-out tree (`/verify`) writable, so one check could change what a later check saw (ADR-0005 D19 rules that out: "the 'otherwise writable' branch let agent code in check 1 rewrite `*_test.go` after the tamper check, so check 2 could compile doctored tests") (F53 a). All checks also shared one `/tmp` scratch emptyDir, so one check could poison the next check's `HOME`/`GOCACHE`/`TMPDIR`. And the verify Job was the only one of the three operator Jobs with no deadline (deliver 600s, memory writer 300s): a check that never terminates held the Loop in `Verifying` for ever with no condition, no Event and no bound (F53 b).
+- **What changed.** Each `check-*` container now mounts `/verify` read-only (the trusted init containers, including the artifact gate that writes the artifact, keep their writable mounts, and a spec asserts both directions so a later "make everything read-only" refactor fails loudly). Each check gets its own `/tmp` scratch (`check-tmp-<i>`), and check containers gain `PYTHONPYCACHEPREFIX=/tmp/pycache` (`08307a8` = PR #306, F53 a). The verify Job now runs with `activeDeadlineSeconds: 900` (15 min, a constant like the two sibling Jobs — worst case 3 × 900s before `VerifyInfraFailed`, within the existing `verifyInfraRetries = 2`); a Job stopped by its deadline is read from the Job's own terminal `DeadlineExceeded` condition and decided as a `VerifyInfraRetry` infrastructure retry even with a pod still showing a `Waiting` or `Running` step, so the Loop is never left in `Verifying` by a hung check, and after the existing retry bound it fails with `VerifyInfraFailed` naming the deadline (F53 b).
+- **On upgrade.** A check that wrote into the checkout now fails with `read-only file system`; the writable places are its own `/tmp` scratch (listed in `docs/UPGRADE.md`) (PR #306). The shipped sample Loops and task examples were updated to build into `/tmp` (e.g. `go build -o /tmp/…`), since a single-`package main` repo's `go build ./...` previously emitted its binary at the checkout root. The Python samples need no edit — their `python3 -m compileall -q .` cache is redirected to `/tmp/pycache` by the new env var; the PR notes this is reasoned, not verified on a kind run.
+
+### F52 (runner/CLI P3s): the memory import stores what its name hashes, an unknown phase idles, and describe names its argument — #303
+
+- **What was wrong.** `cox memory import` hashed the trimmed lesson content for the file name and then stored the un-trimmed bytes, so an entry whose content ends with a newline was written under a name that is not the SHA-256 of its content — the invariant the rest of the path assumes (the memory-writer names a lesson by the hash of the trimmed lesson, and dedup compares by name) (F52 C1). A desired phase the runner does not execute (for example `AwaitingApproval`, which the approval gate reaches without writing the phase itself) made the runner write a `status=blocked` claim the operator rejects as malformed: the one-shot exited 1, restarted, and repeated for ever (F52 C2). And `cox describe` / `cox history` `--help` did not name the Loop argument, while `cox describe` printed the `-n` flag's value (or `default`) instead of the namespace the Loop actually lives in (F52 C3).
+- **What changed.** The import now stores the bytes its file name hashes (the trimmed body) (`f534314` = PR #303, F52 C1). A desired phase the runner does not execute (any phase other than `Planning` or `Implementing`) now idles instead of writing the rejected claim — no claim, no model request, no `result.json`; a hold longer than the runner's 24h idle timeout gets one clean exit-and-restart, not a churn (F52 C2). `cox describe` and `cox history` name their `loop` argument in `--help`, and `cox describe` prints the Loop's own namespace (F52 C3).
+- **On upgrade.** Nothing required; pick up the new `cox` binary and operator image (the change is in the CLI and the runner, no CRD change) (PR #303).
+
+### F52 (restore P3s): a restore with no VolumeSnapshot CRD gets its own reason, and `CheckpointsAvailable` is rewritten only when it changes — #302
+
+- **What was wrong.** On a cluster without the VolumeSnapshot CRD, a restore or rollback was reported with the missing-snapshot reason: the terminal message said the checkpoint "does not exist (it was never taken, or it was GC'd)" — a cause that never applied on a cluster that cannot hold checkpoints at all (F52 A1). And the `CheckpointsAvailable` condition step hard-coded `changed` true, so every steady-state reconcile wrote the condition even when nothing had changed (F52 A2).
+- **What changed.** A restore or rollback when the VolumeSnapshot CRD is not installed now reports the new `VolumeSnapshotCRDMissing` reason (the value the `CheckpointsAvailable` condition already used for this cause, so one vocabulary) instead of a missing-snapshot reason; the reject stays terminal (no requeue), and the reason is named in `cox fork --help`, `docs/FAQ.md` and `docs/QUICKSTART.md` (F52 A1, PR #302). The `CheckpointsAvailable` status is now rewritten only when the condition actually changed (PR #302).
+- **On upgrade.** Nothing required; the new reason is a constant in the operator (no CRD change) (PR #302).
+
+### F48b: a sandbox pod stuck on a volume it can't mount now fails the Loop instead of waiting forever — #266
+
+- **What was wrong.** A sandbox pod stuck on a volume it can't mount (for example a missing Secret, reported as FailedMount) waited forever: the F48 surface showed `SandboxNotStarting` but never failed the Loop (F48b), and the sandbox infra-retry bound itself never tripped — the operator's own Sandbox recreate reset the count (F48b).
+- **What changed.** A sandbox pod stuck on an unmountable volume now fails the Loop after the bounded retries (2) instead of waiting forever. The sandbox infra-retry bound now actually trips (the recreate no longer resets it). The operator now reads the pod's FailedMount Events to make the decision, so it needs `get` and `list` on `events` — a new RBAC rule: apply the new `install.yaml` or chart (PR #266).
+- **On upgrade.** Apply the new `install.yaml` or chart so the operator has `get`/`list` on `events`; everything else is in the new operator image (PR #266).
+
+### F48g: the sandbox retry count now belongs to one run — #269
+
+- **What changed.** The sandbox infra-failure count (that F48b makes trip) now belongs to a **run** — one iteration and phase — keyed on the new `status.agent.infraEpisode` field, so a failure episode cannot consume the next run's retry budget: failures in an earlier run, and failures before a rollback, no longer count toward failing a later run (PR #269, merged `0070686`). The empty-workspace fallback (a lost PVC with no usable checkpoint) now also starts the retry count again (F48h, PR #273).
+- **On upgrade.** Nothing to do beyond the new CRD: `status.agent` gains one optional field, `infraEpisode`, picked up with a standard install (PR #269).
+
+### F89: a sandbox failure with no kubelet reason no longer wedges the whole status write — #271
+
+- **What was wrong.** A sandbox pod that failed with no reason recorded by the kubelet produced a condition whose reason the CRD rejects, and the rejection took the **whole** status write with it — so the failure condition and the retry count were never saved, and the bounded retry never exhausted (F89).
+- **What changed.** An empty termination reason now falls back to `PodFailed` — the same value the operator uses when the kubelet recorded neither a pod-level nor a container-level reason — so the write goes through and the retry limit applies (PR #271). A kubelet failure reason that the condition schema cannot store (for example one containing spaces) now also falls back to `PodFailed`, with the original text kept in the condition message (F89b, PR #275).
+- **On upgrade.** Nothing to do; the fix is in the operator (PR #271).
+
+### F83c: the tamper decision comes only from the verify Job's pod; an OOM-killed tamper check is an infrastructure failure — #264
+
+- **What was wrong.** The status-driven tamper gate that F83 kept could never fire, so the tamper decision had a second path that was dead code (F83c); and a tamper check container killed for running out of memory was a terminal `verifyTampered` failure instead of a retried infrastructure failure (F83c).
+- **What changed.** The dead status-driven tamper gate is deleted, and the verify Job's own pod is now the only tamper decision; a tamper check container killed for running out of memory is now a retried infrastructure failure, not a terminal 'tampered' failure (PR #264).
+- **On upgrade.** Nothing to do; the fix is in the operator (PR #264).
+
+### F83d: the tamper record no longer outlives the run it belongs to — #274
+
+- **What was wrong.** The tamper record (exit code, verified commit, Job UID) survived into the next run, so a delivered PR body could still show the previous run's tamper result after a new verify run had started; a verify-infrastructure failure message printed only the exit code (137) without the kubelet's reason; and the CRD field docs promised a pin-vs-evidence comparison that F83c deleted (F83d).
+- **What changed.** The tamper record is cleared when a new verify run starts, so a delivered PR body no longer shows the previous run's result; a verify-infrastructure failure message now carries the kubelet's reason (for example `OOMKilled`); and the CRD field docs for the verify status fields are corrected to what the code actually does (PR #274).
+- **On upgrade.** Nothing to do beyond the new CRD — the doc-text change is picked up by a standard install (PR #274).
+
+### F48d: `SandboxNotStarting` is saved, fires once, and clears; a bad image name fails at once — #262
+
+- **What was wrong.** During Verifying, the `SandboxNotStarting` condition was not saved, so its Warning Event fired on every reconcile (F48d); the condition was also not cleared when the pod or its Sandbox is gone (F48c); and a bad image name (`InvalidImageName`) waited forever instead of failing the sandbox start (F48d).
+- **What changed.** At Verifying, the `SandboxNotStarting` condition is now saved and its Warning Event fires once, not every reconcile; the condition clears when the pod or its Sandbox is gone (F48c is fixed too); and a bad image name (`InvalidImageName`) now fails the sandbox start at once instead of waiting forever (PR #262).
+- **On upgrade.** Nothing to do; the fix is in the operator (PR #262).
+
+### F85: `cox describe` now shows the real budget and the commit pin and PR lines — #260
+
+- **What was wrong.** `cox describe`'s budget block read a field that doesn't exist and showed neither of the F44 fields, so the budget it printed was wrong and the F44 surfacing was invisible in the CLI (F85); and the commit pin (base vs verified) and the PR number/URL lines never printed at all (PR #260).
+- **What changed.** `cox describe` now shows the real token count (prompt plus completion), requests, unmetered requests, cost, the last usage read, and consecutive read failures — the F44 surface instead of a non-existent field; the base and verified commits now print, so the F43 ancestry fact is visible without reaching for the API; and the delivered PR's number and URL lines now print, which they never did before (PR #260).
+- **On upgrade.** Nothing to do beyond picking up the new `cox` binary — the fix is in the CLI, not the operator (PR #260).
+
+### F88: `cox describe` now shows the wall clock, and empty Budget and Delivery headings are no longer printed — #268
+
+- **What was wrong.** The budget block printed tokens, requests, cost and the like but never the wall-clock time a Loop had run — so a `WallClock` cap that fired told an operator *that* it fired, not how much time was spent — and an empty `Budget:` or `Delivery:` heading could be printed bare with no lines under it (F88).
+- **What changed.** `cox describe` now shows the wall clock first in the budget block (`active: ... of ... cap`, or `active: ... (no cap)` when no cap is set), and the `Budget` and `Delivery` headings print only when they have lines to show (PR #268).
+- **On upgrade.** Nothing to do beyond picking up the new `cox` binary — the change is in the CLI, not the operator (PR #268).
+
+### F48: a sandbox pod that never starts is surfaced, and a config-error start is bounded — #256
+
+- **What was wrong.** A sandbox pod stuck Pending with no container started (e.g. a missing `gitCredentialSecret`: kubelet reports FailedMount only as an Event) wedged the Loop with no condition, Event or timeout (F48, review-api P2-3).
+- **What changed.** Three decisions, all in the sandbox start path (`internal/controller/loop_s4_phase.go`): (a) a `Pending` pod with `CreateContainerConfigError` for >= 60s is a sandbox failure, bounded by the existing `sandboxInfraRetries` (2), so it fails the Loop `Failed:SandboxFailed` — with the valid-claim check first, so a claim recorded in `LastTerminationState` is not burned; (b) a `Pending` pod with no container started for >= 5m sets the new `SandboxNotStarting` condition (True) plus ONE Warning Event on the transition; it SURFACES only (a slow image pull is indistinguishable from the pod status, I49) and is cleared when the pod is no longer Pending; (c) the CRD now validates `spec.agent.gitCredentialSecret` and `spec.agent.endpointSecretRef` (MaxLength 253 + DNS-1123 subdomain pattern), so a malformed Secret name is rejected at the API server instead of surfacing only as a FailedMount Event later. A `docs/UPGRADE.md` note for the stricter validation is in the same PR (merged `4451ade` = PR #256).
+- **Scope note.** The *surface* covers every stuck shape; the F48 bound covers `CreateContainerConfigError` only. A missing Secret **volume** (the `gitCredentialSecret` case) stays `ContainerCreating` with a FailedMount Event and is not bounded by F48 — that bound needs Event read RBAC and was split to F48b (PR #266, now closed).
+- **On upgrade.** Before upgrading, list existing Loops' `gitCredentialSecret` and `endpointSecretRef` values and look for non-matching ones — see `docs/UPGRADE.md`, section "Stricter Secret-name validation (F48)" (PR #256). A non-matching existing Loop is not deleted or changed; on Kubernetes 1.30 and later, other updates to it still work (CRD validation ratcheting lets an update through when it leaves that field unchanged). New Loops with a malformed Secret name are rejected at the API server from now on (PR #256).
+
+### F84: a proxy pod that is starting or not yet up is no longer a failed budget reading — #259
+
+- **What was wrong.** The budget's usage read counted a model-proxy pod that is starting or not yet up (no pod yet, or no pod IP yet) as a *failed* read, so a normally starting proxy pod burned consecutive failed reads until `BudgetReadingStale` raised a false alarm (F84), and the stale message claimed a "last successful reading" that had never happened (PR #259).
+- **What changed.** A proxy pod that is starting or not yet up is now a **no reading** (`ErrNotReady`) with a start-up grace, not a failed read: the consecutive-read-failure counter is not burned while the proxy is coming up. While the model proxy holds the sandbox's model access, a new `ModelProxyNotReady` condition says when it is holding, with one Warning Event on the transition (not per reconcile) — the silent no-op is no longer invisible. The stale-reading message no longer claims a last reading that never happened, and the no-endpoint `MeteringDegraded` / `BudgetReadingStale` conditions are now cleared on recovery (PR #259).
+- **On upgrade.** Nothing to do; the fix is in the operator (PR #259).
+
+F84b (PR #265, merged `74d4a03`): `ModelProxyNotReady` now clears when the Loop reaches Failed or Succeeded, and a proxy pod that could not be read is no longer reported as not existing. Nothing to do on upgrade.
+
+### F84c: `ModelProxyNotReady` no longer sticks when another gate holds, and a flapping proxy read no longer rewrites status every pass — #277
+
+- **What was wrong.** The clear for `ModelProxyNotReady` lived inside the model-proxy hold itself, which the reconcile only reaches after the earlier gates — so a Loop that reached Failed or Succeeded while an earlier gate held (including a missing AgentPolicy reference) kept `ModelProxyNotReady=True` forever, outliving the reason it was set. And a proxy pod that could not be read put the raw error text in the condition's message, so a read error whose text changed between passes re-stamped the condition with a new message on every reconcile pass (F84c).
+- **What changed.** The terminal clear now runs on every reconcile of a finished Loop, ahead of the validation, restore and NetworkEnforced holds and on the deleting path, so a finished Loop no longer keeps `ModelProxyNotReady=True` while another gate (a missing AgentPolicy reference included) holds (F84c, PR #277). A failed proxy read now reports a stable reason; the error text goes to the Event and the log instead of the condition message, so a flapping read no longer rewrites the condition every pass (F84c, PR #277).
+- **On upgrade.** Nothing required; the fix is in the operator (PR #277).
+
+### I144: the memory PVC degradation re-announces on a quiet window instead of firing once — #299
+
+- **What was wrong.** When a running Loop's memory PVC stays unbound (a StorageClass without ReadWriteMany, for example), the `MemoryPVCUnbound` Warning was gated by a one-shot marker set on the first reconcile and cleared only when the PVC bound; because Events expire at the cluster's `--event-ttl` (default 1 hour), a PVC unbound for longer than that left the degradation with no surface at all — no condition, no `cox describe` line, and the Event gone (I144).
+- **What changed.** The warning now runs through the shared quiet-window helper: the marker holds the last Event's time and the `MemoryPVCUnbound` Warning repeats once per 5-minute window while the PVC stays unbound, instead of once per Loop (I144, PR #299). The re-announce is actually scheduled — while the PVC is unbound, the reconcile requeues on the window (taking the earlier of it and the budget's read window, with the 5s work requeue still winning) — and a finished Loop is not warned again, since the surface runs only while the sandbox step runs. No condition was added (option (b) of the item); a pre-upgrade one-shot marker parses as "not recently notified", so an upgrade announces once and rewrites the marker (PR #299).
+- **On upgrade.** Nothing required; the fix is in the operator (PR #299).
+
+### F48e + F90: the iteration counters are documented 0-based, `cox describe` prints the desired phase, and the UPGRADE notes cover the new sandbox-episode field — #278
+
+- **What was wrong.** Eight places documented `status.iteration`, `CheckpointStatus.iteration`, `StallEntry.iteration` and `planAttempt` as 1-based, while the code counts from 0 (F90); `cox describe` printed `Phase:` and `Iteration:` but not the desired phase that the operator docs had promised, so a budget- or stall-driven pause (`Phase: Paused`, `DesiredPhase: Implementing`) could not be told apart from a `spec.suspend` pause; and `docs/UPGRADE.md` did not cover the `status.agent.infraEpisode` field that #269 added (F48e).
+- **What changed.** The API field docs (rendered into the CRD) and the operator, checkpoint, memory-writer and verify docs now state the counters as the code counts them: 0 for the first run, with the first verify retry at 2 (1 is skipped), and `planAttempt` 0 on the first Planning run (F90, PR #278). `cox describe` now prints `DesiredPhase:` when `status.desiredPhase` is set (F90, PR #278). `docs/UPGRADE.md` now covers the pre-F48g shape (a sandbox-failure count with no episode key restarts the episode) and the terminal mount-failure remedy for `status.agent.infraEpisode` (F48e, PR #278).
+- **On upgrade.** Nothing to do beyond the new CRD: the change to the loop CRD is doc-text only, picked up by a standard install (PR #278).
+
+### F83e + F91b: the delivered PR body reads only the pin's own tamper evidence; two code comments corrected — #279
+
+- **What was wrong.** The delivered PR body's tamper line took `status.verify.tamperExitCode` without checking the record belonged to the pin being delivered — and `loops/status` is user-writable — so a forged or pre-F83d record could print as this delivery's verdict (F83e); two comments also said something the code does not do (F91b).
+- **What changed.** The PR description's tamper line now uses the verify record only when its `verifiedCommit` equals the pin being delivered; a non-matching record reads as "no tamper evidence", the fail-closed reading the body already documented (F83e, PR #279). Two code comments were corrected with no behaviour change: the run-key comment (the rejection re-plan moves the run key and the accepted planning claim ends the episode, and the rejection arm itself clears nothing) and the reason-length note (F91b, PR #279).
+- **On upgrade.** Nothing required; the fix is in the operator (PR #279).
+
+### F48f: the sandbox mount-failure Events read now filters server-side, and an unreadable Events read is re-surfaced instead of muted for the Loop's life — #282
+
+- **What was wrong.** When F48b's sandbox fails on an unmountable volume, the mount-failure decision reads the pod's `FailedMount` Events — but that read listed **every** Event in the namespace and filtered in memory (F48f); and a read that failed (the Events API unreadable) set a permanent marker, so the "Events unreadable" Warning fired once and never again, leaving the failure silent for the rest of the Loop's life (F48f).
+- **What changed.** The mount-failure Events read now sends the pod's UID to the apiserver as a field selector (`involvedObject.uid`) whenever it goes through the uncached apiReader, so the filter happens server-side (the in-memory UID/kind/name check stays on both paths as the correctness rule) (F48f, PR #282). The "Events unreadable" marker now records the last notification time and the Warning Event repeats every 5 minutes while the read keeps failing, instead of only once per Loop (F48f, PR #282).
+- **On upgrade.** Nothing required; the fix is in the operator (PR #282).
+
+### F83b: a verify Job that is not the Loop's is never trusted as evidence, and each verify decision reads one Job snapshot — #283
+
+- **What was wrong.** The verify decision did not check that the Job it read was the Loop's own: a Job that happened to carry the Loop's verify name could be used as evidence (burning a retry attempt) and could be adopted and deleted as stale (F83b). And the decision read the Job twice, so between the two reads the operator's own retry could have recreated the Job under the same name and the decision mixed two Jobs' evidence (F83b).
+- **What changed.** A verify Job that is not controller-owned by the Loop is now refused outright: it is never trusted as evidence (no decision, no attempt — the Loop stays `Verifying`), and it is never adopted or deleted; instead one `VerifyJobForeign` Warning Event is raised (re-announced every 5 minutes while the foreign Job persists) (F83b, PR #283). Each verify decision now reads the Job once, and the pod and the `JobFailed` condition come from that single snapshot (F83b, PR #283).
+- **On upgrade.** Nothing required; the fix is in the operator (PR #283).
+
+### F87a + F87b: the chart's install NOTES now teach the right approval RBAC, and `make test` guards the chart render and the NOTES content — #284
+
+- **What was wrong.** The F45 render guard (`hack/chart-check.sh`, the one-effective-`ValidatingAdmissionPolicyBinding` assertion) had no caller — `make test` ran the F29 chart guards but not this one — so a regenerated chart or a second inert binding was only caught by hand (F87a). And the chart's install NOTES still told a Helm user that `cox approve`/`reject` **PATCH** the Loop's status conditions and to bind a role called `loop-editor` with `kubectl create rolebinding … --clusterrole loop-editor`; the rendered helper role is `<fullname>-loop-editor-role`, so the printed command failed with NotFound (F87b).
+- **What changed.** `make test` (via `chart-drift-test`) now runs `hack/chart-check.sh` and the new `hack/chart-notes-check.sh`, both proved by their siblings' harness to fail on a bad chart: the render guard fails on a chart with an inert second VAP binding, and the NOTES guard fails on the pre-F87 text. The NOTES now say the two commands read the Loop and set the `PlanApproved` / `PlanRejected` conditions on the `loops/status` subresource (an `update` on `loops/status` is the minimum grant); that the chart installs **no user-facing role** by default (the operator's own role grants these to its ServiceAccount, not to the user); that the helper role is named through `coxswain.resourceName`; and they branch on `rbac.namespaced` — `--role=` in the release namespace (the helper Role lives there, so it covers Loops there only) versus `--clusterrole=` with `-n <loop-namespace>` (one namespaced RoleBinding per Loop namespace). The NOTES also name the peek-pod rules (`create`,`get`,`delete` on `pods`, `get` on `pods/log`) that the helper role does **not** grant and that must be bound separately in the Loop's namespace (F87a + F87b, PR #284, merged `058529c`). The chart README's `--clusterrole` sentence is corrected to bind with `-n <loop-namespace>`, matching what the NOTES print (PR #284).
+- **On upgrade.** Nothing required: the NOTES are printed only at `helm install`/`upgrade`, and the guards run in CI from `make test` (PR #284).
+
+### F83f: the `Events unreadable` and `VerifyJobForeign` warnings now share one quiet-window marker — #288
+
+- **What changed.** The two repeat-Warning surfaces (F48b/F48f's `Events unreadable` and F83b's `VerifyJobForeign`) were near-verbatim copies of the same gate → Event → marker-patch body, and the verify copy parsed its marker with the sandbox-named helper; they now share one quiet-window marker implementation (`internal/controller/loop_quiet_marker.go`), with no behaviour change except that a Loop deleted mid-update (the re-get after the marker patch returns NotFound) keeps its in-memory `resourceVersion` instead of having it cleared to empty (merged `653d46e` = PR #288).
+- **On upgrade.** Nothing required; this is an internal refactor of two in-operator Event gates (PR #288).
+
+### F87d: `cox approve` / `cox reject` now patch `status.conditions` instead of PUTting the whole object — #286
+
+- **What was wrong.** `cox approve` and `cox reject` wrote the whole `loops/status` object back (a whole-object PUT of every status field — `phase`, `checkpoints`, `budget`, `verify`, `agent` — for a one-condition change). It carried the live `resourceVersion`, so a racing operator write was a 409 rather than a silent revert, but the write was the shipped demonstration of the "status is user-writable" premise F47 corrected (merged `98db918` = PR #286).
+- **What changed.** Both commands now send a **JSON merge patch of `status.conditions`** (the full list the CLI just read plus its one condition — a merge patch replaces arrays wholesale) to the `loops/status` subresource, keeping the live `metadata.resourceVersion`, so a racing operator write is still a 409 (a conflict, not an overwrite) (PR #286, merged `98db918`). The chart README and the install NOTES' minimum-role line are updated to match: the write is now a `get` on `loops` plus `patch` on `loops/status` (a custom role that grants **only** `update` on `loops/status` no longer authorizes `cox approve`/`reject`; the shipped editor role already grants `get;update;patch`, so nothing changes for users bound to it) (PR #286).
+- **On upgrade.** If you bound a user to the chart's editor role or any role that grants `patch` on `loops/status`: nothing to do. If you wrote a custom role that grants **only** `update` on `loops/status` (the pre-F87 minimum the old README prescribed): add `patch`, or `cox approve`/`reject` will be `Forbidden` for that user (the kind evidence in #286 shows the pre-F87 minimum role is now denied the write). The shipped editor role and the default install are unchanged (PR #286).
+
+### F87c: a `status.checkpoints` entry now suppresses a new checkpoint only when the operator can trust it — #285
+
+- **What was wrong.** The checkpoint step decided a checkpoint was already taken from `status.checkpoints` alone — an entry at the iteration being taken, whatever its name (merged `defc770` = PR #285). `status` is user-writable, so one write to `/status` with a forged `checkpoints` entry at the current iteration made the operator believe the checkpoint was already taken: **no VolumeSnapshot was created for that iteration**, so a later lost-PVC restore or a fork had no source. This is the same defect class F47 closed for the retention GC and F83c closed for the tamper decision (a status value must not decide) — the last one documented — and the forged entry does not *fail* a Loop, it *hides* a checkpoint.
+- **What changed.** The checkpoint step now judges the `status.checkpoints` entries at the iteration being taken with F47's trust rule (the entry's name is exactly what the operator would name it for this Loop and iteration, **and** the VolumeSnapshot it names exists and carries this Loop's label) (PR #285, merged `defc770`):
+  - a **trusted** entry at this iteration still suppresses the create (idempotency kept — a re-reconcile does not create a second snapshot);
+  - a **foreign** entry (wrong name, or a snapshot that exists without this Loop's label) at this iteration is **dropped** from `status.checkpoints` and the checkpoint is created anyway, surfaced with the retention GC's own `CheckpointEntryUntrusted` Warning Event;
+  - a `Gone` entry at this iteration (the operator's name, no snapshot behind it) is dropped too, so the re-taken checkpoint **replaces** it rather than appending a second entry for one iteration;
+  - a snapshot read that fails is no decision: the entry is kept and the step requeues, rather than creating a duplicate or dropping the entry.
+  - On a cluster **without the VolumeSnapshot CRD**, no snapshot read is made at all: the trust check is gated on the CRD being present (the same gate every other snapshot read in the operator uses), so every `status.checkpoints` entry is kept unjudged and the `CheckpointsAvailable=False/VolumeSnapshotCRDMissing` condition is reported as before — the pre-fix order would have issued an ungated read there, which could have dropped a genuine entry or requeued forever (PR #285).
+  - Entries at *other* iterations are left to the retention GC, which judges every entry it runs over (F47).
+  - `docs/TROUBLESHOOTING.md`'s `CheckpointEntryUntrusted` entry now says which consumer drops the entry (the checkpoint step, for an entry at the iteration it is about to take, or the retention GC for any other entry) (PR #285).
+- **On upgrade.** Nothing required; the fix is in the operator (PR #285). If you are running a cluster without the VolumeSnapshot CRD, `status.checkpoints` entries are now kept as they are (no snapshot read, no drop) — the same `VolumeSnapshotCRDMissing` surface as before.
+
+### F50: the sample Loops now run against the seeded repos, in the `samples` namespace — #292
+
+- **What was wrong.** The three example Loops (`loop-fix-failing-test`, `loop-implement-missing-endpoint`, `loop-python-missing-function`) pointed at `coxswain.git` @ `main`, which has none of the files they test or protect, so they could not succeed as applied; the `samples-git-cred` Secret they needed is created in the `samples` namespace, so from `namespace: default` no clone could run; the gocli task 2 manifest `hack/sample-run.sh` requires was missing; and the chart shipped two dead value groups (`rbac.roleNamespaces` and `webhook.*`) that no template reads (merged `3eaf998` = PR #292).
+- **What changed.** Each sample Loop now points at the seeded in-cluster Gitea repo for the same `examples/<app>` tree (`samples/gocli.git`, `webapi`, `pylib`), `ref: initial`, `gitCredentialSecret: samples-git-cred`, and is `namespace: samples` (the namespace `make samples-up` creates and `hack/samples-seed.sh` seeds) (PR #292). `examples/gocli/tasks/2.loop.yaml` was added (modelled on `1.loop.yaml`), so `make sample-run APP=gocli TASK=2` no longer dies on the missing file; and the two dead chart value groups and their README bullet are deleted (PR #292).
+- **On upgrade.** Nothing required; the samples, the example manifests and the chart values are the only changes (PR #292).
+
+### F51 (P2-3): with no CNI prober wired the sandbox is held `Suspended` (fail-closed) — #293
+
+- **What was wrong.** The network-fence gate treated a nil `CNIProber` as "the gate does not apply", so the sandbox ran with no network evidence — while the D30 egress gate fails closed for a nil `Enforcer` (F51, merged `f07fee1` = PR #293).
+- **What changed.** The nil seam now fails closed: `NetworkEnforced=False` with reason `ProbeUnavailable` ("no CNI prober wired; sandbox held Suspended (fail-closed)") and the sandbox stays `Suspended`; `--allow-unenforced-network` still runs the Loop with the flag set (condition `False`/`EnforcementDisabled`, i.e. the fence was **not** measured) — mirroring the D30 escape hatch and the only way to run without a prober. `cmd/main.go` always wires a `PodProber`, so no shipped install changes behaviour (PR #293).
+- **On upgrade.** Nothing required for a standard install (the operator always wires a prober); if you built the operator without a `CNIProber` the sandbox is now held `Suspended` instead of running without a fence — use `--allow-unenforced-network` to run without one (PR #293).
+
+### F51 (P2-2): an unresolvable or refused CNI probe target makes the probe unavailable instead of counting as reachable — #291
+
+- **What was wrong.** The D38 CNI probe reported a target it could not resolve (DNS lookup failed) or that refused the connection as `REACHABLE` — the packet reaching a host and being rejected there is not evidence of a policy drop (F51, merged `b33cc7a` = PR #291). On an expected-BLOCKED target that reads as a fence bypass (`CNIUnenforced`); on the positive control it made an unmeasured fence look measured — the probe claimed a verdict it did not have.
+- **What changed.** Both shapes now emit the new `UNRESOLVED` verdict (the probe script's resolution-failure arm and `ConnectionRefusedError`; a timeout — the shape of a real policy drop — still emits `BLOCKED`), and any `UNRESOLVED` row maps the whole probe to `ProbeUnavailable` **before** the control/BLOCKED verdict logic runs: never `Enforced`, never `Unenforced`, with the `Detail` naming the unmeasured target (PR #291). That is a real change for a cluster that was reporting `CNIEnforced` on a refused or unresolvable target: it now reports `ProbeUnavailable` instead, and one unmeasured target pre-empts a `CNIUnenforced`/`CNIEnforced` verdict (PR #291's P3-3).
+- **On upgrade.** Nothing required; the change is in the operator (the probe script it generates) (PR #291).
+
+### F47: checkpoint status entries are validated before the GC deletes or restore uses them — #254
+
+- **What was wrong.** `status.checkpoints` is user-writable (the editor role, since B3), and the operator acted on it without trusting it: the retention GC would delete any VolumeSnapshot a status entry named, even one belonging to another Loop, and the lost-PVC restore could take a forged entry as its restore source (PR #254, review finding review-api P2-1).
+- **What changed.** `checkpointEntryTrusted` (in `loop_checkpoint.go`) is the single trust gate: a `status.checkpoints` entry may be acted on only if its name is exactly `checkpoint-<this loop>-iter-<n>` (n >= 0), `n == entry.Iteration`, and the VolumeSnapshot of that name carries this Loop's ownership label. The retention GC **never deletes** a snapshot for a Foreign (unowned or misnamed) entry — it only drops the untrusted entry from status and emits a Warning Event `CheckpointEntryUntrusted`, and only when the GC loop runs (i.e. when the keep-set does not already cover the whole list); a forged entry can stay in status but is never acted on. The lost-PVC restore walks from the newest entry and takes the last Trusted one; if entries exist but none is trusted it takes the visible `NoUsableCheckpoint` fallback (condition + Event), not a silent empty workspace. No RBAC change; the safety property is "never deleted / never restored from", not "always dropped from status" (merged `1cad554` = PR #254).
+- **Scope note.** F47 closes the *status* vector only: the fork path still derives its source snapshot from `spec.forkOf` and PATCHes a `fork-of` label onto it with no ownership check, so "an editor cannot read another Loop's checkpoint" is not a property this PR establishes; the `ensureCheckpoint` idempotency guard and the tamper gate's status inputs are also not yet hardened this way (PR #254).
+- **On upgrade.** Nothing required; the fix is in the operator (PR #254).
+
+### F83: delivered PR bodies now report the real tamper check result, and the tamper gate acts only on operator-only evidence — #258
+
+- **What was wrong.** The tamper evidence fields (`status.verify.tamperExitCode` / `verifiedCommit`) had no production writer, so the tamper gate could never fire and every delivered PR body said "no tamper evidence (fail-closed reading)" even when the tamper check passed (PR #258).
+- **What changed.** The operator now records the tamper evidence from the verify Job's own pod while the verify runs (the exit code is `nil` while the tamper init is still Waiting/Running — never "clean" by default — then its real exit code, with the pin), so the delivered PR body reports the real result (e.g. "Tamper check: clean (no protected path changed)") instead of always "no tamper evidence". Because the gate's inputs are user-writable status, the gate now acts only when the verify Job's own pod confirms the recorded exit code: the recorded `status.verify.tamperJobUID` must equal the verify Job's UID and that Job's pod's tamper init must have terminated with the recorded code — so a status write can neither fail a Loop nor pass one through the gate (a forged status-only "tampered" verdict leaves the Loop running; the PR adds no new detection) (PR #258).
+- **On upgrade.** `status.verify` gains one field, `tamperJobUID`: apply the new CRD with the new operator (it is generated and chart-synced, so a standard install picks it up); nothing else to do (PR #258).
+
+### F46: the model timeout is now wired (`spec.loop.modelTimeoutSeconds`) — #252
+
+- **What was wrong.** The runner's model timeout was documented but never set: the entrypoint left `runConfig.ModelTimeout` at its 120s default, so a slow self-hosted model had no knob to raise it (the docs said so — see the #208 and #232 docs entries above) (PR #252).
+- **What changed.** New `spec.loop.modelTimeoutSeconds` (int32, 1–3600, validated by the CRD): the operator sets `COX_MODEL_TIMEOUT=<n>s` on the agent container (only when a model endpoint exists and the field is set), and the runner entrypoint parses it (Go duration or bare seconds; absent/invalid/<=0 keeps 120s). The Sandbox container list is rewritten on every reconcile, so editing the field on a live Loop changes the timeout without a restart. The worst-case figure in the runner's comment is corrected: 4 attempts + 2+4+8s backoff = 4 × timeout + 14s (merged `96d04e6` = PR #252).
+- **On upgrade.** Nothing required; the fix is in the operator. To use the knob, set `spec.loop.modelTimeoutSeconds` on the Loop (CRD field; also in the regenerated chart CRD) — e.g. `modelTimeoutSeconds: 300` raises the per-request model timeout from 120s to 300s (PR #252).
+
+### F45: the chart no longer renders a second (inert) VAP binding — #249
+
+- **What was wrong.** Helm installs from v0.1.0–v0.1.2 rendered **two**
+  `ValidatingAdmissionPolicyBinding` objects for the one ephemeral-container
+  `ValidatingAdmissionPolicy`: the literal
+  `coxswain-deny-ephemeral-containers` (correct), plus a templated one named
+  after the release's fullname, whose `policyName` named the templated name
+  and therefore no existing VAP — the second was **inert** (it bound nothing;
+  the gate still worked). At the default release name `coxswain` the two
+  templates collide on one object, so it was invisible there; at any other
+  release name the stale inert binding was left behind (merged `63679f1` =
+  PR #249).
+- **What changed.** The templated second binding is removed from the chart, so
+  a render produces exactly one effective VAP binding; the guard in
+  `hack/chart-check.sh` now renders a second time at a non-default release
+  name/namespace and fails if a binding names a policy that is not a VAP in
+  that render, or if the render is not exactly one VAP binding
+  (merged `63679f1` = PR #249).
+- **On upgrade.** At the default release name `coxswain`: nothing to do. At
+  any other release name: check for and delete the stale binding per the
+  `docs/UPGRADE.md` "The chart no longer renders a second VAP binding" entry
+  (it is inert, so deleting it cannot weaken the ephemeral-container gate)
+  (PR #249).
+
+### F44: unmetered requests and stale usage readings are surfaced — #248
+
+- **What was wrong.** Two of the budget's inputs could silently stop
+  working: (a) a model request the proxy forwarded without a parseable
+  usage object was simply not counted, so the token and cost caps ran on
+  partial data with no signal; and (b) a usage read that failed (a proxy
+  pod mid-restart, a scrape error) was silently ignored — the caps kept
+  evaluating the last good reading and nothing recorded how stale it was
+  (merged `0f6915a` = PR #248).
+- **What changed.** The proxy now counts requests it forwarded without a
+  usage object and reports them per read; the operator surfaces both cases
+  with conditions and transition-gated Warning Events, and new status
+  fields make the staleness inspectable: `MeteringDegraded` (reason
+  `UnmeteredRequests`) goes True while a read reports new unmetered
+  requests and carries the running total, and the new
+  `status.budget.unmeteredRequests` accumulates it; `BudgetReadingStale`
+  (reason `UsageReadFailed`) goes True after 3 consecutive failed usage
+  reads and the new `status.budget.lastUsageReadAt` /
+  `status.budget.consecutiveReadFailures` fields record the last good
+  read and the failure run. Both are cleared when the next good read
+  arrives, and both carry one Warning Event per episode, not per
+  reconcile. Surfacing only: on a stale read the caps stay on the last
+  good reading (fail-open) — whether to hold the Loop instead is the open
+  owner decision (merged `0f6915a` = PR #248). A new metric,
+  `coxswain_unmetered_requests_total`, records the operator-side total.
+- **On upgrade.** Nothing required; the fix is in the operator (PR #248).
+
+### F33: memory-writer audit now hashes the trimmed lesson, counts batch duplicates correctly, and creates the deny-all NetworkPolicy before the Job — #234
+
+- **What was wrong.** Three small defects in the memory-writer Job: the audit record's hash was over the raw lesson text, but the file was named by the trimmed text, so a lesson with leading or trailing whitespace had a hash that did not match its name (P3-1); two identical lessons in one batch produced per-lesson lines whose count did not agree with the batch total (P3-2); and the deny-all NetworkPolicy for the Job pod was created after the Job, so the pod's first seconds ran without the fence (P3-6) (PR #234).
+- **What changed.** The audit hash is now over the trimmed text; duplicate lessons are counted once per occurrence in the summary; the NetworkPolicy is created before the Job (merged `069a655` = PR #234).
+- **On upgrade.** Nothing required; the fix is in the operator (PR #234).
+
+### F43: the verify Job refuses a pinned commit that does not descend from the base — #244
+
+- **What was wrong.** The commit the system verifies and delivers was
+  agent-chosen, with no check that it descends from the base commit (the
+  finding's P1-1, downgraded to P2 by the reviewer before the fix): the pin
+  was shape-checked only (a 40-hex SHA), so a runner (or a corrupted
+  `result.json`) could pin any commit reachable in the agent's repo,
+  including pre-existing history that predates the Loop — and the tamper
+  diff, which is tree-to-tree, cannot catch it (an unchanged pre-existing
+  tree reads as clean) (merged `80dac60` = PR #244).
+- **What changed.** The verify Job's `import-agent` init now runs
+  `git merge-base --is-ancestor <baseCommit> <pin>` before the checkout:
+  exit 1 ("not an ancestor") exits with a distinct code that the operator
+  maps to a terminal `Failed` reason `PinNotDescendant` (a Warning Event
+  naming both commits, a completion metric, no retry — a re-run would
+  import the same pin); any other git failure stays an infra failure
+  (`VerifyInfraFailed`, retried). A pin equal to the base is allowed ("the
+  agent changed nothing") and the checks then decide. In the runner,
+  `priorCompletedResult` re-emits a stored Implementing success only if its
+  `headCommit` is a commit in the workspace repo — a defence in depth; the
+  PR states the trusted gate is the verify Job's ancestry check (a
+  per-container-run stamp was shown to be forgeable: the agent shell runs
+  as the same user in the same container) (merged `80dac60` = PR #244).
+  Also in #244: a blocked Planning no longer truncates `PLAN.md` (the phase
+  hook runs only when the model call produced an answer), stale comments
+  that claimed a `summary` field / `result.json` reader were corrected (no
+  behaviour change), and `commitWorkspace` now returns a reason on each git
+  failure instead of an empty string. Lab run: the new import-agent script
+  ran in a real verify pod (pass path; the pin equaled the base), and the
+  refusal path is covered by the spec that executes the real generated
+  script (PR #244).
+- **On upgrade.** Nothing required; the fix is in the operator (PR #244).
+
+### F78: the memory-writer audit keeps its counts line, and the 1000-byte cut is line-oriented — #243
+
+- **What was wrong.** The audit text cut at 1000 bytes on a byte/rune
+  boundary, and the counts line was last, so a long write lost
+  `summary: total=...` (the line `cox describe` and the verdicts metric
+  parse) to a mid-line fragment; the `ensureMemoryWriterJobAndNetPolicy`
+  doc and the netpol-before-Job comment described the writer's egress fence
+  oppositely ("deny-all" / "no network calls" instead of the actual proxy +
+  DNS allowlist); and four spec names no longer described what they assert
+  (merged `bd4c457` = PR #243).
+- **What changed.** `summaryLines` emits the counts line first, then the
+  audit lines, then the per-lesson lines; `memoryWriteAuditText` is
+  line-oriented — whole lines up to 1000 bytes, then ` … N more lines`,
+  never a mid-line fragment; `memoryWriteVerdicts` reads the counts line by
+  content, so the metric is unchanged; the fence comments now say proxy +
+  DNS egress only; the misnamed specs were renamed (merged `bd4c457` = PR
+  #243).
+- **On upgrade.** Nothing required; the fix is in the operator (PR #243).
+
+### F34: a stale lessons.json no longer survives into a later iteration, and the restore hold covers StoppingWorkloads — #238
+
+- **What was wrong.** A `lessons.json` left in the workspace from a previous iteration survived into the next one, so a check that found no lessons to propose still saw the old file (P3-3); and the restore hold checked only two of the three workload-stopping conditions the memory-writer Job documents, so a Loop could start a memory write while a restore was in progress (P3-4) (PR #238).
+- **What changed.** The stale `lessons.json` is removed when nothing is proposed; the restore hold now also covers `StoppingWorkloads` (merged `5e82c96` = PR #238).
+- **On upgrade.** Nothing required; the fix is in the operator (PR #238).
+
+### F31: a no-pod memory-writer Job is decided from its own conditions — #229
+
+- **What was wrong.** `recordMemoryWriterOutcome` requeued whenever the
+  Job had no pod, before reading the Job's own conditions. A Job that is
+  Failed or Complete with no pod (pod GC, eviction, admission reject)
+  requeued every 5 s forever, never set `MemoryWriteDone`, and `cox memory
+  delete` refused forever (PR #229).
+- **What changed.** With no pod, the outcome is now decided from the Job's
+  conditions: Failed sets `MemoryWriteFailed` naming the Job's reason
+  (Warning Event, failed metric once); Complete sets `MemoryWritten` with
+  no summary; neither means still in progress (requeue) (merged `aedc33d`
+  = PR #229). This closes the no-pod half of the F31 item (see Known
+  issues: the F73 entry (#336) covers a Job that failed while its pod is
+  still stuck).
+- **On upgrade.** Nothing required; the fix is in the operator (PR #229).
+
+### F54: the "evil agent" end-to-end test now exists — #222
+
+A test addition, not a product change: the agent must be stopped from
+reading its service-account token, reaching the API server or model proxy
+directly, reaching the cloud metadata address, pushing code with a
+forged credential, and tampering with the verify step (merged `eb6ce98`
+= PR #222). It runs two Loop variants (the real runner with a hostile
+model stand-in, and the F42 no-endpoint shape) plus a tamper Loop, with
+gate conditions and Events added on 2026-10-24. Verified on kind (Calico
++ KubeArmor): the pre-fix build FAILED (variant b escaped seven probes
+and the tamper Loop), the fixed build `evil-agent-e2e: OK`, and the
+five named mutations (M1–M5) each failed the run (PR #222). Steps the
+e2e could not yet prove (probe 6's direct leg — kind has no metadata
+service — and a few assertions) are queued as F72 (see Known issues).
+No operator or image changed, so no upgrade action (PR #222).
+
+### F30: memory-write metrics — #206
+
+New Prometheus metrics, registered in the operator and documented with PromQL
+in `docs/OPERATOR.md` on `main` (merged `dcd79da` = PR #206):
+
+- `coxswain_memory_writes_total{outcome=written|failed}`: one per Loop, on
+  the transition that sets `MemoryWriteDone`; a re-reconcile does not bump.
+  Counted only after the status update persists, so a conflicting
+  status-update no longer double-counts (the kind run found and fixed this;
+  PR #206).
+- `coxswain_memory_lessons_total{verdict=kept|static-drop|curator-drop}`:
+  with a `written` outcome only. `kept` and the drop totals come from the
+  summary counts line; per-lesson lines only split the drops
+  (`curator: ...` / `curator unavailable` are curator-drop; the rest are
+  static-drop).
+- Per-cluster kind results: on kind-ref the curator call worked and `kept`
+  was observed; on k3d-hermes-sim (k3s) the curator call failed for every
+  lesson (`curator unavailable (call failed)`, cause unknown — open
+  investigation), so there `curator-drop` dominated and
+  `kept`/`static-drop` were not observed. All four outcomes are covered by
+  the envtest specs (merged `dcd79da` = PR #206).
+
+### Docs — #208, #209, #224, #225, #227, #228, #230, #231, #232, #236, #237, #239, #240, #247, #250, #251, #253
+
+- #208 (merged `2a3208f`): user docs — corrected a non-existent failure name
+  in `docs/QUICKSTART.md` (the deliver credential is only read when
+  `spec.workspace.gitCredentialSecret` is set), the `cox logs` flag form
+  (`--component`, not a positional), the model-timeout worst case (4 calls of
+  120s plus 14s of backoff, about 8 minutes), that `ModelTimeout` is not
+  configurable as shipped, a non-existent `make kind-load` target, the
+  metrics port (default disabled; manifests bind `:8443` HTTPS), a
+  non-existent `--namespace` flag, and the finalizer name
+  (`coxswain.wattu.com/checkpoints`). Stale line-number citations in
+  `docs/UPGRADE.md` were replaced with function names. Two code gaps were
+  flagged instead of hidden: `ModelTimeout` is documented but never wired,
+  and the retry worst-case comment disagrees with the code (PR #208).
+- #209 (merged `9178e51`): samples, examples, chart docs — the `git-cred`
+  "prerequisite" in `config/samples/loop-fix-failing-test.yaml` is only
+  relevant when delivery is enabled and a secret is named; the verify image
+  `golang:1.26` lacks the `python3` the smoke script uses (now named in a
+  comment); the gocli/pylib/webapi example snippets now use the real seeded
+  values (`samples/<app>.git`, `samples-git-cred`) instead of the
+  non-existent `gitea-clone`; the chart README documents the other
+  user-facing value groups, and `rbac.roleNamespaces` and
+  `webhook.enabled`/`webhook.port` are documented as dead (read by no
+  template). No field value, template, or code changed (PR #209).
+- #224 (merged `f3929d8`): a new `docs/TROUBLESHOOTING.md` section covering
+  the gate conditions and Events added with this batch of fixes.
+- #225 (merged `2f95627`): a new `docs/OPERATOR.md` section on what the
+  sandbox can and cannot reach.
+- #227 (merged `17a5587`): readability pass on `docs/TROUBLESHOOTING.md`
+  and `docs/OPERATOR.md` — mostly rewording for a first-time reader. Two
+  substantive changes: TROUBLESHOOTING now says A1–A6 are the alpha
+  plan's work items (A6 the acceptance run), and the "Loops stuck in
+  Implementing" PromQL example was removed from OPERATOR because its
+  `timestamp()` wrap returns the scrape time, not the pod age (PR #227).
+- #228 (merged `a32bfc5`): a new `docs/GLOSSARY.md` — a plain-language
+  glossary of the terms an operator meets in the docs, each entry linked
+  to the section that defines it (PR #228).
+- #230 (merged `a0f7fd6`): readability pass on `docs/QUICKSTART.md`
+  prose for a first-time reader; touches no commands or code blocks.
+  The command defects in §9 it found are queued separately as F71 (see
+  Known issues) (PR #230).
+- #231 (merged `5454541`): a new `docs/OPERATOR-FAQ.md` — plain-language
+  answers to the questions an operator asks first (PR #231).
+- #232 (merged `8533a89`): a new `docs/EGRESS-LOG.md` explaining how to read
+  the egress proxy's audit log, and a correction to the model-timeout
+  worst-case figure in `docs/OPERATOR.md` (PR #232).
+- #236 (merged `a6d73c5`): a new `docs/INDEX.md` — a table of contents for
+  the docs, each entry linked to the section (PR #236).
+- #237 (merged `f9569dc`): a new `docs/UPGRADE.md` section covering the
+  changes in this release since v0.1.2 (PR #237).
+- #239 (merged `acb40b0`): a new `docs/EVIL-AGENT-E2E.md` — how to run the
+  evil-agent e2e, what it proves, and what is still UNPROVEN (F72) (PR
+  #239).
+- #240 (merged `b850406`): a new `docs/MEMORY-WRITE.md` — how to read the
+  memory-write outcome (the `MemoryWritten` / `MemoryWriteFailed` conditions
+  and the curator verdicts) (PR #240).
+- #242 (merged `23124e7`): cross-doc consistency fixes — the operator FAQ's
+  `cox logs` flag form and the hold list (now including
+  `NetworkEnforced=False`), the glossary's real `cox` subcommand list (from
+  `internal/cli/cli.go`: no `get`/`apply`; adds `diff`/`memory`) plus the
+  100-lesson cap and the reader caps, a runnable `cox memory export` line in
+  QUICKSTART, "sidecar" reworded to the separate proxy pods in
+  TROUBLESHOOTING, and UPGRADE: the F55 entry's condition worded precisely,
+  a code line number dropped, the cap wording narrowed, and a
+  `MemoryPVCUnbound` entry (that Event isn't in v0.1.2). Docs only (PR #242).
+- #245 (merged `4d7b5d2`): docs plus two comment-only code changes —
+  TROUBLESHOOTING names the `MemoryWriteFailed` Warning Event's reason and
+  says the audit text is now cut on whole lines with "… N more lines" (F78,
+  #243), GLOSSARY's "Stall gate" excludes verify infrastructure failures,
+  EVIL-AGENT-E2E's probe count now matches the harness `expect` lists, and
+  two stale comments that said lessons are written to
+  `/memory/lesson-<n>.txt` were corrected to `<sha256>.txt`
+  (`cmd/memory-writer/main.go`, `internal/controller/loop_memory_writer_job.go`).
+  Comments only; no behaviour change (PR #245).
+
+### F41: the curator call is retried on a transport failure — #241
+
+- **What was wrong.** On the k3d-hermes-sim lab cluster the memory writer's
+  curator call failed for every lesson ("curator unavailable (call failed)")
+  while the same writer worked on kind-ref. The mechanism was never shown
+  (the failure is a start-up transport error that clears by itself,
+  bracketed at (0s, 10s] — a writer started immediately against the same
+  proxy fails, one delayed 10s succeeds), so the fix makes the writer
+  resilient to a transient transport failure instead of failing closed on
+  the first one (merged `4b71ff4` = PR #241).
+- **What changed.** `pkg/curator` retries a transport failure (no HTTP
+  response) up to 3 times on a 1s/2s/4s backoff (7s for one lesson); the
+  retry wait is bounded per batch — one Client (one writer batch, up to 20
+  lessons) shares a 20s retry budget, so a down proxy costs at most 20s
+  instead of 20 × 7s, and once spent a failed call is dropped at once
+  ("call failed", fail-closed). An HTTP status or a bad body is never
+  retried; each retry logs `retry n/N in <delay>: <err>` to the Job log
+  (merged `4b71ff4` = PR #241). One post-fix lab run: `written=2 dropped=1`
+  on the cluster that previously failed every call (PR #241).
+- **On upgrade.** Nothing required; the fix is in the operator (the curator
+  client ships in the operator image, which is the default memory-writer
+  image; set `--memory-writer-image` to the new image if your install is not
+  `config/default`) (PR #241).
+
+## Known issues still open
+
+The eight P1 fixes above (F37, F39, F40, F42, F38, F35, F36, F55) are all
+merged, and F31 (no-pod memory-writer Job, #229), F54 (the evil-agent e2e,
+#222), F32 (D71 memory lesson cap, #233), F33 (memory-writer audit, #234),
+F34 (stale lessons.json, #238), F78 (memory-writer audit counts line, #243),
+F41 (the unknown curator failure, #241), F43 (the agent-chosen pin, #244),
+F44 (surfacing unmetered requests and stale usage reads, #248), F47
+(untrusted checkpoint status entries, #254), F84 (the `BudgetReadingStale`
+false alarm while the proxy pod is starting, #259), F84b (the
+`ModelProxyNotReady` condition sticking at a terminal phase, and a failed
+proxy read reported as a missing pod, #265), F85 (the `cox describe` budget
+block reading a non-existent field, #260), F88 (the wall-clock line missing from the budget block, and the bare Budget/Delivery headings, #268), F48d and F48c (the
+`SandboxNotStarting` condition not saved at Verifying, and not cleared when
+the pod is gone, #262), F46 (the unwired model timeout, #252), F83 (the
+unrecorded tamper evidence, #258), F83c (the status-driven tamper gate
+that could never fire, and an OOM-killed tamper check reading as a terminal
+tampered failure, #264), F83d (the tamper record outliving the run it
+belonged to, and a verify-infrastructure failure message without the kubelet's
+reason, #274), F48b (the sandbox pod stuck on an unmountable
+volume, and the infra-retry bound that never tripped, #266), and F48g (the
+sandbox-failure count that outlived the run it belonged to, #269), and F89
+(a sandbox failure with no kubelet reason that wedged the whole status
+write and the retry limit, #271) were
+closed by the PRs named beside them. In plain words, the items still open:
+
+**P1 (security):**
+
+- **F60**: the verify canary shipped in #366 — it detects in-process subversion of a tested Go package (exit 43 → the terminal `SubvertedVerify`). Four limits were observed by the reviewer running the exact canary script outside the cluster; they are now **fixed by #371**: a Go repo whose tests sit in a nested package (no `go.mod` at the repo root) is now reported correctly (the whole tree is copied, so the nested package's `go.mod` comes along); a subverted package can no longer hide behind an honest one (the per-package verdict catches ANY subverted package); an agent-controlled probe that makes `go test` print `testing: warning: no tests to run` no longer turns a would-be 43 into a 44 (the token-based decision ignores the string); a build-error string no longer turns a would-be 43 into a 45 (the go toolchain's own `-json` `Action:"build-fail"` event is the only 45 trigger). The non-Go repo limit (`preset: none` → 44 → wedge in `Verifying`) is fixed by #370: the canary is skipped for `preset: none` and the skip is surfaced with `CanarySkipped=True` / `CanaryNotApplicable` (I90).
+
+**P2:**
+
+- **F47 follow-ups** (F47 itself closed by #254): the fork path still
+  derives its source snapshot from `spec.forkOf` with no ownership check,
+  and the `ensureCheckpoint` idempotency guard and the tamper gate's
+  status inputs are not yet hardened this way (PR #254's scope note).
+- **F48**: a sandbox pod that cannot start wedges the Loop with no condition
+  or timeout.
+- **F49**: the "hold the sandbox while awaiting approval" rule and a
+  no-pin delivery branch have no automated tests.
+- **F51**: the network-fence check reads an unresolvable address as
+  "reached"; a missing checker leaves the gate open.
+- **F72**: some of the evil-agent e2e's steps are still UNPROVEN (the
+  verify-checkout assertions, the probe 15 control Loop, exec-path
+  equivalence; probe 6's direct leg is unproven because kind has no
+  metadata service) (PR #222).
+
+**P3 (and P3 bundle):**
+
+- **F74-F77**: four restore/fork edge cases left after F35 and F36 — an
+  empty-PVC fallback that leaves `baseCommit` set (F74, waits on owner
+  D84), a pre-F35 `Restored` marker with no target key that counts as
+  complete for any target (F75), a failed fork-retention label SET that is
+  not retried although the doc says it is (F76), and a rollback whose
+  post-state is undefined (F77) (PR #238's run).
+
+- **F50/F52**: small and low items — shipped samples pointing at repo
+  contents they test, a checkpoint-recovery edge case, and a bundle of misc
+  items (a failed delivery counted "in flight" forever, the CLI approval
+  command writing status with no conflict retry, and more). (F45 closed by
+  #249; F46 closed by #252.)
+- **F59**: a code comment claims a "suspicious pattern scan" exists; it
+  doesn't.
+- **F61**: sample agent-policy files are not shipped.
+- **F86**: F47 follow-ups — `ensureCheckpoint`'s idempotency guard
+  (`cp.Iteration == iteration`) and the tamper gate's status inputs are not
+  yet validated like `checkpointEntryTrusted` (PR #254's scope note).
+- **F93**: a Loop whose sandbox pod can never be scheduled stays
+  `SandboxNotStarting` forever and never reaches `Failed` (F93a; the
+  unmountable-volume bound of F48b does not trip for an unschedulable pod —
+  the cause is unknown, the evidence shows a 20h+ wedge with no decision).
+  **Fixed by F93a (#387)**: any unschedulable Loop pod (sandbox, model,
+  egress, or tool proxy) is surfaced with the `PodUnschedulable` condition
+  and the Loop fails with `reason=PodUnschedulable` after 10 minutes.
+  With C2's `--loop-node-selector` set and no matching node, the model and
+  egress proxy pods are the first to go Pending: the Loop holds at
+  `Planning` with `ModelProxyNotReady=True`, no sandbox pod is created, and
+  the Loop fails after 10 minutes with `reason=PodUnschedulable` (the F93a
+  bound; docs/TROUBLESHOOTING.md, "PodUnschedulable=True"). Separately, the
+  Sandbox template's BPF node affinity was not
+  reconciled when the operator's `--allow-unenforced` flag changed, so a
+  recreated pod kept the stale affinity (F93b; **fixed by C2** — #381
+  (`6e7b992`)).
+- **F94**: a Go repo with no `*_test.go` makes the verify canary exit 44
+  (`VerifyCanaryUnavailable`), which means "no decision" — and with no bound,
+  timeout or terminal path, the Loop holds in `Verifying` forever. A fix
+  needs an owner decision on the base commit: had the base tests (agent
+  deleted them → terminal) or not (skip the canary, decide on the
+  acceptance checks, as #370 does), plus a bound so no state holds
+  `Verifying` forever. (Owner decision 2026-11-01: (a)+(b)+(c) accepted.)
+  **Fixed by #383** (`8c85890`): see "F94: a repo with no tests no longer
+  wedges `Verifying`" under Other changes.
+
+- **D85 / editor role**: a user bound to the Loop editor role can write
+  the Loop's status subresource (the role grants `update` and `patch` on
+  `loops/status`, since #148, so that `cox approve` and `cox reject` work;
+  see `config/rbac/loop_editor_role.yaml` on `main`). That means such a
+  user can change status fields the operator acts on — the verify and
+  tamper evidence, the budget counters, the stall history, and checkpoint
+  entries. F47 (#254) makes the operator validate the checkpoint
+  entries it acts on, but the grant itself is still broader than ADR-0005
+  allows. **Fixed by #377** (owner decision D85, option (b)): `cox
+  approve`/`reject` no longer writes the status subresource — it patches
+  the Loop's metadata with a one-shot annotation (`coxswain.io/approve` /
+  `coxswain.io/reject`) that the operator turns into the condition and
+  clears, and the editor role's `loops/status` grant is back to `get`
+  only. A stale approval (a re-plan after the CLI's read) is caught by the
+  I93 plan-hash check at Implementing start. The `loop_admin_role.yaml`
+  admin role is unchanged (the trusted role). Until this release lands,
+  bind the editor role only to users you would trust with the Loop's
+  verdicts.
+- **F86**: a fork from another Loop's checkpoint named in the spec is not
+  ownership-checked.
+- **F87(c)**: a forged `status.checkpoints` entry at the current iteration
+  can stop the real checkpoint being taken.
+
+**Waiting on owner decisions (not builder tasks):**
+
+- ~~a precondition before the operator mounts a named Secret and presents it
+  to a host the same author names (confused deputy)~~ — SHIPPED as D76/D102
+  (Secret opt-in, above): the RoleBinding + `coxswain.io/usable` label, both
+  admin-only (the builder cannot create them), and a metadata-only check that
+  holds the Loop while unmet.
+- whether a stale usage reading should hold the Loop at its cost cap (F44);
+- whether to enable the operator NetworkPolicy by default (F45 P3-1);
+- narrowing editor write access to the two approval conditions only (F47
+  option (a); #254 implemented option (b), validate before acting — the
+  editor role is unchanged);
+- whether to reject or document as unsupported the `spec.workspace.repo`
+  ssh/scp forms the delivery path can never serve.
+
+No P1 fix outstanding from the merged batch remains open; the F60 verify
+canary shipped in #366 closes the "no canary at all" gap, and the four
+limits of that canary listed under the F60 P1 bullet above are now
+fixed by #371 (per-package verdict on the token, whole-tree copy,
+cap of 50 packages, per-package run from the nearest `go.mod` ancestor).
+One limit remains open there: a probe that reads the generated canary
+file and prints its token reads as OK (the token is in plain text in the
+agent's package dir; a real fix needs a channel the agent's code cannot
+read).
+
+### Docs — the six additions after #240
+
+- #247 (merged `3eed62c`): a new `TROUBLESHOOTING.md` section for
+  `PinNotDescendant` (F43, #244) — what you see (the terminal Failed
+  reason, the Warning Event naming both commits, the import-agent init
+  container exiting 97), why the verify Job refuses the pin (the runner's
+  `headCommit` claim is not operator evidence; the ancestry check runs
+  `git merge-base --is-ancestor` before any checkout), what to do (compare
+  `status.baseCommit` and `status.currentVerify.verifiedCommit`, then
+  restart the Loop or roll back to a pre-divergence checkpoint — it is
+  terminal, no retry), and how it differs from its neighbours
+  (`TamperedVerify`, `VerifyInfraFailed`, `Stalled`) (PR #247).
+- #250 (merged `5fbc837`): a new `TROUBLESHOOTING.md` entry for F44 — what
+  the `MeteringDegraded` and `BudgetReadingStale` conditions and their
+  Warning Events (`UnmeteredRequests` / `UsageReadFailed`) mean, what to
+  check (the `status.budget` fields, the model proxy pod's port 9090,
+  whether `unmeteredRequests` is still growing), and why the caps stay on
+  the last good reading (fail-open; D77 hold-vs-surface is still open)
+  (PR #250).
+- #251 (merged `ced2e2a`): the operator FAQ gains the question "Why did my
+  Loop fail with PinNotDescendant?" (as question 8, with the later
+  questions renumbered) and the glossary gains a `PinNotDescendant` entry;
+  both link to the #247 TROUBLESHOOTING section (PR #251).
+- #253 (merged `de44eac`): the `docs/UPGRADE.md` entry for the F45 stale VAP
+  binding — what the stale binding is, why the default release name is
+  unaffected, and the check-and-delete steps for any other release name
+  (PR #253).
+- #255: a new `TROUBLESHOOTING.md` entry for the F47 Warning Event
+  `CheckpointEntryUntrusted` (#254, merged `1cad554`) — what makes a
+  `status.checkpoints` entry trusted (the exact name shape, a matching
+  iteration, and this Loop's ownership label), that an untrusted entry is
+  never deleted and never restored from, and how the restore falls back
+  visibly. (Merged after the notes' "as of" line; included here so the docs
+  list is not left short one entry.)
+- #257 (merged `61d12f1`): two `docs/UPGRADE.md` pointers in the "two new
+  manager flags" entry — the chart's own `--memory-writer-image` emission
+  (derived from `manager.image`, before `manager.args`; last occurrence
+  wins, so set `manager.image` instead of duplicating the flag in
+  `manager.args`) and `hack/rwx-storage.sh` as the path for clusters whose
+  default StorageClass is RWO-only (it installs a dynamic ReadWriteMany
+  class with `bindingMode: Immediate`) (PR #257).
+- #256: a `docs/UPGRADE.md` note for F48's stricter Secret-name validation
+  (`spec.agent.gitCredentialSecret`, `spec.agent.endpointSecretRef`;
+  merged `4451ade`) (PR #256).

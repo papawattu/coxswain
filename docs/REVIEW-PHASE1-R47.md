@@ -128,9 +128,10 @@ Ticked in `docs/REVIEW-PHASE1-R46.md` by this commit:
   **Fix:** the homelab side (the homelab Claude's H slices) finds out why a pod on pi3 cannot
   reach pi12's host ports even with no policy. D104 (below) is decided as (a), so pi12's rows stay UNRESOLVED until that is explained.
 
-  **Acceptance:** either a homelab `verify-cni` verdict of PASS, or of a named UNPROVEN whose only
-  unmeasurable rows are of a type D104 excludes. And the first deployed-operator run on k3s records
-  its `NetworkEnforced` condition with the command and output.
+  **Acceptance:** the cause of pi12's baseline failure is recorded, and a homelab `verify-cni`
+  verdict of PASS follows. Under D104 (a), no row type is excluded, so pi12 must be fixed or
+  explained first. The first deployed-operator run on k3s records its `NetworkEnforced` condition
+  with the command and output.
 
 - [ ] **I214: the D103 builder sessions repeated the R45/R46 slip classes in every slice; the reviewer's mutations caught each one before merge**
 

@@ -546,11 +546,15 @@ field is the most useful diagnostic:
   enforce NetworkPolicy. Either install an enforcing CNI (Calico) or use the
   `--allow-unenforced-network` escape hatch (dev only).
 - `ProbeUnavailable` → the network probe ran but could not measure the fence
-  (a target was refused by both the probe pod and the no-policy control pod,
-  could not be resolved, or the positive control was not REACHABLE in both
-  passes). The condition's message names the target that was not measurable.
-  Re-run the standalone check to see the per-target table: run `make
-  verify-cni`.
+  because a row came out **UNRESOLVED** (a target could not be resolved, or it
+  was refused while the no-policy control pod was BLOCKED or UNRESOLVED for it),
+  or the DNS positive control was not REACHABLE in both passes, or no
+  host-network target was measured BLOCKED, or a pass could not run (timed
+  out, went not-Ready, or exited non-zero). A target refused by **both** the
+  probe pod and the control pod combines to NOT_LISTENING — that is shown, not
+  counted, and is not a `ProbeUnavailable` by itself. The condition's message
+  names what was not measurable. Re-run the standalone check to see the
+  per-target table: run `make verify-cni`.
 - `PolicyEnforced=False` → the KubeArmor policy gate is not enforced. Check
   that KubeArmor is installed and the BPF-LSM hooks are active.
 
@@ -791,12 +795,12 @@ The verdict (`decide`):
   **BLOCKED** and at least one node port (node :6443 or :10250) measured
   **BLOCKED** — a service route AND a host-network route fenced. Rows that
   combined to **NOT_LISTENING** are shown in the detail but **not counted**:
-  with a policy drop (nothing may listen there) the control pass is what
-  separates a rejection from a dead port, which is exactly why the second,
-  no-policy pod exists — some policy controllers (k3s's embedded one
-  included) **REJECT** (RST) rather than **drop**, and a REJECT on a
-  no-policy target is indistinguishable from a REJECT caused by the policy
-  without the baseline.
+  some policy controllers refuse a policy-denied connection instead of
+  silently dropping it — the homelab k3s run of 2026-11-04 observed every
+  target refused, including 1.1.1.1:443, which is consistent with such a
+  controller, though the RST cause was not verified — and a no-policy baseline
+  is what separates a policy-induced refusal from a port nothing listens on.
+  That is exactly why the second, no-policy pod exists.
 - **`CNIUnenforced`** if any expected-BLOCKED target combined REACHABLE.
 - **`ProbeUnavailable`** if any row is UNRESOLVED (the detail names the
   target), the DNS positive control was not REACHABLE in both passes, or no

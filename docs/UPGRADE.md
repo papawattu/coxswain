@@ -460,10 +460,11 @@ the probe timeout, which now **defaults to 120s** (it was 60s).
 safe floor): the two passes now share the one timeout, so the old value halves
 each pass's time and a slow node can tip the probe into `ProbeUnavailable`.
 
-No config change is otherwise needed; both probe pods are operator-managed and
-cleaned up at the start of the next probe. One behavioural note: a cluster
+No config change is otherwise needed; both probe pods are operator-managed —
+each pass's pod is deleted right after that pass, and any leftover is removed
+by the cleanup at the start of the next probe. One behavioural note: a cluster
 that previously reported `ProbeUnavailable` because every target was refused
-(a REJECT-style policy controller, e.g. k3s's embedded one) may now report
+(a refusing policy controller, e.g. k3s's embedded one) may now report
 `CNIEnforced` — the control pass is what makes a REJECT-style controller
 measurable, not a behaviour change in the CNI.
 

@@ -7102,7 +7102,7 @@ func (r *LoopReconciler) validateAgentPolicies(ctx context.Context, loop *coxv1a
 		for _, e := range spec.Exec {
 			if isNonCanonicalPath(e) {
 				return policyValidationResult{valid: false, reason: "NonCanonicalExecPath",
-					message: fmt.Sprintf("%s %s: exec entry %q is non-canonical (no ., .., //, or trailing /)", res.kinds[i], name, e)}
+					message: nonCanonicalExecMessage(res.kinds[i], name, e)}
 			}
 		}
 		unionExec = append(unionExec, spec.Exec...)
@@ -7180,6 +7180,17 @@ func isNonCanonicalPath(p string) bool {
 		return true
 	}
 	return false
+}
+
+// nonCanonicalExecMessage is the NonCanonicalExecPath PolicyValid gate's
+// message. It names the RESOLVED kind (an agentPolicy ref that has no
+// namespaced AgentPolicy resolves to a ClusterAgentPolicy — the message must
+// say which one; see P6a follow-ups, reviewer's finding K) and is a pure
+// helper so the kind-naming is unit-testable without an API server (the
+// CRD's CEL XValidation blocks seeding a non-canonical exec through the API
+// in every write form, so no envtest spec can drive this gate end-to-end).
+func nonCanonicalExecMessage(kind, name, path string) string {
+	return fmt.Sprintf("%s %s: exec entry %q is non-canonical (no ., .., //, or trailing /)", kind, name, path)
 }
 
 // ensureVerifyJobIfActive is the ensureVerifyJob call gated on phase !=

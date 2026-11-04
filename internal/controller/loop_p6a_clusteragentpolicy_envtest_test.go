@@ -44,6 +44,7 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"strings"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -74,9 +75,11 @@ const (
 	// namespaced and the cluster policy (the union's dedup is asserted on
 	// the rendered per-Loop KubeArmorPolicy).
 	p6aSharedExec = "/usr/bin/diff"
-	// p6aClusterNonCanonical is the non-canonical exec path spec 5's
-	// ClusterAgentPolicy carries (a ".." segment: the NonCanonicalExecPath
-	// gate must reject it and NAME the resolved kind in the message).
+	// p6aClusterNonCanonical is the non-canonical exec path (a ".." segment)
+	// the NonCanonicalExecPath gate's MESSAGE unit test asserts on
+	// (TestNonCanonicalExecMessageNamesKind, loop_noncanonical_exec_test.go —
+	// the CRD's CEL XValidation blocks seeding it through the API, so the
+	// gate's message is covered at unit level, not spec level).
 	p6aClusterNonCanonical = "/usr/bin/../bin/sh"
 	// p6aKindPolicyName is spec 5's cluster-only policy name (no namespaced
 	// AgentPolicy with this name exists, so the ref resolves to the
@@ -375,7 +378,17 @@ var _ = Describe("P6a: ClusterAgentPolicy (D81(b))", func() {
 
 	It("spec 4 (D98): a ref naming BOTH scopes → namespaced wins + a transition-gated PolicyNameCollision Event", func() {
 		ns := "p6a-collision-" + nowSuffix()
+		// A FAKE recorder (not the broadcaster + cluster Event sink): the
+		// broadcaster's event correlator folds a repeated identical Event into
+		// the existing Event OBJECT (bumping .Count), so counting Event
+		// objects in the cluster does not move when the gate is disabled —
+		// the reviewer's mutation M1 (the transition gate) sailed past the
+		// old object-count assertion. The recorder's Events channel records
+		// every call; the drain helper below counts the PolicyNameCollision
+		// calls per reconcile.
+		rec := record.NewFakeRecorder(64)
 		r = p6aReconciler(false)
+		r.Recorder = rec
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
 		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
 
@@ -409,42 +422,36 @@ var _ = Describe("P6a: ClusterAgentPolicy (D81(b))", func() {
 			"D98: the namespaced policy must win (the hash is the namespaced allows, not the cluster's)")
 		Expect(got.Status.Policy.EffectiveHash).ToNot(Equal(p6aUnionHash(wantCluster)))
 
-		// The collision is surfaced: a PolicyNameCollision Warning Event fired
-		// (the broadcaster posts to the cluster; envtest Events can arrive
-		// late, so wait for the first one).
-		countCollisionEvents := func() int {
-			var events corev1.EventList
-			if err := k8sClient.List(ctx, &events, client.InNamespace(ns)); err != nil {
-				return 0
-			}
-			count := 0
-			for i := range events.Items {
-				if events.Items[i].Reason == p6aCollisionReason && events.Items[i].InvolvedObject.Name == p6aLoopName {
-					count++
+		// The collision is surfaced: one PolicyNameCollision Warning Eventf
+		// call on the fake recorder's Events channel.
+		drainCollisions := func() int {
+			n := 0
+			for {
+				select {
+				case ev := <-rec.Events:
+					if strings.Contains(ev, p6aCollisionReason) {
+						n++
+					}
+				default:
+					return n
 				}
 			}
-			return count
 		}
-		var firstCount int
-		Eventually(countCollisionEvents, "5s", "100ms").Should(BeNumerically(">=", 1),
+		// Eventf can take a moment to write to the channel (the recorder
+		// writes asynchronously when the buffer is not full — wait for it).
+		Eventually(drainCollisions, "5s", "100ms").Should(Equal(1),
 			"a PolicyNameCollision Warning Event must fire on the first pass")
-		// The broadcaster COALESCES identical events within its burst window,
-		// so pin the count after the first pass once it is stable; the
-		// transition gate (emitPolicyNameCollision's prev == cur short-circuit)
-		// is what MUST bound the count on the second pass — coalescing alone
-		// does not (a second pass is seconds later, outside the burst window).
-		Eventually(countCollisionEvents, "5s", "100ms").Should(BeNumerically(">=", 1))
-		firstCount = countCollisionEvents()
 
-		// A second reconcile while the collision set is UNCHANGED: the in-memory
-		// loop's annotation still names the collision (the gate's durable
-		// surface), so the prev == cur short-circuit holds — no re-emit.
+		// A second reconcile while the collision set is UNCHANGED: the
+		// in-memory loop's annotation still names the collision (the gate's
+		// durable surface), so the prev == cur short-circuit holds — no
+		// re-emit.
 		// The trailing status write may race with the transition gate's
 		// annotation patch (the patch bumps the resourceVersion and the status
-		// write's optimistic-concurrency check sees the stale version), so the
-		// reconcile may return a conflict error — harmless (the gate ran before
-		// the status write, and the Event count assertion below is the real
-		// check: an ungated emit would land a new Event regardless).
+		// write's optimistic-concurrency check sees the stale version), so
+		// the reconcile may return a conflict error — harmless (the gate ran
+		// before the status write, and the recorder assertion below is the
+		// real check: an ungated emit would land a string on the channel).
 		_, _ = r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: p6aLoopName}})
 
 		// Re-fetch the Loop: the transition gate's durable surface is the
@@ -456,22 +463,24 @@ var _ = Describe("P6a: ClusterAgentPolicy (D81(b))", func() {
 		Expect(got.Annotations["coxswain.io/policy-collisions"]).To(Equal(p6aBothName),
 			"the collision set is recorded on the Loop (the transition gate's durable surface)")
 
-		// Review 5736305575 finding 3: the transition gate itself. With the
-		// set UNCHANGED the second pass must not re-emit — the Event count
-		// stays at firstCount (the broadcaster coalesces only within its burst
-		// window, which a second reconcile at this point is outside; an
-		// ungated emit would land a new Event and move the count). The spec
-		// FAILS the reviewer's mutation (the `if prev == cur` gate disabled):
-		// that emits a new Event on the second pass, so the count moves.
-		Consistently(countCollisionEvents, "2s", "200ms").Should(Equal(firstCount),
-			"the transition gate: no new PolicyNameCollision Event when the collision set is unchanged (the reviewer's mutation M1 — gate disabled — moves the count)")
+		// Review 5736305575 finding 3 (reviewer's session-2 P2-1, mutation
+		// M1): the transition gate itself. With the set UNCHANGED the second
+		// pass must make ZERO further PolicyNameCollision Eventf calls on the
+		// recorder — the fake recorder has no correlator, so an ungated emit
+		// lands another string on the channel and the count moves. (The
+		// cluster Event object does not move: the broadcaster's correlator
+		// folds a repeated identical Event into the existing object — which
+		// is why the spec counts recorder calls, not Event objects.)
+		Consistently(drainCollisions, "2s", "200ms").Should(Equal(0),
+			"the transition gate: no re-emit when the collision set is unchanged (the reviewer's mutation M1 — gate disabled — moves the count)")
 
 		By("positive control: change the collision set → the annotation moves and the Event re-fires")
 		// Delete the cluster policy with the shared name: the ref now resolves
 		// to the namespaced policy only, so the collision set becomes empty
 		// (prev=p6aBothName, cur="" → the gate passes and the Event fires
 		// again; the annotation is removed). If the gate were an unconditional
-		// no-op (both branches suppressed) the count would not move either.
+		// no-op (both branches suppressed) the recorder would have no calls
+		// either.
 		Expect(k8sClient.Delete(ctx, &coxv1alpha1.ClusterAgentPolicy{ObjectMeta: metav1.ObjectMeta{Name: p6aBothName}})).To(Succeed())
 		_, _ = r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: p6aLoopName}})
 		var moved coxv1alpha1.Loop
@@ -483,7 +492,10 @@ var _ = Describe("P6a: ClusterAgentPolicy (D81(b))", func() {
 			return !has
 		}, "5s", "250ms").Should(BeTrue(),
 			"with the collision gone the annotation must be removed (the set changed → the gate passes)")
-		Eventually(countCollisionEvents, "5s", "250ms").Should(BeNumerically(">", firstCount),
+		// emitPolicyNameCollision fires the Event before it writes the
+		// annotation, so by the time the annotation is gone (asserted above)
+		// the second Eventf call has already landed on the recorder channel.
+		Expect(drainCollisions()).To(BeNumerically(">=", 1),
 			"a CHANGED collision set must re-emit the Event (positive control: the gate fires on transitions in BOTH directions)")
 	})
 
@@ -525,18 +537,14 @@ var _ = Describe("P6a: ClusterAgentPolicy (D81(b))", func() {
 		Expect(k8sClient.Create(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: p6aKindToolCred, Namespace: ns}})).To(Succeed())
 
 		// The NonCanonicalExecPath gate is a controller-side check on the
-		// RESOLVED union: the CRD's CEL XValidation rejects non-canonical exec
-		// at admission for EVERY write form (Create AND Patch both re-evaluate
-		// it), so a spec-pinned envtest cannot seed the non-canonical exec
-		// through the API server. The gate itself is the "second line of
-		// defence" the resolver carries (loop_i43_policyvalid_test.go's step 3
-		// notes the same admission limitation for its controller-side flip),
-		// so the MESSAGE's kind-naming is a unit-level concern: the
-		// validateAgentPolicies call below drives the exact code the reviewer's
-		// mutation touches (the hard-coded "AgentPolicy" in the
-		// NonCanonicalExecPath message), and the label assertion (below) stays
-		// spec-pinned end-to-end through loopNamedSecrets (the policy IS valid,
-		// so no gate is involved — only the label is asserted).
+		// RESOLVED union. The CRD's CEL XValidation blocks a non-canonical
+		// exec through the API in every write form (Create AND Patch both
+		// re-evaluate it), so the kind-naming of the gate's MESSAGE is covered
+		// by the unit test TestNonCanonicalExecMessageNamesKind
+		// (loop_noncanonical_exec_test.go), not by a spec-pinned envtest. The
+		// label assertion below stays spec-pinned end-to-end through
+		// loopNamedSecrets (the policy IS valid — canonical exec — so no gate
+		// is involved; only the label is asserted).
 		loop := p6aBuildLoop(ns, p6aKindPolicyName)
 		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
 
@@ -544,10 +552,12 @@ var _ = Describe("P6a: ClusterAgentPolicy (D81(b))", func() {
 		Expect(err).NotTo(HaveOccurred())
 
 		// The label assertion (spec-pinned, end-to-end through loopNamedSecrets):
-		// the tool credential is labelled clusterAgentPolicy.<ref>, not
-		// agentPolicy.<ref>. The policy is valid (canonical exec), so no gate
-		// is involved — only the label shape is asserted. (The D34 model
-		// secret is a second named secret; find the tool credential by name.)
+		// the tool credential's secret-source label is the lowerCamel
+		// clusterAgentPolicy.<ref> field path (matching every other label in
+		// loopNamedSecrets), NOT the agentPolicy.<ref> one. The policy is
+		// valid (canonical exec), so no gate is involved — only the label
+		// shape is asserted. (The D34 model secret is a second named secret;
+		// find the tool credential by name.)
 		var l coxv1alpha1.Loop
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: p6aLoopName}, &l)).To(Succeed())
 		named := loopNamedSecrets(ctx, r, &l)
@@ -558,8 +568,8 @@ var _ = Describe("P6a: ClusterAgentPolicy (D81(b))", func() {
 			}
 		}
 		Expect(toolCred).NotTo(BeNil(), "the Loop must name the tool credential Secret")
-		Expect(toolCred.field).To(Equal("ClusterAgentPolicy."+p6aKindPolicyName+".spec.tools[].credentialSecretRef"),
-			"the secret-source label must name the RESOLVED kind (ClusterAgentPolicy, not AgentPolicy)")
+		Expect(toolCred.field).To(Equal("clusterAgentPolicy."+p6aKindPolicyName+".spec.tools[].credentialSecretRef"),
+			"the secret-source label must use the lowerCamel clusterAgentPolicy. prefix (not agentPolicy.)")
 	})
 
 	// Review 5736305575 finding 1 (P2): the ClusterAgentPolicy watch's map

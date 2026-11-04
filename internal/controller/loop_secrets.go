@@ -111,7 +111,16 @@ func loopNamedSecrets(ctx context.Context, r *LoopReconciler, loop *coxv1alpha1.
 	if res, rerr := r.resolvePolicyRefs(ctx, loop); rerr == nil {
 		for i, ref := range loop.Spec.PolicyRefs {
 			for _, tool := range res.specs[i].Tools {
-				add(tool.CredentialSecretRef.Name, "agentPolicy."+ref+".spec.tools[].credentialSecretRef")
+				// The label names the RESOLVED kind's lowerCamel prefix (a
+				// cluster-only ref is a clusterAgentPolicy.<ref>, not an
+				// agentPolicy.<ref>) — matching the lowerCamel field-path shape
+				// of every other label in this function (reviewer's P3-1: the
+				// kind must not be a capitalised Go type name in a label).
+				kindPrefix := "agentPolicy"
+				if res.kinds[i] == "ClusterAgentPolicy" {
+					kindPrefix = "clusterAgentPolicy"
+				}
+				add(tool.CredentialSecretRef.Name, kindPrefix+"."+ref+".spec.tools[].credentialSecretRef")
 			}
 		}
 	}

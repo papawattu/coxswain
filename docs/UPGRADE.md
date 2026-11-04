@@ -194,6 +194,24 @@ The ClusterRole now includes `serviceaccounts` (create, get, list, watch)
 automatically; there is nothing to do. If your RBAC is managed separately
 (not via `install.yaml`), apply the new rule to your ClusterRole.
 
+### New CRD: ClusterAgentPolicy (P6a)
+
+The operator now **watches** `ClusterAgentPolicy` (a Loop's `spec.policyRefs`
+entry may name one; #386). The watch is registered unconditionally at
+startup, so the CRD must be installed **before the new manager starts** —
+with the CRD missing, the manager cannot sync its cache and does not start.
+Both shipped install paths install it: `helm upgrade` ships it under the
+chart's `templates/crd/`, and `kubectl apply -f dist/install.yaml` includes
+it. Bumping **only the image** over an old install that lacks the CRD will
+not start the operator — apply the new CRD (or the full installer) first,
+then the new image.
+
+The operator's ClusterRole also gained `clusteragentpolicies`
+(`get;list;watch`) (the operator only reads cluster policies, never writes
+them). Same note as the `serviceaccounts` rule above: a standard installer
+picks it up automatically; if your RBAC is managed separately (not via
+`install.yaml`), apply the new rule to your ClusterRole.
+
 ### `spec.workspace.restoreFrom` is now immutable
 
 `restoreFrom` is immutable (F35, PR #215). Changing it on an existing Loop

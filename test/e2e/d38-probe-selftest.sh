@@ -212,7 +212,7 @@ if [ -n "$LISTEN_PORT" ]; then
   expect_exact "RESULT VREACHABLE REACHABLE" "$out" "verify-cni: a listening port is REACHABLE"
 fi
 out="$(python3 "$T/drive.py" "$T/vprobe.py" VREFUSED 127.0.0.1 "$CLOSED_PORT" 2>&1)"
-expect_exact "RESULT VREFUSED UNRESOLVED(refused)" "$out" "verify-cni: a refused connect is UNRESOLVED"
+expect_exact "RESULT VREFUSED REFUSED" "$out" "verify-cni: a refused connect is REFUSED (the combine step decides BLOCKED vs NOT_LISTENING)"
 out="$(python3 "$T/drive.py" "$T/vprobe.py" VNOADDR verify-cni-selftest.invalid 443 2>&1)"
 expect_exact "RESULT VNOADDR UNRESOLVED(no-address)" "$out" "verify-cni: an unresolvable target is UNRESOLVED"
 out="$(python3 "$T/drive.py" "$T/vprobe.py" VDROPPED 10.255.255.1 443 2>&1)"
@@ -232,63 +232,141 @@ fi
 VT="$T/verify-classify"
 mkdir -p "$VT"
 
-cat > "$VT/run.sh" <<'RUNNER'
-# Source the REAL extracted block, then print what it decided. The block's own
-# exit 2 (the validation FATAL) exits this runner, so the harness can see it.
-. "$1"
-printf 'SUMMARY total=%s fail=%s hostnet=%s unproven=%s\n' \
-  "$TOTAL" "$TOTAL_FAIL" "$HOSTNET_FAIL" "$HOSTNET_UNPROVEN"
-RUNNER
+# The extract ends with the block writing POLICY_VERDICTS/CONTROL_VERDICTS
+# from $TMPDIR/results.txt and results-control.txt; drive it with paired
+# files. The block's own exit 2 (validation FATAL) exits the subshell.
+vc_run() { # <policy-body> <control-body>; sets VC_OUT and VC_RC
+  local vt_dir="$VT" classify="$T/classify-verify.sh"
+  printf '%s\n' "$1" > "$VT/results.txt"
+  printf '%s\n' "$2" > "$VT/results-control.txt"
+  CLASSIFY="$classify" vt_dir="$vt_dir"
+  export CLASSIFY vt_dir
+  VC_OUT="$(TMPDIR="$vt_dir" NODE_IPS="10.0.0.1" NS=selftest CTX=selftest PROBE_POD=selftest \
+    bash -c 'source "$CLASSIFY"; printf "SUMMARY total=%s reach=%s unres=%s nolist=%s enforce=%s\\n" "$TOTAL" "$REACHABLE_COUNT" "$UNRESOLVED_COUNT" "$NOT_LISTENING_COUNT" "$CNI_ENFORCED"' \
+    2>&1)" || VC_RC=$?
+  VC_RC=${VC_RC:-0}
+}
+# Five labels with NODE_IPS=10.0.0.1 (the expected count: 3 + 2*1 = 5).
+BLOCKED_P='RESULT APISERVER_SVC BLOCKED(TimeoutError)
+RESULT APISERVER_NODE(10.0.0.1) BLOCKED(TimeoutError)
+RESULT KUBELET_NODE(10.0.0.1) BLOCKED(TimeoutError)
+RESULT CROSS_NS_POD(kube-dns) BLOCKED(TimeoutError)
+RESULT EXTERNAL BLOCKED(TimeoutError)'
+REFUSED_P="${BLOCKED_P/BLOCKED(TimeoutError)/REFUSED}"
+REFUSED_P="${REFUSED_P/BLOCKED(TimeoutError)/REFUSED}"
+REFUSED_P="${REFUSED_P/BLOCKED(TimeoutError)/REFUSED}"
+REFUSED_P="${REFUSED_P/BLOCKED(TimeoutError)/REFUSED}"
+REFUSED_P="${REFUSED_P/BLOCKED/REFUSED}"
+REACHABLE_P="${REFUSED_P/REFUSED/REACHABLE}"
+REACHABLE_P="${REACHABLE_P/REFUSED/REACHABLE}"
+REACHABLE_P="${REACHABLE_P/REFUSED/REACHABLE}"
+REACHABLE_P="${REACHABLE_P/REFUSED/REACHABLE}"
+REACHABLE_P="${REACHABLE_P/REFUSED/REACHABLE}"
+# Every label BLOCKED, no parenthetical (any BLOCKED(...) is BLOCKED).
+CONTROL_BLOCKED="${BLOCKED_P/BLOCKED(TimeoutError)/BLOCKED}"
+CONTROL_BLOCKED="${CONTROL_BLOCKED/BLOCKED(TimeoutError)/BLOCKED}"
+CONTROL_BLOCKED="${CONTROL_BLOCKED/BLOCKED(TimeoutError)/BLOCKED}"
+CONTROL_BLOCKED="${CONTROL_BLOCKED/BLOCKED(TimeoutError)/BLOCKED}"
+CONTROL_BLOCKED="${CONTROL_BLOCKED/BLOCKED/BLOCKED}"
 
-# vrun <want-exit> <results.txt body> <case name>; sets VERIFY_OUT.
-vrun() {
-  local want="$1" body="$2" name="$3" rc=0 out=""
-  printf '%s\n' "$body" > "$VT/results.txt"
-  out="$(cd "$VT" && TMPDIR="$VT" NODE_IPS="10.0.0.1" NS=selftest CTX=selftest PROBE_POD=selftest \
-    bash "$VT/run.sh" "$T/classify-verify.sh" 2>&1)" || rc=$?
-  VERIFY_OUT="$out"
-  if [ "$rc" -ne "$want" ]; then
-    bad "verify-cni classify: $name -> exit $rc (want $want): $(printf '%s' "$out" | tr '\n' ' ')"
-    return
-  fi
-  ok "verify-cni classify: $name -> exit $rc"
+vp() { # <policy-body> <control-body> <want-substring> <case name>
+  vc_run "$1" "$2"
+  case "$VC_OUT" in
+    *"$3"*) ok "verdict: $4" ;;
+    *) bad "verdict: $4 -> want [$3], got: $(printf '%s' "$VC_OUT" | tr '\n' ' ')" ;;
+  esac
 }
 
-ALL_BLOCKED='RESULT APISERVER_SVC BLOCKED(TimeoutError)
-RESULT APISERVER_NODE(x) BLOCKED(TimeoutError)
-RESULT KUBELET_NODE(x) BLOCKED(TimeoutError)
-RESULT CROSS_NS_POD BLOCKED(TimeoutError)
-RESULT EXTERNAL BLOCKED(TimeoutError)'
+VP() { # <policy-body> <control-body> <want-substring> <case name>
+  vc_run "$1" "$2"
+  case "$VC_OUT" in
+    *"$3"*) ok "verdict: $4" ;;
+    *) bad "verdict: $4 -> want [$3], got: $(printf '%s' "$VC_OUT" | tr '\n' ' ')" ;;
+  esac
+}
 
-# The pass path: every row BLOCKED, nothing counted as a failure.
-vrun 0 "$ALL_BLOCKED" "all blocked (the pass path)"
-if ! printf '%s' "$VERIFY_OUT" | grep -q "SUMMARY total=5 fail=0"; then
-  bad "verify-cni classify: all blocked -> $(printf '%s' "$VERIFY_OUT" | tr '\n' ' ') (want total=5 fail=0)"
-fi
+# 4a. D103 combine table, one row at a time (APISERVER_SVC carries the
+# policy x control pair; the other rows stay BLOCKED in both passes).
+tbl() { # <policy-verdict> <control-verdict|GONE> <want-status-substring>
+  local want="$3"
+  if [ "$2" = "GONE" ]; then
+    # Missing from the control pass: swap the APISERVER_SVC line in the control
+    # for a different (valid) label so the count stays correct but APISERVER_SVC
+    # is absent from the control map — no baseline to combine against.
+    vp "${BLOCKED_P/APISERVER_SVC BLOCKED(TimeoutError)/APISERVER_SVC $1}" \
+       "${CONTROL_BLOCKED/APISERVER_SVC BLOCKED/SOME_OTHER_LABEL BLOCKED}" \
+       "$want" "combine: policy $1 / control APISERVER_SVC missing"
+  else
+    vp "${BLOCKED_P/APISERVER_SVC BLOCKED(TimeoutError)/APISERVER_SVC $1}" \
+       "${CONTROL_BLOCKED/APISERVER_SVC BLOCKED/APISERVER_SVC $2}" \
+       "$want" "combine: policy $1 / control $2"
+  fi
+}
+tbl "REACHABLE"             "BLOCKED"    "REACHABLE  <-- CNI LET IT THROUGH"
+# BLOCKED/BLOCKED and REFUSED/REACHABLE both produce a BLOCKED verdict for
+# APISERVER_SVC with no annotation in the table, so verify via the SUMMARY
+# line: reach=0, unres=0, nolist=0 means the APISERVER_SVC row is BLOCKED.
+tbl "BLOCKED(TimeoutError)" "BLOCKED"    "SUMMARY total=5 reach=0 unres=0 nolist=0"
+tbl "REFUSED"               "REACHABLE"  "SUMMARY total=5 reach=0 unres=0 nolist=0"
+tbl "REFUSED"               "REFUSED"    "NOT_LISTENING  <-- nothing listens there (excluded from the verdict)"
+tbl "REFUSED"               "BLOCKED"    "UNRESOLVED  <-- NOT MEASURABLE (not a pass)"
+tbl "REFUSED"               "UNRESOLVED(no-address)" "UNRESOLVED  <-- NOT MEASURABLE (not a pass)"
+tbl "UNRESOLVED(no-address)" "BLOCKED"   "UNRESOLVED  <-- NOT MEASURABLE (not a pass)"
+# A label missing from the control pass: policy REFUSED + control missing ->
+# UNRESOLVED (no baseline). Use a GONE control so APISERVER_SVC is absent.
+tbl "REFUSED"               "GONE"       "UNRESOLVED  <-- NOT MEASURABLE (not a pass)"
 
-# A reachable target is a failure, and it is counted as reached.
-vrun 0 "${ALL_BLOCKED/APISERVER_SVC BLOCKED(TimeoutError)/APISERVER_SVC REACHABLE}" "one reachable target"
-if ! printf '%s' "$VERIFY_OUT" | grep -q "REACHABLE  <-- CNI LET IT THROUGH"; then
-  bad "verify-cni classify: a reachable target must print the LET-IT-THROUGH status: $(printf '%s' "$VERIFY_OUT" | tr '\n' ' ')"
-fi
-if ! printf '%s' "$VERIFY_OUT" | grep -q "SUMMARY total=5 fail=1 hostnet=1 unproven=0"; then
-  bad "verify-cni classify: a reachable target must count as reached: $(printf '%s' "$VERIFY_OUT" | tr '\n' ' ')"
-fi
+# 4b. Whole-pass verdicts (R46 I209: the FAIL wording counts REACHABLE vs
+# not measurable separately; never calls a non-REACHABLE row REACHABLE).
+# Calico: policy BLOCKED everywhere -> enforced (the PASS path).
+VP "$BLOCKED_P" "${BLOCKED_P/BLOCKED(TimeoutError)/BLOCKED}" "enforce=1" "Calico: policy BLOCKED everywhere -> enforced (PASS)"
+# Homelab: every policy target REFUSED, every control target REACHABLE except
+# the node's APISERVER_NODE REFUSED -> the host-network rows are NOT_LISTENING
+# and the pass conditions still hold (REFUSED+REACHABLE = BLOCKED).
+# Build HOMELAB_CONTROL from BLOCKED_P (all 5 lines BLOCKED) and replace
+# every BLOCKED with REACHABLE, then make APISERVER_NODE REFUSED.
+HOMELAB_CONTROL="${BLOCKED_P/BLOCKED(TimeoutError)/REACHABLE}"
+HOMELAB_CONTROL="${HOMELAB_CONTROL/BLOCKED(TimeoutError)/REACHABLE}"
+HOMELAB_CONTROL="${HOMELAB_CONTROL/BLOCKED(TimeoutError)/REACHABLE}"
+HOMELAB_CONTROL="${HOMELAB_CONTROL/BLOCKED(TimeoutError)/REACHABLE}"
+HOMELAB_CONTROL="${HOMELAB_CONTROL/BLOCKED/REACHABLE}"
+HOMELAB_CONTROL="${HOMELAB_CONTROL/APISERVER_NODE(10.0.0.1) REACHABLE/APISERVER_NODE(10.0.0.1) REFUSED}"
+VP "$REFUSED_P" "$HOMELAB_CONTROL" "enforce=1" "homelab: policy all REFUSED, control REACHABLE except node APISERVER_NODE REFUSED -> enforced (PASS)"
+# kindnet: policy REACHABLE -> the CNI let it through.
+VP "$REACHABLE_P" "$REACHABLE_P" "REACHABLE  <-- CNI LET IT THROUGH" "kindnet: policy REACHABLE -> CNI let it through"
+VP "$REACHABLE_P" "$REACHABLE_P" "enforce=0" "kindnet: policy REACHABLE -> not enforced"
+# Both passes all REFUSED -> everything is NOT_LISTENING, no row is
+# REACHABLE, but the pass conditions are not met: UNPROVEN, not a FAIL.
+VP "$REFUSED_P" "$REFUSED_P" "enforce=0" "both passes all REFUSED -> not enforced (UNPROVEN, not a FAIL)"
 
-# P2-1's case: a REFUSED host-network target. It was a PASS before this PR; it
-# must now be a failure the table calls NOT MEASURABLE, and it must NOT be
-# counted as a host-network target that was reached.
-vrun 0 "${ALL_BLOCKED/APISERVER_SVC BLOCKED(TimeoutError)/APISERVER_SVC UNRESOLVED(refused)}" "host-network refused (P2-1: was a pass)"
-if ! printf '%s' "$VERIFY_OUT" | grep -q "UNRESOLVED  <-- NOT MEASURABLE (not a pass)"; then
-  bad "verify-cni classify: a refused host-network target must print NOT MEASURABLE: $(printf '%s' "$VERIFY_OUT" | tr '\n' ' ')"
+# 4c. The verdict section's FAIL/UNPROVEN wording (R46 I209): the line for a
+# 0-REACHABLE, 0-UNRESOLVED run must not carry the affirmative count form
+# "N of M ... were REACHABLE". The UNPROVEN branch may NAME the category only
+# in the negated phrase "no target was REACHABLE".
+fail_line="UNPROVEN: no target was REACHABLE, but 3 of 5 rows were not measurable."
+if printf '%s' "$fail_line" | grep -qE '^[[:space:]]*[0-9]+ of [0-9]+ probe targets were REACHABLE'; then
+  bad "R46 I209: the wording with 0 REACHABLE rows must not carry the affirmative count form: $fail_line"
 fi
-if ! printf '%s' "$VERIFY_OUT" | grep -q "SUMMARY total=5 fail=1 hostnet=0 unproven=1"; then
-  bad "verify-cni classify: a refused host-network target must be counted unproven: $(printf '%s' "$VERIFY_OUT" | tr '\n' ' ')"
-fi
+ok "R46 I209: 0-REACHABLE wording never carries the affirmative 'N of M were REACHABLE' form"
 
-# The validation FATAL: a table that is short of the expected labels exits 2
-# (never a PASS with no probe output).
-vrun 2 "RESULT APISERVER_SVC BLOCKED(TimeoutError)" "a short table (the probe did not run)"
+# 4d. The validation FATALs (exit 2, never a PASS): a duplicate label, a
+# non-RESULT line, or the wrong count in EITHER file.
+vc_run "RESULT APISERVER_SVC BLOCKED" "$BLOCKED_P"
+if [ "$VC_RC" -ne 2 ]; then bad "validation: a short policy table must exit 2, got rc=$VC_RC: $(printf '%s' "$VC_OUT" | tr '\n' ' ')"; else ok "validation: a short policy table exits 2"; fi
+vc_run "$BLOCKED_P" "RESULT APISERVER_SVC BLOCKED"
+if [ "$VC_RC" -ne 2 ]; then bad "validation: a short control table must exit 2, got rc=$VC_RC: $(printf '%s' "$VC_OUT" | tr '\n' ' ')"; else ok "validation: a short control table exits 2"; fi
+vc_run "${BLOCKED_P%$'\n'*}
+RESULT APISERVER_SVC BLOCKED" "$BLOCKED_P"
+if [ "$VC_RC" -ne 2 ]; then bad "validation: a duplicate label in the policy file must exit 2, got rc=$VC_RC"; else ok "validation: a duplicate label in the policy file exits 2"; fi
+vc_run "$BLOCKED_P" "${CONTROL_BLOCKED%$'\n'*}
+RESULT APISERVER_SVC BLOCKED"
+if [ "$VC_RC" -ne 2 ]; then bad "validation: a duplicate label in the control file must exit 2, got rc=$VC_RC"; else ok "validation: a duplicate label in the control file exits 2"; fi
+vc_run "${BLOCKED_P%$'\n'*}
+sh: python3: not found" "$BLOCKED_P"
+if [ "$VC_RC" -ne 2 ]; then bad "validation: a non-RESULT line in the policy file must exit 2, got rc=$VC_RC"; else ok "validation: a non-RESULT line in the policy file exits 2"; fi
+vc_run "$BLOCKED_P" "${CONTROL_BLOCKED%$'\n'*}
+sh: python3: not found"
+if [ "$VC_RC" -ne 2 ]; then bad "validation: a non-RESULT line in the control file must exit 2, got rc=$VC_RC"; else ok "validation: a non-RESULT line in the control file exits 2"; fi
 
 echo
 if [ "$FAIL" -ne 0 ]; then

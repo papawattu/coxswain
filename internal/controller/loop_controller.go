@@ -691,7 +691,27 @@ func (r *LoopReconciler) agentPoliciesValid(ctx context.Context, loop *coxv1alph
 // modelEndpoint set together): a Secret without an endpoint (or an endpoint
 // without a Secret) is a misconfiguration that would crash-loop the proxy, so
 // it is rejected early with ModelConfigValid=False (the caller requeues).
+// I212: a runner Loop with NO model endpoint at all is held the same way
+// (reason NoModelEndpoint, distinct from the pair check): the runner requires
+// the operator-set model proxy URL, and without it the agent crash-loops in
+// Planning with no condition naming the cause (the v0.1.3 smoke run: the
+// shipped samples carry the model fields commented out). A non-runner agent
+// image is not held: an external agent may not need the model proxy.
 func (r *LoopReconciler) modelConfigInvalid(ctx context.Context, loop *coxv1alpha1.Loop) bool {
+	if loop.Spec.Agent.EndpointSecretRef == "" && loop.Spec.Agent.ModelEndpoint == "" {
+		if !runnerRuns(r, loop) {
+			return false
+		}
+		// spec.agent.modelEndpoint is immutable once set (the CRD's XValidation
+		// self == oldSelf), so the only fix is a recreated Loop with the model
+		// fields.
+		setCondition(loop, "ModelConfigValid", metav1.ConditionFalse, "NoModelEndpoint",
+			"spec.agent.endpointSecretRef and spec.agent.modelEndpoint are both empty; the runner needs the operator-set model proxy URL — recreate the Loop with spec.agent.modelEndpoint and spec.agent.endpointSecretRef set")
+		if err := r.Status().Update(ctx, loop); err != nil {
+			return true // still invalid; the error is the caller's
+		}
+		return true
+	}
 	if loop.Spec.Agent.EndpointSecretRef == "" || loop.Spec.Agent.ModelEndpoint != "" {
 		return false
 	}

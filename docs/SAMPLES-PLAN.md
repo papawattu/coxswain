@@ -221,6 +221,10 @@ isolated network, checks pass" — not "an SDLC that ships a PR."
   `self == oldSelf || self == ''` + host:port pattern + port 1–65535.
   The controller additionally rejects a Secret without an endpoint
   (`ModelConfigValid` / `MissingModelEndpoint`, `loop_controller.go:246`).
+  I212: it also holds a runner Loop with NEITHER field set
+  (`ModelConfigValid` / `NoModelEndpoint`, pre-sandbox — the runner requires
+  the operator-set model proxy URL; a non-runner `spec.agent.image` is not
+  held).
 - **The model proxy pod (D33).** `buildProxyPod`
   (`loop_controller.go:1064`): a bare Pod, `MODEL_ENDPOINT` env =
   `modelEndpointValue(loop)` (`loop_controller.go:2137` — a bare
@@ -366,7 +370,7 @@ file — keep them in separate PRs so the reviewer can see each seam.
 | B2 `tamperVerdict` tri-state; B3 check-gate to `Succeeded`; verify Job not created by operator (envtest sets `status.verify.*`) | `loop_controller.go:873`, `:290-315` (Verifying block), `api/v1alpha1/loop_types.go` `VerifyStatus` doc comment |
 | B3 verify Job shape (clone init + tamper init + check inits, exit codes, `restartPolicy: Never`/`backoffLimit: 0`, canary, advisory scan) | `docs/TDD-PLAN-PHASE1.md` B3/B3a/B3b/B3c/B3d (lines ~832–900) |
 | **GAP 5:** no delivery: no push/PR/branch code; `gitCredentialSecret` has no reader in `internal/`/`cmd/` | grep of `internal/`, `cmd/` (no go-git/clone/push); `docs/TDD-PLAN-PHASE1.md` ("PR + Judge" = Phase 6, line 1034) |
-| `endpointSecretRef`+`modelEndpoint` together + immutability CELs; pair check at reconcile | `api/v1alpha1/loop_types.go` `AgentConfig` markers; `loop_controller.go:246` (`MissingModelEndpoint`) |
+| `endpointSecretRef`+`modelEndpoint` together + immutability CELs; pair check at reconcile (`MissingModelEndpoint`); I212 runner model hold (`NoModelEndpoint`, pre-sandbox) | `api/v1alpha1/loop_types.go` `AgentConfig` markers; `loop_controller.go` `modelConfigInvalid` |
 | Proxy pod: `MODEL_ENDPOINT` = `http://`+endpoint; Secret mounted at `/model-creds`; stand-in fatals without a key; forwards `:8080` | `loop_controller.go:1064` (`buildProxyPod`), `:2137` (`modelEndpointValue`); `cmd/proxy-standin/main.go` |
 | Proxy netpol egress = model endpoint peer + DNS; `modelPeer` → `IPBlock 192.168.1.20/32` (no except) for an IP endpoint; carve-outs belong to the egress-proxy rule | `loop_controller.go:1669` (`ensureNetworkPolicy`, proxyNP block), `:2082` (`modelPeer`), `:2058` (`egressCarveOutCIDRs`), egress-proxy netpol block |
 | `COX_MODEL_BASE_URL` set by operator, `COX_*` env names rejected (I34) — the namespace the build uses for `COX_GOAL` | `loop_controller.go:653`; `AgentEnvVar` CEL in `api/v1alpha1/loop_types.go:256` (`!self.startsWith('COX_')`) |

@@ -174,7 +174,18 @@ var _ = Describe("F56: a missing runner image is visible on the Loop", func() {
 		}
 
 		name := "l2"
-		Expect(k8sClient.Create(ctx, f56Loop(ns, name, ""))).To(Succeed())
+		// I212: the sandbox-creation spec gives the runner Loop the full model
+		// pair (the spec is about the runner-available condition, not the
+		// model hold — the runner requires the model proxy URL, so a model-less
+		// runner Loop is held before the sandbox and this spec would see no pod).
+		Expect(k8sClient.Create(ctx, &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "f56-model-cred", Namespace: ns},
+		})).To(Succeed())
+		l2 := f56Loop(ns, name, "")
+		l2.Spec.Agent.Model = testModel
+		l2.Spec.Agent.EndpointSecretRef = "f56-model-cred"
+		l2.Spec.Agent.ModelEndpoint = "fake-model:8000"
+		Expect(k8sClient.Create(ctx, l2)).To(Succeed())
 		f56Reconcile(r, ns, name)
 
 		cond := f56Condition(f56Get(ns, name))

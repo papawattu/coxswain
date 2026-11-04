@@ -471,6 +471,7 @@ and why the hold ended.
 | `Paused=True reason=Budget` | A budget cap was hit with `onExceeded=Pause`; the Loop is held Paused until resumed. |
 | `NetworkEnforced=False reason=CNIUnenforced` | The CNI does not enforce NetworkPolicy; the Loop is held Suspended (fail-closed). |
 | `ModelAvailable=False reason=ModelUnavailable` | The model backend is unreachable or returned no response within the timeout. |
+| `ModelConfigValid=False reason=NoModelEndpoint` | A runner Loop (the operator's `--runner-image`, with `spec.agent.image` empty or equal to it) has no `spec.agent.endpointSecretRef` and no `spec.agent.modelEndpoint`. The runner needs the operator-set model proxy URL, so the Loop is held with no sandbox (I212); recreate the Loop with the model fields set. |
 | `SecretsUsable=False reason=NamespaceNotEnabled` | The namespace has no D102 `RoleBinding` for the `coxswain-secret-reader` ClusterRole; the Loop is held (no sandbox) until it is added (Secret opt-in, below). |
 | `SecretsUsable=False reason=SecretNotOptedIn` | A named Secret is missing the `coxswain.io/usable: "true"` label; the message names the Secret and the field that references it. |
 | `SecretsUsable=False reason=SecretNotFound` | A named Secret does not exist in the Loop's namespace. |

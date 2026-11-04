@@ -78,23 +78,43 @@ const (
 	expectedResultLen = 5 // 4 expected-BLOCKED (APISERVER_SVC, NODE_API, KUBELET_NODE, EXTERNAL) + 1 positive control (DNS_POSITIVE)
 	verdictReachable  = "REACHABLE"
 	verdictBlocked    = "BLOCKED"
-	// verdictUnresolved: the target's hostname could not be resolved (or the
-	// connection was refused), so the probe has no evidence either way. It is
-	// never Enforced and never Unenforced: parse() maps any UNRESOLVED row to
-	// ProbeUnavailable (F51 P2-2 — the old script reported a resolution
-	// failure as REACHABLE, i.e. an unresolvable expected-BLOCKED target
-	// counted as a fence bypass).
+	// verdictUnresolved: the target's hostname could not be resolved, so the
+	// probe has no evidence either way. It is never Enforced and never
+	// Unenforced: parse() maps any UNRESOLVED row to ProbeUnavailable (F51
+	// P2-2 — the old script reported a resolution failure as REACHABLE, i.e.
+	// an unresolvable expected-BLOCKED target counted as a fence bypass).
 	verdictUnresolved = "UNRESOLVED"
+	// verdictRefused: the connection reached the host and was actively
+	// rejected (ConnectionRefusedError). It is not by itself evidence of a
+	// policy drop (nothing may listen there) — combineVerdicts resolves it
+	// against the no-policy control pass (D103). Until that pass exists, a
+	// REFUSED row maps to ProbeUnavailable like UNRESOLVED.
+	verdictRefused = "REFUSED"
+	// verdictNotListening: the combined verdict for a target refused in BOTH
+	// passes — nothing listens there. It carries no verdict about the fence
+	// and is excluded from the enforcement decision (shown in the detail).
+	verdictNotListening = "NOT_LISTENING"
+)
+
+// The RESULT labels the probe emits, one constant per target. The python
+// script embeds them as plain text (the script is a string, so they must be
+// inlined there); the Go side uses the constants for every map, list and
+// comparison.
+const (
+	labelAPIServerSVC = "APISERVER_SVC"
+	labelNodeAPI      = "NODE_API"
+	labelKubeletNode  = "KUBELET_NODE"
+	labelExternal     = "EXTERNAL"
 )
 
 // knownProbeLabels is the strict set of RESULT labels the probe emits (design
 // point 4: an unknown label is a validation error, never a false pass).
 var knownProbeLabels = map[string]bool{
-	"APISERVER_SVC": true,
-	"NODE_API":      true,
-	"KUBELET_NODE":  true,
-	"EXTERNAL":      true,
-	"DNS_POSITIVE":  true,
+	labelAPIServerSVC:    true,
+	labelNodeAPI:         true,
+	labelKubeletNode:     true,
+	labelExternal:        true,
+	positiveControlLabel: true,
 }
 
 // expectedBlockedLabels are the RESULT labels that must be BLOCKED for the
@@ -108,10 +128,10 @@ var knownProbeLabels = map[string]bool{
 // On a non-enforcing CNI (kindnet) EXTERNAL is REACHABLE, which is itself
 // evidence of unenforcement.
 var expectedBlockedLabels = map[string]bool{
-	"APISERVER_SVC": true,
-	"NODE_API":      true,
-	"KUBELET_NODE":  true,
-	"EXTERNAL":      true,
+	labelAPIServerSVC: true,
+	labelNodeAPI:      true,
+	labelKubeletNode:  true,
+	labelExternal:     true,
 }
 
 // positiveControlLabel is the RESULT label that must be REACHABLE for the
@@ -120,6 +140,12 @@ var expectedBlockedLabels = map[string]bool{
 // BLOCKED positive control means the probe has no network at all (the fence
 // is unproven) and the result is ProbeUnavailable.
 const positiveControlLabel = "DNS_POSITIVE"
+
+// passLabels is the strict, stable order of RESULT labels a probe pass emits
+// (used for the UNRESOLVED/REFUSED pre-emptions, the CNIUnenforced Detail
+// joining, and Rows rendering — the order is pinned so the detail text is
+// deterministic). It must stay in sync with knownProbeLabels.
+var passLabels = []string{labelAPIServerSVC, labelNodeAPI, labelKubeletNode, labelExternal, positiveControlLabel}
 
 // probeCommand is the probe, run as the pod's own command (the
 // image is python:3-alpine by default — it ships python3 and neither bash nor
@@ -220,9 +246,13 @@ def probe(label, host, port):
         s.connect((host, port))
         out("RESULT %s REACHABLE" % label)
     except ConnectionRefusedError:
-        # A refused connection reached the host and was rejected there; it is
-        # not evidence that a policy dropped the packet.
-        out("RESULT %s UNRESOLVED" % label)
+        # A refused connection reached the host and was actively rejected
+        # there. That is NOT evidence that a policy dropped the packet (nothing
+        # may listen there) and NOT unresolvable (the name DID resolve): the
+        # no-policy control pass (D103) tells the two apart — a control
+        # REACHABLE means the policy rejected it (BLOCKED), a control REFUSED
+        # means nothing listens (NOT_LISTENING).
+        out("RESULT %s REFUSED" % label)
     except Exception:
         out("RESULT %s BLOCKED" % label)
     finally:
@@ -481,9 +511,10 @@ func (p *PodProber) waitForTermination(ctx context.Context, pod *corev1.Pod) (st
 // REACHABLE; the positive control (DNS_POSITIVE, the cluster's kube-dns :53)
 // is NOT expected-blocked — a BLOCKED control means the probe has no network
 // and the result is ProbeUnavailable (never CNIEnforced on an unproven fence,
-// never CNIUnenforced on a healthy CNI). An UNRESOLVED row (no address, or a
-// refused connection) is also ProbeUnavailable: it is a missing measurement,
-// not a verdict about the fence (F51 P2-2).
+// never CNIUnenforced on a healthy CNI). An UNRESOLVED row (no address) or a
+// REFUSED row (single pass — until slice B's control pass distinguishes a
+// policy drop from nothing listening) is also ProbeUnavailable: it is a
+// missing measurement, not a verdict about the fence (F51 P2-2).
 func (p *PodProber) parse(msg string, pod *corev1.Pod) (CNIProbeResult, error) {
 	// A non-zero exit (container terminated with a non-zero code) is
 	// ProbeUnavailable even if the message looks valid.
@@ -492,56 +523,28 @@ func (p *PodProber) parse(msg string, pod *corev1.Pod) (CNIProbeResult, error) {
 			return unavailable("probe exited non-zero: " + fmt.Sprint(cs.State.Terminated.ExitCode)), nil
 		}
 	}
-	var rows []TargetRow
-	var reachable []string
-	seen := 0
-	for line := range strings.SplitSeq(strings.TrimSpace(msg), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || line == "DONE" {
-			continue
-		}
-		fields := strings.Fields(line)
-		if len(fields) != 3 || fields[0] != "RESULT" {
-			return unavailable("unrecognised probe line: " + line), nil
-		}
-		label, verdict := fields[1], fields[2]
-		if verdict != verdictReachable && verdict != verdictBlocked && verdict != verdictUnresolved {
-			return unavailable("unrecognised verdict: " + label + " " + verdict), nil
-		}
-		if !knownProbeLabels[label] {
-			return unavailable("unknown probe target label: " + label), nil
-		}
-		seen++
-		// UNRESOLVED is not evidence of enforcement OR of a fence bypass:
-		// the target was not measurable — either its name did not resolve or
-		// the connection was refused (which proves the name DID resolve, so
-		// the detail must not assert a resolution failure). Any UNRESOLVED
-		// row makes the whole probe ProbeUnavailable, before the
-		// control/BLOCKED logic can claim a verdict.
-		if verdict == verdictUnresolved {
+	pass, err := parsePass(msg)
+	if err != nil {
+		return unavailable(err.Error()), nil
+	}
+	// Until the no-policy control pass (D103 slice B), a REFUSED row means the
+	// same thing an UNRESOLVED row did: the target was not measurable — a
+	// refusal alone cannot tell a policy drop from nothing listening — so it
+	// makes the whole probe ProbeUnavailable with the same detail text. Any
+	// UNRESOLVED row (name did not resolve) is the same.
+	for _, label := range passLabels {
+		if v := pass[label]; v == verdictUnresolved || v == verdictRefused {
 			return unavailable("probe target was not measurable: " + label), nil
 		}
-		rows = append(rows, TargetRow{Label: label, Verdict: verdict})
-		if verdict == verdictReachable {
-			reachable = append(reachable, label)
-		}
-	}
-	if seen != expectedResultLen {
-		return unavailable(fmt.Sprintf("expected %d RESULT lines, got %d", expectedResultLen, seen)), nil
 	}
 	// The positive control (DNS_POSITIVE) must be REACHABLE: the probe
 	// NetworkPolicy allows egress to the cluster's kube-dns on 53. A BLOCKED
 	// control means the probe has no network at all (e.g. the node's own CNI
 	// is down) — the fence is unproven, so the result is ProbeUnavailable.
-	controlOK := false
-	for _, row := range rows {
-		if row.Label == positiveControlLabel && row.Verdict == verdictReachable {
-			controlOK = true
-		}
-	}
-	if !controlOK {
+	if pass[positiveControlLabel] != verdictReachable {
 		return unavailable(positiveControlLabel + " control not REACHABLE: the probe has no network; the fence is unproven"), nil
 	}
+	rows, reachable := passToRows(pass)
 	var unenforced []string
 	for _, label := range reachable {
 		if expectedBlockedLabels[label] {
@@ -565,6 +568,146 @@ func (p *PodProber) parse(msg string, pod *corev1.Pod) (CNIProbeResult, error) {
 	// set) and skip retage (no log, no metric, no re-gate GenericEvent), so
 	// Loops would never be re-reconciled on the new result.
 	return res, nil
+}
+
+// parsePass does the strict line validation of one probe pass's termination
+// message: exactly expectedResultLen lines of "RESULT <label> <verdict>" (any
+// other line shape is an error), each label a known probe label, each verdict
+// one of REACHABLE / BLOCKED / REFUSED / UNRESOLVED. It returns the label →
+// verdict map, or an error on any violation (design point 4: an unknown label
+// or verdict is never a false pass).
+func parsePass(msg string) (map[string]string, error) {
+	pass := make(map[string]string, expectedResultLen)
+	seen := 0
+	for line := range strings.SplitSeq(strings.TrimSpace(msg), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || line == "DONE" {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) != 3 || fields[0] != "RESULT" {
+			return nil, fmt.Errorf("unrecognised probe line: %s", line)
+		}
+		label, verdict := fields[1], fields[2]
+		if !knownProbeLabels[label] {
+			return nil, fmt.Errorf("unknown probe target label: %s", label)
+		}
+		if verdict != verdictReachable && verdict != verdictBlocked && verdict != verdictRefused && verdict != verdictUnresolved {
+			return nil, fmt.Errorf("unrecognised verdict: %s %s", label, verdict)
+		}
+		pass[label] = verdict
+		seen++
+	}
+	if seen != expectedResultLen {
+		return nil, fmt.Errorf("expected %d RESULT lines, got %d", expectedResultLen, seen)
+	}
+	return pass, nil
+}
+
+// passToRows renders a one-pass verdict map as Rows (in passLabels order) and
+// the ordered list of REACHABLE labels.
+func passToRows(pass map[string]string) (rows []TargetRow, reachable []string) {
+	for _, label := range passLabels {
+		verdict := pass[label]
+		rows = append(rows, TargetRow{Label: label, Verdict: verdict})
+		if verdict == verdictReachable {
+			reachable = append(reachable, label)
+		}
+	}
+	return rows, reachable
+}
+
+// combineVerdicts combines the policy pass and the no-policy control pass per
+// label, exactly the D103 table:
+//
+//	policy REACHABLE                          -> REACHABLE (the policy lets it through)
+//	policy BLOCKED                            -> BLOCKED (a policy drop, as today)
+//	policy REFUSED + control REACHABLE        -> BLOCKED (the policy rejected a connection that
+//	                                          succeeds without it — D103's new cell)
+//	policy REFUSED + control REFUSED          -> NOT_LISTENING (nothing listens there; excluded
+//	                                          from the verdict, shown in the detail)
+//	policy REFUSED + control BLOCKED/UNRESOLVED -> UNRESOLVED (the control pass could not
+//	                                          measure the baseline, so neither can we)
+//	policy UNRESOLVED                         -> UNRESOLVED
+//	a label missing from the control pass     -> UNRESOLVED (no baseline to combine against)
+func combineVerdicts(policy, control map[string]string) map[string]string {
+	combined := make(map[string]string, len(passLabels))
+	for _, label := range passLabels {
+		p := policy[label]
+		switch p {
+		case verdictReachable:
+			combined[label] = verdictReachable
+		case verdictBlocked:
+			combined[label] = verdictBlocked
+		case verdictRefused:
+			switch c := control[label]; c {
+			case verdictReachable:
+				combined[label] = verdictBlocked
+			case verdictRefused:
+				combined[label] = verdictNotListening
+			default: // BLOCKED or UNRESOLVED, or missing from the control pass
+				combined[label] = verdictUnresolved
+			}
+		default: // UNRESOLVED, or missing from the policy pass
+			combined[label] = verdictUnresolved
+		}
+	}
+	return combined
+}
+
+// decide applies the D103 verdict rules to the combined pass, in order:
+//
+//  1. any combined UNRESOLVED -> ProbeUnavailable (Detail names the label);
+//  2. DNS_POSITIVE not REACHABLE in BOTH the policy and the control pass ->
+//     ProbeUnavailable (one pass without a working network leaves the fence
+//     unproven);
+//  3. any expected-BLOCKED label combined REACHABLE -> CNIUnenforced
+//     (Detail carries those labels, joined ", ", as today);
+//  4. APISERVER_SVC combined BLOCKED and at least one of NODE_API /
+//     KUBELET_NODE combined BLOCKED -> CNIEnforced (the service route AND a
+//     host-network route are fenced, so the "nothing listens" rows cannot
+//     hide an unenforced CNI);
+//  5. otherwise -> ProbeUnavailable ("no host-network target was measurable":
+//     e.g. every host-network target NOT_LISTENING, which carries no verdict
+//     about the fence).
+//
+// Rows carries every label's combined verdict, NOT_LISTENING included.
+func decide(policy, control, combined map[string]string) CNIProbeResult {
+	for _, label := range passLabels {
+		if combined[label] == verdictUnresolved {
+			return unavailable("probe target was not measurable: " + label)
+		}
+	}
+	if policy[positiveControlLabel] != verdictReachable || control[positiveControlLabel] != verdictReachable {
+		return unavailable(positiveControlLabel + " control not REACHABLE in both passes: the fence is unproven")
+	}
+	var unenforced []string
+	for _, label := range passLabels {
+		if expectedBlockedLabels[label] && combined[label] == verdictReachable {
+			unenforced = append(unenforced, label)
+		}
+	}
+	if len(unenforced) > 0 {
+		res := CNIProbeResult{Rows: combinedToRows(combined), Reason: ReasonCNIUnenforced}
+		res.Detail = strings.Join(unenforced, ", ")
+		return res
+	}
+	apiserverBlocked := combined[labelAPIServerSVC] == verdictBlocked
+	if apiserverBlocked && (combined[labelNodeAPI] == verdictBlocked || combined[labelKubeletNode] == verdictBlocked) {
+		return CNIProbeResult{Reason: ReasonCNIEnforced, Rows: combinedToRows(combined)}
+	}
+	return unavailable("no host-network target was measurable")
+}
+
+// combinedToRows renders a combined verdict map as Rows in passLabels order
+// (NOT_LISTENING rows included — the design shows them in the
+// condition/Event detail).
+func combinedToRows(combined map[string]string) []TargetRow {
+	rows := make([]TargetRow, 0, len(passLabels))
+	for _, label := range passLabels {
+		rows = append(rows, TargetRow{Label: label, Verdict: combined[label]})
+	}
+	return rows
 }
 
 // unavailable builds a ProbeUnavailable result.

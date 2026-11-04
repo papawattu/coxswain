@@ -58,7 +58,7 @@ func TestProbeCommandShape(t *testing.T) {
 	}
 	script := cmd[2]
 	for _, want := range []string{
-		"RESULT %s REACHABLE", "RESULT %s BLOCKED", "RESULT %s UNRESOLVED", "DONE",
+		"RESULT %s REACHABLE", "RESULT %s BLOCKED", "RESULT %s UNRESOLVED", "RESULT %s REFUSED", "DONE",
 		"kubernetes.default.svc.cluster.local", "10250", "6443", "1.1.1.1",
 		"kube-dns.kube-system.svc.cluster.local",
 		"settimeout", "status.hostIP",
@@ -380,7 +380,11 @@ exec(compile(sys.stdin.read(), "probe", "exec"))
 		reject string
 	}{
 		{"resolution failure -> UNRESOLVED", "gaierror", "RESULT APISERVER_SVC UNRESOLVED", "REACHABLE"},
-		{"connection refused -> UNRESOLVED", "refused", "RESULT APISERVER_SVC UNRESOLVED", "BLOCKED"},
+		// D103: a refused connection now prints REFUSED (reached the host and
+		// was rejected there — the no-policy control pass, slice B, tells a
+		// policy drop from nothing listening); noaddr (no address) stays
+		// UNRESOLVED.
+		{"connection refused -> REFUSED", "refused", "RESULT APISERVER_SVC REFUSED", "UNRESOLVED"},
 		{"a timeout stays BLOCKED (positive control)", "timeout", "RESULT APISERVER_SVC BLOCKED", "UNRESOLVED"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -472,5 +476,228 @@ func TestBuildPodIsPinnedAndCredentialFree(t *testing.T) {
 	}
 	if pod.Spec.Containers[0].Image == "" {
 		t.Error("the probe container must carry the configured image")
+	}
+}
+
+// D103 (slice A): the REFUSED+control cell of the D103 table. One table row
+// per cell, plus the label-missing-from-control case. Reviewer mutations M-A1
+// (REFUSED+REACHABLE -> UNRESOLVED) and M-A2 (REFUSED+REFUSED -> BLOCKED) must
+// fail this test.
+func TestCombineVerdictsTable(t *testing.T) {
+	policy := map[string]string{
+		"APISERVER_SVC": verdictReachable,  // REACHABLE cell
+		"NODE_API":      verdictBlocked,    // BLOCKED cell
+		"KUBELET_NODE":  verdictRefused,    // REFUSED cells
+		"EXTERNAL":      verdictRefused,    // (control missing -> UNRESOLVED)
+		"DNS_POSITIVE":  verdictUnresolved, // UNRESOLVED cell
+	}
+	control := map[string]string{
+		"APISERVER_SVC": verdictBlocked,   // ignored: policy REACHABLE
+		"NODE_API":      verdictReachable, // ignored: policy BLOCKED
+		"KUBELET_NODE":  verdictReachable, // REFUSED+REACHABLE -> BLOCKED
+		"EXTERNAL":      verdictRefused,   // REFUSED+REFUSED -> NOT_LISTENING
+		"DNS_POSITIVE":  verdictReachable, // ignored: policy UNRESOLVED
+	}
+	got := combineVerdicts(policy, control)
+	for _, tc := range []struct{ label, want string }{
+		{"APISERVER_SVC", verdictReachable},
+		{"NODE_API", verdictBlocked},
+		{"KUBELET_NODE", verdictBlocked},
+		{"EXTERNAL", verdictNotListening},
+		{"DNS_POSITIVE", verdictUnresolved},
+	} {
+		if got[tc.label] != tc.want {
+			t.Errorf("combine(%s) = %s, want %s", tc.label, got[tc.label], tc.want)
+		}
+	}
+
+	// REFUSED + control BLOCKED or UNRESOLVED -> UNRESOLVED.
+	for _, c := range []string{verdictBlocked, verdictUnresolved} {
+		if got := combineVerdicts(map[string]string{"NODE_API": verdictRefused}, map[string]string{"NODE_API": c})["NODE_API"]; got != verdictUnresolved {
+			t.Errorf("REFUSED + control %s -> %s, want UNRESOLVED", c, got)
+		}
+	}
+	// A label missing from the control pass -> UNRESOLVED.
+	if got := combineVerdicts(map[string]string{"NODE_API": verdictRefused}, map[string]string{})["NODE_API"]; got != verdictUnresolved {
+		t.Errorf("REFUSED + missing control -> %s, want UNRESOLVED", got)
+	}
+	// REFUSED + REACHABLE stays BLOCKED even for a label the control pass did
+	// not emit everything else about (only that label matters).
+	if got := combineVerdicts(map[string]string{"EXTERNAL": verdictRefused}, map[string]string{"EXTERNAL": verdictReachable})["EXTERNAL"]; got != verdictBlocked {
+		t.Errorf("REFUSED + REACHABLE -> %s, want BLOCKED", got)
+	}
+}
+
+// D103 (slice A): the verdict rules of decide(), in order. Reviewer mutation
+// M-A3 (drop the "at least one host-network BLOCKED" rule) must fail the
+// all-host-network-NOT_LISTENING case.
+func TestDecideRules(t *testing.T) {
+	full := func(v map[string]string) map[string]string {
+		out := make(map[string]string, len(passLabels))
+		for _, label := range passLabels {
+			out[label] = v[label]
+		}
+		return out
+	}
+	enforced := func() map[string]string {
+		return full(map[string]string{
+			"APISERVER_SVC": verdictBlocked, "NODE_API": verdictBlocked,
+			"KUBELET_NODE": verdictBlocked, "EXTERNAL": verdictBlocked,
+			"DNS_POSITIVE": verdictReachable,
+		})
+	}
+	allBlockedPass := map[string]string{
+		"APISERVER_SVC": verdictBlocked, "NODE_API": verdictBlocked,
+		"KUBELET_NODE": verdictBlocked, "EXTERNAL": verdictBlocked,
+		"DNS_POSITIVE": verdictReachable,
+	}
+	allReachablePass := map[string]string{
+		"APISERVER_SVC": verdictReachable, "NODE_API": verdictReachable,
+		"KUBELET_NODE": verdictReachable, "EXTERNAL": verdictReachable,
+		"DNS_POSITIVE": verdictReachable,
+	}
+
+	t.Run("rule 1: any combined UNRESOLVED -> ProbeUnavailable naming the label", func(t *testing.T) {
+		combined := enforced()
+		combined["EXTERNAL"] = verdictUnresolved
+		res := decide(allBlockedPass, allBlockedPass, combined)
+		if res.Reason != ReasonProbeUnavailable || res.Detail != "probe target was not measurable: EXTERNAL" {
+			t.Fatalf("want ProbeUnavailable naming EXTERNAL, got %v %q", res.Reason, res.Detail)
+		}
+	})
+	t.Run("rule 2: DNS not REACHABLE in both passes -> ProbeUnavailable", func(t *testing.T) {
+		for _, tc := range []struct {
+			name string
+			p, c map[string]string
+		}{
+			{"policy DNS BLOCKED", map[string]string{"DNS_POSITIVE": verdictBlocked}, map[string]string{"DNS_POSITIVE": verdictReachable}},
+			{"control DNS BLOCKED", map[string]string{"DNS_POSITIVE": verdictReachable}, map[string]string{"DNS_POSITIVE": verdictBlocked}},
+			{"control DNS REFUSED", map[string]string{"DNS_POSITIVE": verdictReachable}, map[string]string{"DNS_POSITIVE": verdictRefused}},
+		} {
+			policy := enforced()
+			policy["DNS_POSITIVE"] = tc.p["DNS_POSITIVE"]
+			control := enforced()
+			control["DNS_POSITIVE"] = tc.c["DNS_POSITIVE"]
+			// The combined pass used here must NOT have a combined UNRESOLVED
+			// (rule 1 would fire first): DNS REFUSED in one pass only combines
+			// to NOT_LISTENING, which is not UNRESOLVED.
+			res := decide(policy, control, combineVerdicts(policy, control))
+			if res.Reason != ReasonProbeUnavailable {
+				t.Fatalf("%s: want ProbeUnavailable, got %v %q", tc.name, res.Reason, res.Detail)
+			}
+			if !strings.Contains(res.Detail, positiveControlLabel) {
+				t.Fatalf("%s: Detail must name %s, got %q", tc.name, positiveControlLabel, res.Detail)
+			}
+		}
+	})
+	t.Run("rule 3: expected-BLOCKED label combined REACHABLE -> CNIUnenforced", func(t *testing.T) {
+		// The kindnet case: the policy pass is REACHABLE -> CNIUnenforced.
+		// The kindnet case: the policy pass is REACHABLE -> CNIUnenforced.
+		res := decide(allReachablePass, allBlockedPass, allReachablePass)
+		if res.Reason != ReasonCNIUnenforced || res.Detail != "APISERVER_SVC, NODE_API, KUBELET_NODE, EXTERNAL" {
+			t.Fatalf("want CNIUnenforced listing the reachable labels, got %v %q", res.Reason, res.Detail)
+		}
+	})
+	t.Run("rule 4: APISERVER_SVC + a host-network label BLOCKED -> CNIEnforced", func(t *testing.T) {
+		// The Calico case: policy BLOCKED, control REACHABLE -> CNIEnforced.
+		res := decide(allBlockedPass, allReachablePass, allBlockedPass)
+		if res.Reason != ReasonCNIEnforced {
+			t.Fatalf("want CNIEnforced, got %v %q", res.Reason, res.Detail)
+		}
+		// Rows carry every label's combined verdict.
+		if len(res.Rows) != expectedResultLen {
+			t.Fatalf("Rows must carry all %d labels, got %d", expectedResultLen, len(res.Rows))
+		}
+	})
+	t.Run("rule 5: all host-network targets NOT_LISTENING -> ProbeUnavailable", func(t *testing.T) {
+		// REFUSED in both passes for every host-network target (nothing
+		// listens); the apiserver route alone cannot prove the fence.
+		combined := full(map[string]string{
+			"APISERVER_SVC": verdictNotListening, "NODE_API": verdictNotListening,
+			"KUBELET_NODE": verdictNotListening, "EXTERNAL": verdictNotListening,
+			"DNS_POSITIVE": verdictReachable,
+		})
+		res := decide(map[string]string{"DNS_POSITIVE": verdictReachable}, map[string]string{"DNS_POSITIVE": verdictReachable}, combined)
+		if res.Reason != ReasonProbeUnavailable || res.Detail != "no host-network target was measurable" {
+			t.Fatalf("want ProbeUnavailable (no host-network target was measurable), got %v %q", res.Reason, res.Detail)
+		}
+		// NOT_LISTENING rows are still shown in Rows.
+		for _, row := range res.Rows {
+			if row.Label == "NODE_API" && row.Verdict != verdictNotListening {
+				t.Fatalf("Rows must show the NOT_LISTENING verdict, got %+v", row)
+			}
+		}
+	})
+	t.Run("the homelab case: REJECT-style policy controller -> CNIEnforced", func(t *testing.T) {
+		// Policy pass: everything refused except DNS (a worker node's k3s
+		// embedded controller REJECTS instead of DROPS). Control pass: all
+		// REACHABLE except NODE_API refused (no apiserver on a worker).
+		policy := full(map[string]string{
+			"APISERVER_SVC": verdictRefused, "NODE_API": verdictRefused,
+			"KUBELET_NODE": verdictRefused, "EXTERNAL": verdictRefused,
+			"DNS_POSITIVE": verdictReachable,
+		})
+		control := full(map[string]string{
+			"APISERVER_SVC": verdictReachable, "NODE_API": verdictRefused,
+			"KUBELET_NODE": verdictReachable, "EXTERNAL": verdictReachable,
+			"DNS_POSITIVE": verdictReachable,
+		})
+		combined := combineVerdicts(policy, control)
+		// APISERVER_SVC/KUBELET_NODE/EXTERNAL: REFUSED+REACHABLE -> BLOCKED;
+		// NODE_API: REFUSED+REFUSED -> NOT_LISTENING.
+		if combined["APISERVER_SVC"] != verdictBlocked || combined["KUBELET_NODE"] != verdictBlocked || combined["EXTERNAL"] != verdictBlocked || combined["NODE_API"] != verdictNotListening {
+			t.Fatalf("combined pass is not the D103 table: %v", combined)
+		}
+		res := decide(policy, control, combined)
+		if res.Reason != ReasonCNIEnforced {
+			t.Fatalf("the homelab case must be CNIEnforced (the policy rejected a connection that succeeds without it), got %v %q", res.Reason, res.Detail)
+		}
+		nodeAPI := ""
+		for _, row := range res.Rows {
+			if row.Label == "NODE_API" {
+				nodeAPI = row.Verdict
+			}
+		}
+		if nodeAPI != verdictNotListening {
+			t.Fatalf("Rows must show NODE_API NOT_LISTENING, got %q (rows %+v)", nodeAPI, res.Rows)
+		}
+	})
+}
+
+// D103 (slice A): parsePass strictness. An unknown label, a bad verdict and
+// a short table are each an error — never a partial pass.
+func TestParsePassStrict(t *testing.T) {
+	valid := "RESULT APISERVER_SVC BLOCKED\nRESULT NODE_API BLOCKED\nRESULT KUBELET_NODE BLOCKED\nRESULT EXTERNAL BLOCKED\nRESULT DNS_POSITIVE REACHABLE\nDONE"
+	pass, err := parsePass(valid)
+	if err != nil {
+		t.Fatalf("a valid pass must parse: %v", err)
+	}
+	if len(pass) != expectedResultLen || pass["APISERVER_SVC"] != verdictBlocked {
+		t.Fatalf("parsePass returned %v, want 5 labels with APISERVER_SVC BLOCKED", pass)
+	}
+	// REFUSED is a known verdict (the new arm).
+	withRefused := "RESULT APISERVER_SVC REFUSED\nRESULT NODE_API BLOCKED\nRESULT KUBELET_NODE BLOCKED\nRESULT EXTERNAL BLOCKED\nRESULT DNS_POSITIVE REACHABLE\nDONE"
+	pass, err = parsePass(withRefused)
+	if err != nil || pass["APISERVER_SVC"] != verdictRefused {
+		t.Fatalf("REFUSED is a known verdict: err=%v pass=%v", err, pass)
+	}
+	for _, tc := range []struct {
+		name, msg, wantErr string
+	}{
+		{"unknown label", "RESULT WHATEVER BLOCKED\nRESULT NODE_API BLOCKED\nRESULT KUBELET_NODE BLOCKED\nRESULT EXTERNAL BLOCKED\nRESULT DNS_POSITIVE REACHABLE\nDONE", "unknown probe target label: WHATEVER"},
+		{"bad verdict", "RESULT APISERVER_SVC MEDIUM\nRESULT NODE_API BLOCKED\nRESULT KUBELET_NODE BLOCKED\nRESULT EXTERNAL BLOCKED\nRESULT DNS_POSITIVE REACHABLE\nDONE", "unrecognised verdict: APISERVER_SVC MEDIUM"},
+		{"bad line shape", "RESULT APISERVER_SVC\nRESULT NODE_API BLOCKED\nRESULT KUBELET_NODE BLOCKED\nRESULT EXTERNAL BLOCKED\nRESULT DNS_POSITIVE REACHABLE\nDONE", "unrecognised probe line: RESULT APISERVER_SVC"},
+		{"short table", "RESULT APISERVER_SVC BLOCKED\nDONE", "expected 5 RESULT lines, got 1"},
+		{"empty message", "", "expected 5 RESULT lines, got 0"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := parsePass(tc.msg)
+			if err == nil {
+				t.Fatalf("want an error for %s, got none", tc.name)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("error %q must contain %q", err.Error(), tc.wantErr)
+			}
+		})
 	}
 }

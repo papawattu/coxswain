@@ -138,8 +138,8 @@ func main() {
 	flag.DurationVar(&cniCheckInterval, "cni-check-interval", 10*time.Minute,
 		"How often the leader-elected probe Runnable re-probes the CNI self-test (D38).")
 	var cniProbeTimeout time.Duration
-	flag.DurationVar(&cniProbeTimeout, "cni-probe-timeout", 60*time.Second,
-		"Per-run timeout for one CNI probe; not-Ready / no exit / pull failure within it = ProbeUnavailable (D38).")
+	flag.DurationVar(&cniProbeTimeout, "cni-probe-timeout", 120*time.Second,
+		"Per-run timeout for one CNI probe (both passes, D103: two probe pods, hence 120s).")
 	// P5a: the memory PVC's StorageClass. Empty = the cluster default.
 	// Set to a RWX-capable class (e.g. local-shared) on kind clusters where
 	// the default (rancher.io/local-path, nodePathMap) is RWO-only.

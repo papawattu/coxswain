@@ -296,8 +296,57 @@ done
 [ "$READY" = "yes" ] || { echo "FATAL: probe pod did not become Ready in 300s (check: kubectl --context $CTX -n $NS describe pod $PROBE_POD)"; exit 2; }
 echo "   probe pod Ready"
 
+# Control pod: a SECOND probe pod with the SAME image/command/settings but a
+# label the NetworkPolicy does NOT select, pinned to the probe pod's node
+# (required node affinity). With no policy on it, it measures the baseline
+# "does anything listen there at all" that the policy pass cannot: a
+# policy REFUSED + control REACHABLE means the policy rejected a working
+# connection (BLOCKED); a policy REFUSED + control REFUSED means nothing
+# listens there (NOT_LISTENING — no evidence about the fence). D103's
+# two-pass probe (internal/cni/pod_prober.go combineVerdicts).
+PROBE_POD_NODE=$(K -n "$NS" get pod "$PROBE_POD" -o jsonpath='{.spec.nodeName}')
+[ -n "$PROBE_POD_NODE" ] || { echo "FATAL: could not read the probe pod's node (.spec.nodeName is empty)"; exit 2; }
+CONTROL_POD="cni-probe-control"
+echo "   creating control pod (no policy, pinned to node $PROBE_POD_NODE)..."
+cat > "$TMPDIR/control.yaml" <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${CONTROL_POD}
+  namespace: ${NS}
+  labels:
+    app.kubernetes.io/component: cni-control
+spec:
+  automountServiceAccountToken: false
+  restartPolicy: Never
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchFields:
+              - key: metadata.name
+                operator: In
+                values:
+                  - ${PROBE_POD_NODE}
+  containers:
+    - name: probe
+      image: ${PROBE_IMAGE}
+      command: ["python3", "-c", "import time; time.sleep(999999)"]
+EOF
+K -n "$NS" apply -f "$TMPDIR/control.yaml" >/dev/null
+READY=""
+for i in $(seq 1 60); do
+  PHASE=$(K -n "$NS" get pod "$CONTROL_POD" -o jsonpath='{.status.phase}' 2>/dev/null)
+  READYC=$(K -n "$NS" get pod "$CONTROL_POD" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)
+  if [ "$PHASE" = "Running" ] && [ "$READYC" = "True" ]; then READY=yes; break; fi
+  [ "$PHASE" = "Failed" ] && break
+  sleep 5
+done
+[ "$READY" = "yes" ] || { echo "FATAL: control pod did not become Ready in 300s (check: kubectl --context $CTX -n $NS describe pod $CONTROL_POD)"; exit 2; }
+echo "   control pod Ready on node $PROBE_POD_NODE"
+
 echo
-echo "--- STEP 2: TCP-connect probes from the probe pod ---"
+echo "--- STEP 2: TCP-connect probes from the probe pod (policy pass) + control pod (no-policy pass) ---"
 # The probe is a raw TCP-CONNECT test — the exact layer the CNI polices —
 # classified exactly as the operator's own CNI self-test classifies it
 # (internal/cni/pod_prober.go; F51b):
@@ -338,8 +387,10 @@ def probe(label, host, port, timeout=4):
         print("RESULT %s REACHABLE" % label)
     except ConnectionRefusedError:
         # The peer answered with a refusal: the packet reached it, so the
-        # connect was NOT dropped by any policy. UNRESOLVED, never BLOCKED.
-        print("RESULT %s UNRESOLVED(refused)" % label)
+        # connect was NOT dropped by any policy. REFUSED (the combine step
+        # below turns a policy REFUSED + control REACHABLE into BLOCKED,
+        # and a policy REFUSED + control REFUSED into NOT_LISTENING).
+        print("RESULT %s REFUSED" % label)
     except Exception as exc:
         print("RESULT %s BLOCKED(%s)" % (label, type(exc).__name__))
     finally:
@@ -352,21 +403,34 @@ for ip in os.environ["NODE_IPS"].split():
 probe("CROSS_NS_POD(kube-dns)", os.environ["DNS_POD_IP"], 8080)
 probe("EXTERNAL", os.environ["EXTERNAL_IP"], 443)
 PYEOF
-K -n "$NS" cp "$TMPDIR/probe.py" "$PROBE_POD:/tmp/verify-cni-probe.py" >/dev/null 2>&1 || { echo "FATAL: kubectl cp probe.py failed"; exit 2; }
+K -n "$NS" cp "$TMPDIR/probe.py" "$PROBE_POD:/tmp/verify-cni-probe.py" >/dev/null 2>&1 || { echo "FATAL: kubectl cp probe.py (policy pass) failed"; exit 2; }
+K -n "$NS" cp "$TMPDIR/probe.py" "$CONTROL_POD:/tmp/verify-cni-probe.py" >/dev/null 2>&1 || { echo "FATAL: kubectl cp probe.py (control pass) failed"; exit 2; }
+echo "   policy pass (pod $PROBE_POD, under the NetworkPolicy):"
 K -n "$NS" exec "$PROBE_POD" -- sh -c "APISERVER_SVC_IP=${APISERVER_SVC_IP} NODE_IPS='${NODE_IPS_ENV}' DNS_POD_IP=${DNS_POD_IP} EXTERNAL_IP=${EXTERNAL_IP} python3 /tmp/verify-cni-probe.py" > "$TMPDIR/results.txt" 2>&1
 EXEC_RC=$?
 if [ $EXEC_RC -ne 0 ]; then
-  echo "FATAL: the probe exec exited with rc=$EXEC_RC — the probe could not run."
+  echo "FATAL: the policy-pass probe exec exited with rc=$EXEC_RC — the probe could not run."
   echo "      (Check the probe image: $PROBE_IMAGE must ship python3.)"
   echo "      --- raw probe output ---"
   cat "$TMPDIR/results.txt"
   exit 2
 fi
 cat "$TMPDIR/results.txt"
-[ -s "$TMPDIR/results.txt" ] || { echo "FATAL: the probe produced no output (check the pod: kubectl --context $CTX -n $NS logs $PROBE_POD)"; exit 2; }
+[ -s "$TMPDIR/results.txt" ] || { echo "FATAL: the policy pass produced no output (check the pod: kubectl --context $CTX -n $NS logs $PROBE_POD)"; exit 2; }
+echo "   control pass (pod $CONTROL_POD, no NetworkPolicy, same node):"
+K -n "$NS" exec "$CONTROL_POD" -- sh -c "APISERVER_SVC_IP=${APISERVER_SVC_IP} NODE_IPS='${NODE_IPS_ENV}' DNS_POD_IP=${DNS_POD_IP} EXTERNAL_IP=${EXTERNAL_IP} python3 /tmp/verify-cni-probe.py" > "$TMPDIR/results-control.txt" 2>&1
+EXEC_RC=$?
+if [ $EXEC_RC -ne 0 ]; then
+  echo "FATAL: the control-pass probe exec exited with rc=$EXEC_RC — the probe could not run."
+  echo "      --- raw probe output ---"
+  cat "$TMPDIR/results-control.txt"
+  exit 2
+fi
+cat "$TMPDIR/results-control.txt"
+[ -s "$TMPDIR/results-control.txt" ] || { echo "FATAL: the control pass produced no output (check the pod: kubectl --context $CTX -n $NS logs $CONTROL_POD)"; exit 2; }
 
 echo
-echo "--- RESULT ---"
+echo "--- RESULT (combined: policy pass + no-policy control pass; D103 combineVerdicts) ---"
 printf '%-45s %s\n' "endpoint (expected: BLOCKED)" "result"
 echo "-------------------------------------------------------------"
 # host-network targets only (service IP, node :6443/:10250) are the
@@ -377,64 +441,138 @@ echo "-------------------------------------------------------------"
 # KUBELET_NODE per node) + 1 (CROSS_NS_POD) + 1 (EXTERNAL) = 3 + 2*node_count
 # >>> verify-cni-classify (executed verbatim by test/e2e/d38-probe-selftest.sh)
 EXPECTED_TOTAL=$((3 + 2 * $(echo $NODE_IPS | wc -w)))
-HOSTNET_FAIL=0
-HOSTNET_UNPROVEN=0
-TOTAL_FAIL=0
+REACHABLE_COUNT=0
+UNRESOLVED_COUNT=0
+NOT_LISTENING_COUNT=0
 TOTAL=0
-SEEN_LABELS=""
 PROBE_ERROR=0
-while read -r line; do
-  case "$line" in
-    RESULT\ *)
-      label=$(echo "$line" | awk '{print $2}' | cut -d'(' -f1)
-      TOTAL=$((TOTAL + 1))
-      # Check for duplicate labels (each must appear exactly once)
-      if echo "$SEEN_LABELS" | grep -qxF "$label"; then
-        echo "ERROR: duplicate label $label in probe output" >&2
-        PROBE_ERROR=1
-      fi
-      SEEN_LABELS="$SEEN_LABELS$label\n"
-      case "$line" in
-        *REACHABLE*)
-          status="REACHABLE  <-- CNI LET IT THROUGH"
-          TOTAL_FAIL=$((TOTAL_FAIL + 1))
-          case "$line" in
-            *APISERVER_SVC*|*APISERVER_NODE*|*KUBELET_NODE*) HOSTNET_FAIL=$((HOSTNET_FAIL + 1)) ;;
-          esac
-          ;;
-        *UNRESOLVED*)
-          # No address, or the peer REFUSED: the packet was not dropped, so
-          # enforcement is UNPROVEN here — never a pass (F51b).
-          status="UNRESOLVED  <-- NOT MEASURABLE (not a pass)"
-          TOTAL_FAIL=$((TOTAL_FAIL + 1))
-          case "$line" in
-            *APISERVER_SVC*|*APISERVER_NODE*|*KUBELET_NODE*) HOSTNET_UNPROVEN=$((HOSTNET_UNPROVEN + 1)) ;;
-          esac
-          ;;
-        *BLOCKED*) status="BLOCKED" ;;
-        *) status="UNKNOWN: $line"; TOTAL_FAIL=$((TOTAL_FAIL + 1)) ;;
-      esac
-      printf '%-45s %s\n' "$label" "$status"
-      ;;
-    "")
-      ;; # skip blank lines
-    *)
-      # Any non-RESULT line is an error (probe crashed, stderr leaked, etc.)
-      echo "ERROR: non-RESULT line in probe output: $line" >&2
-      PROBE_ERROR=1
-      ;;
-  esac
-done < "$TMPDIR/results.txt"
+POLICY_VERDICTS=""
+CONTROL_VERDICTS=""
 
-# Strict validation: TOTAL must equal EXPECTED_TOTAL, and there must be no
-# probe errors. This prevents a FALSE-PASS when the probe can't run
-# (e.g. image without python3 → empty results.txt → TOTAL=0 → PASS).
-if [ "$PROBE_ERROR" -eq 1 ] || [ "$TOTAL" -ne "$EXPECTED_TOTAL" ]; then
-  echo "FATAL: probe output validation failed (TOTAL=$TOTAL, EXPECTED=$EXPECTED_TOTAL, PROBE_ERROR=$PROBE_ERROR)."
-  echo "      --- raw probe output ---"
+# parse_pass <file>: strict parse of one pass's RESULT lines into
+# "label<TAB>verdict" lines (stdout). Returns 0 on success, 1 on any
+# validation error (duplicate label, non-RESULT line, wrong count).
+# Duplicate detection is per-file (the same label in both passes is expected).
+parse_pass() {
+  local file="$1" lines="" t=0 label verdict seen="" err=0
+  while IFS= read -r line; do
+    case "$line" in
+      RESULT\ *)
+        # D103 (C1, multi-node): keep the FULL label (e.g.
+        # APISERVER_NODE(10.0.0.2)) as the identity. Truncating at `(` made
+        # every node's label collide ("duplicate label APISERVER_NODE" on any
+        # multi-node cluster) and made the control lookup return the first
+        # node's control verdict for every node. The host-network test below
+        # uses `$1 ~ /^APISERVER_NODE/`, which works on the full label.
+        label=$(echo "$line" | awk '{print $2}')
+        verdict=$(echo "$line" | awk '{print $3}')
+        t=$((t + 1))
+        if printf '%s\n' "$seen" | grep -qxF "$label"; then
+          echo "ERROR: duplicate label $label in $file" >&2
+          err=1
+        fi
+        seen="${seen}${seen:+$'\n'}${label}"
+        case " $verdict " in
+          *"REACHABLE"*)   lines="${lines}${lines:+$'\n'}${label}$(printf '\t')REACHABLE" ;;
+          *"REFUSED"*)     lines="${lines}${lines:+$'\n'}${label}$(printf '\t')REFUSED" ;;
+          *"BLOCKED"*)     lines="${lines}${lines:+$'\n'}${label}$(printf '\t')BLOCKED" ;;
+          *"UNRESOLVED"*)  lines="${lines}${lines:+$'\n'}${label}$(printf '\t')UNRESOLVED" ;;
+          *) echo "ERROR: unrecognised result in $file: $line" >&2; err=1 ;;
+        esac
+        ;;
+      "")
+        ;; # skip blank lines
+      *)
+        echo "ERROR: non-RESULT line in $file: $line" >&2
+        err=1
+        ;;
+    esac
+  done < "$file"
+  if [ "$t" -ne "$EXPECTED_TOTAL" ]; then
+    echo "ERROR: $file has $t RESULT lines, expected $EXPECTED_TOTAL" >&2
+    err=1
+  fi
+  printf '%s' "$lines"
+  return $err
+}
+
+POLICY_VERDICTS=$(parse_pass "$TMPDIR/results.txt") || PROBE_ERROR=1
+CONTROL_VERDICTS=$(parse_pass "$TMPDIR/results-control.txt") || PROBE_ERROR=1
+
+# Strict validation: both passes must have the exact expected label count,
+# with no duplicates or non-RESULT lines. This prevents a FALSE-PASS when a
+# pass can't run (e.g. image without python3 → empty results.txt → PASS).
+TOTAL=0
+if [ "$PROBE_ERROR" -eq 1 ]; then
+  echo "FATAL: probe output validation failed (EXPECTED=$EXPECTED_TOTAL, PROBE_ERROR=$PROBE_ERROR)."
+  echo "      --- policy pass ---"
   cat "$TMPDIR/results.txt"
+  echo "      --- control pass ---"
+  cat "$TMPDIR/results-control.txt"
   exit 2
 fi
+
+# combine_pass <policy-label> <control-raw> -> combined verdict, exactly the
+# D103 table (internal/cni/pod_prober.go combineVerdicts):
+#   policy REACHABLE                          -> REACHABLE
+#   policy BLOCKED                            -> BLOCKED
+#   policy REFUSED + control REACHABLE        -> BLOCKED
+#   policy REFUSED + control REFUSED          -> NOT_LISTENING
+#   policy REFUSED + control BLOCKED/UNRESOLVED/missing -> UNRESOLVED
+#   policy UNRESOLVED                         -> UNRESOLVED
+#   policy missing                            -> UNRESOLVED (no baseline)
+combine_pass() {
+  case "$1" in
+    REACHABLE) echo "REACHABLE" ;;
+    BLOCKED) echo "BLOCKED" ;;
+    REFUSED)
+      case "$2" in
+        REACHABLE) echo "BLOCKED" ;;
+        REFUSED) echo "NOT_LISTENING" ;;
+        *) echo "UNRESOLVED" ;;
+      esac ;;
+    *) echo "UNRESOLVED" ;;
+  esac
+}
+
+TAB=$(printf '\t')
+COMBINED_VERDICTS=""
+while IFS="$TAB" read -r label pverdict; do
+  [ -n "$label" ] || continue
+  TOTAL=$((TOTAL + 1))
+  cverdict=$(printf '%s' "$CONTROL_VERDICTS" | awk -F'\t' -v l="$label" '$1==l {print $2; exit}')
+  verdict=$(combine_pass "$pverdict" "$cverdict")
+  COMBINED_VERDICTS="${COMBINED_VERDICTS}${COMBINED_VERDICTS:+$'\n'}${label}$(printf '\t')${verdict}"
+  case "$verdict" in
+    REACHABLE)
+      status="REACHABLE  <-- CNI LET IT THROUGH"
+      REACHABLE_COUNT=$((REACHABLE_COUNT + 1))
+      ;;
+    BLOCKED) status="BLOCKED" ;;
+    NOT_LISTENING)
+      status="NOT_LISTENING  <-- nothing listens there (excluded from the verdict)"
+      NOT_LISTENING_COUNT=$((NOT_LISTENING_COUNT + 1))
+      ;;
+    *)
+      status="UNRESOLVED  <-- NOT MEASURABLE (not a pass)"
+      UNRESOLVED_COUNT=$((UNRESOLVED_COUNT + 1))
+      ;;
+  esac
+  printf '%-45s %s\n' "$label" "$status"
+done <<< "$POLICY_VERDICTS"
+
+# Verdict (D103 decide, mirrored in shell): APISERVER_SVC combined BLOCKED +
+# at least one host-network target combined BLOCKED, and no UNRESOLVED or
+# REACHABLE rows -> CNI_ENFORCED=1. A REACHABLE row is a CNI failure;
+# everything else short of that is UNPROVEN.
+CNI_ENFORCED=0
+if [ "$REACHABLE_COUNT" -eq 0 ] && [ "$UNRESOLVED_COUNT" -eq 0 ] \
+  && [ "$(printf '%s' "$COMBINED_VERDICTS" | awk -F'\t' '$1=="APISERVER_SVC" {print $2; exit}')" = "BLOCKED" ] \
+  && { printf '%s' "$COMBINED_VERDICTS" | awk -F'\t' '$2=="BLOCKED" && $1 ~ /^APISERVER_NODE/ {r=1; next} $2=="BLOCKED" && $1 ~ /^KUBELET_NODE/ {r=1} END {exit r?0:1}'; }; then
+  CNI_ENFORCED=1
+fi
+# TOTAL_FAIL is the legacy failure count for the verdict section below.
+TOTAL_FAIL=$((REACHABLE_COUNT + UNRESOLVED_COUNT))
 # <<< verify-cni-classify
 
 # ---------------------------------------------------------------------------
@@ -556,32 +694,41 @@ PYEOF
 fi
 
 echo
-if [ "$TOTAL_FAIL" -eq 0 ]; then
+if [ "$CNI_ENFORCED" -eq 1 ]; then
   CNI_NOTE=$(K -n kube-system get pod -o json 2>/dev/null | python3 -c "import sys,json; names={p['spec']['containers'][0]['name'] for p in json.load(sys.stdin)['items']}; print('likely ' + ', '.join(sorted(n for n in names if 'calico' in n or 'cilium' in n or 'flannel' in n or 'kindnet' in n or 'weave' in n)))" 2>/dev/null)
-  echo "PASS: every probe was BLOCKED by the NetworkPolicy, including the host-network"
-  echo "     targets (apiserver svc IP, node :6443/:10250). This CNI ($CNI_NOTE) polices"
-  echo "     pod -> host-network egress: it satisfies the D38 production requirement."
-  echo "     The D38 property (a pod under the agent's allowlist NetworkPolicy cannot reach"
-  echo "     host-network destinations) HOLDS on this cluster."
+  echo "PASS: the policy pass was BLOCKED on the apiserver svc and a host-network"
+  echo "     target (node :6443/:10250), and no row was REACHABLE or not measurable."
+  echo "     The control pass (no NetworkPolicy, same node) supplies the baseline: a"
+  echo "     refused-by-policy connection the control pass could reach counts as"
+  echo "     BLOCKED; rows nothing listens on are NOT_LISTENING and excluded."
+  if [ "$NOT_LISTENING_COUNT" -gt 0 ]; then
+    echo "     ($NOT_LISTENING_COUNT rows were NOT_LISTENING: shown in the table above,"
+    echo "      excluded from the verdict — nothing listens there at all.)"
+  fi
+  echo "     This CNI ($CNI_NOTE) polices pod -> host-network egress: it satisfies the"
+  echo "     D38 production requirement. The D38 property (a pod under the agent's"
+  echo "     allowlist NetworkPolicy cannot reach host-network destinations) HOLDS on"
+  echo "     this cluster."
   exit 0
 else
-  echo "FAIL: $TOTAL_FAIL of $TOTAL probe targets were REACHABLE despite the NetworkPolicy"
-  if [ "$HOSTNET_FAIL" -gt 0 ]; then
-    echo "      (host-network targets reached: $HOSTNET_FAIL). This CNI does NOT police pod ->"
-    echo "      host-network egress: it does NOT satisfy the D38 production requirement."
+  # R46 I209: report the counts separately — N REACHABLE, M not measurable
+  # (UNRESOLVED), K not listening. Never call a non-REACHABLE row REACHABLE.
+  echo "CNI check: $REACHABLE_COUNT REACHABLE (the CNI let it through), $UNRESOLVED_COUNT not measurable (UNRESOLVED), $NOT_LISTENING_COUNT not listening"
+  if [ "$REACHABLE_COUNT" -gt 0 ]; then
+    echo "FAIL: $REACHABLE_COUNT of $TOTAL probe targets were REACHABLE despite the NetworkPolicy."
+    echo "      This CNI does NOT police pod -> host-network egress: it does NOT satisfy"
+    echo "      the D38 production requirement."
     echo "      Remedy: run a CNI that enforces NetworkPolicy egress against host-network and"
     echo "      node destinations — verified: Calico v3.30.1 (make d38-cni-e2e); to be"
     echo "      confirmed with this check: Cilium, GKE Dataplane V2, EKS VPC CNI + network"
     echo "      policy, AKS."
-  elif [ "$HOSTNET_UNPROVEN" -gt 0 ]; then
-    echo "      (host-network targets NOT MEASURABLE: $HOSTNET_UNPROVEN — a refused or"
-    echo "      unresolvable target proves nothing about enforcement). The D38 property is"
-    echo "      UNPROVEN on this cluster, not shown to hold: re-run where the probe pod can"
-    echo "      resolve and reach the apiserver/node targets."
-  else
-    echo "      (only pod-IP/external targets reached; host-network targets were blocked.)"
-    echo "      Remedy: investigate why the CNI let those through (policy enforcement is"
-    echo "      working for host-network egress; check pod-to-pod / external enforcement)."
+    exit 1
   fi
+  echo "UNPROVEN: no target was REACHABLE, but $UNRESOLVED_COUNT of $TOTAL rows were not"
+  echo "      measurable (UNRESOLVED: the connect was not dropped — a refusal, no address,"
+  echo "      or the control pass could not establish a baseline) and the pass conditions"
+  echo "      (APISERVER_SVC BLOCKED + at least one host-network target BLOCKED) are not"
+  echo "      met. The D38 property is UNPROVEN on this cluster, not shown to hold:"
+  echo "      re-run where the policy and control passes can both measure the targets."
   exit 1
 fi

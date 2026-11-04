@@ -14,28 +14,5 @@
 
 package cni
 
-import (
-	corev1 "k8s.io/api/core/v1"
-)
-
-// pod returns a pod whose probe container has terminated with the given exit
-// code and stdout as its termination message.
-func pod(stdout string, exit int32) *corev1.Pod {
-	return &corev1.Pod{
-		Status: corev1.PodStatus{
-			Phase: corev1.PodSucceeded,
-			ContainerStatuses: []corev1.ContainerStatus{
-				{
-					Name: "probe",
-					State: corev1.ContainerState{
-						Terminated: &corev1.ContainerStateTerminated{
-							ExitCode: exit,
-							Message:  stdout,
-							Reason:   "Completed",
-						},
-					},
-				},
-			},
-		},
-	}
-}
+// (The single-pass test helper `pod` used here was removed with the
+// single-pass parse(); slice B tests drive Probe() through the run seam.)

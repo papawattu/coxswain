@@ -447,6 +447,27 @@ kubectl debug -it <a coxswain pod> --image=busybox
 
 If the check in step 1 shows two bindings for one release, keep the literal `coxswain-deny-ephemeral-containers` and delete the other.
 
+### The CNI probe runs a second, no-policy pod (D103)
+
+The D38 CNI probe now runs **TWO pods** in `coxswain-cni-probe` (D103, #392):
+`coxswain-cni-probe-control` first (its label is not selected by the probe's
+NetworkPolicy, so **no policy applies** — it is the baseline that tells a
+policy-induced REJECT from a port nothing listens on), then
+`coxswain-cni-probe` on the same node under the allow-list. Both passes share
+the probe timeout, which now **defaults to 120s** (it was 60s).
+
+**If you set `--cni-probe-timeout` explicitly to 60s, raise it** (120s is a
+safe floor): the two passes now share the one timeout, so the old value halves
+each pass's time and a slow node can tip the probe into `ProbeUnavailable`.
+
+No config change is otherwise needed; both probe pods are operator-managed —
+each pass's pod is deleted right after that pass, and any leftover is removed
+by the cleanup at the start of the next probe. One behavioural note: a cluster
+that previously reported `ProbeUnavailable` because every target was refused
+(a refusing policy controller, e.g. k3s's embedded one) may now report
+`CNIEnforced` — the control pass is what makes a REJECT-style controller
+measurable, not a behaviour change in the CNI.
+
 ## Stricter Secret-name validation (F48)
 
 `spec.workspace.gitCredentialSecret` and `spec.agent.endpointSecretRef` are

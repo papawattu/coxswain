@@ -16,6 +16,7 @@ see `docs/QUICKSTART.md`.
 - [Uninstall](#uninstall)
 - [What the sandbox can and cannot reach](#what-the-sandbox-can-and-cannot-reach)
   - [ClusterAgentPolicy (P6a)](#clusteragentpolicy-p6a)
+  - [How the network probe measures enforcement (D103)](#how-the-network-probe-measures-enforcement-d103)
 - [Reading the egress proxy log](#reading-the-egress-proxy-log)
 - [Pinning Loops to a node pool (C2)](#pinning-loops-to-a-node-pool-c2)
 - [k3s / flannel / SMB profile (C3)](#k3s--flannel--smb-profile-c3)
@@ -544,6 +545,16 @@ field is the most useful diagnostic:
 - `CNIUnenforced` → the network gate is not satisfied. The CNI does not
   enforce NetworkPolicy. Either install an enforcing CNI (Calico) or use the
   `--allow-unenforced-network` escape hatch (dev only).
+- `ProbeUnavailable` → the network probe ran but could not measure the fence
+  because a row came out **UNRESOLVED** (a target could not be resolved, or it
+  was refused while the no-policy control pod was BLOCKED or UNRESOLVED for it),
+  or the DNS positive control was not REACHABLE in both passes, or no
+  host-network target was measured BLOCKED, or a pass could not run (timed
+  out, went not-Ready, or exited non-zero). A target refused by **both** the
+  probe pod and the control pod combines to NOT_LISTENING — that is shown, not
+  counted, and is not a `ProbeUnavailable` by itself. The condition's message
+  names what was not measurable. Re-run the standalone check to see the
+  per-target table: run `make verify-cni`.
 - `PolicyEnforced=False` → the KubeArmor policy gate is not enforced. Check
   that KubeArmor is installed and the BPF-LSM hooks are active.
 
@@ -750,6 +761,54 @@ Reference policies ship in `config/samples/policies/`: a minimal `default-deny`
 and a `go-toolchain` network allow list. They are ordinary AgentPolicy objects
 (inert until a Loop references one via `spec.policyRefs`) and are included in
 `kubectl apply -k config/samples`.
+
+### How the network probe measures enforcement (D103)
+
+The operator's CNI probe (`internal/cni/pod_prober.go`, run by the Regate
+source that sets the `CNIEnforced` / `CNIUnenforced` /
+`ProbeUnavailable` result) measures the cluster's NetworkPolicy enforcement
+by running **TWO pods** in the fixed `coxswain-cni-probe` namespace, both
+within the probe timeout (`--cni-probe-timeout`, default 120s, `cmd/main.go`):
+
+1. `coxswain-cni-probe-control` — **no NetworkPolicy applies** to it (its
+   label is not selected by the probe netpol). It runs first and establishes
+   the baseline: what each target looks like with no policy at all. Its node
+   assignment is read back, and
+2. `coxswain-cni-probe` — the same spec under the probe's allow-list
+   NetworkPolicy (egress to DNS only), **pinned to the control pod's node**
+   so both passes measure the same node's host-network targets.
+
+Each pass probes a fixed set of targets and reports a per-target verdict. The
+passes are combined per target (`combineVerdicts`) and the D103 rules apply:
+
+| Policy pass | Control pass | Combined |
+|---|---|---|
+| REACHABLE | — | **REACHABLE** (the CNI let it through) |
+| BLOCKED | — | **BLOCKED** (a real drop) |
+| REFUSED | REACHABLE | **BLOCKED** (the policy made the CNI reject; the controller enforces) |
+| REFUSED | REFUSED | **NOT_LISTENING** (nothing listens there at all) |
+| otherwise (UNRESOLVED, or a REFUSED against a BLOCKED control) | | **UNRESOLVED** |
+
+The verdict (`decide`):
+
+- **`CNIEnforced`** needs the apiserver Service (ClusterIP :443) measured
+  **BLOCKED** and at least one node port (node :6443 or :10250) measured
+  **BLOCKED** — a service route AND a host-network route fenced. Rows that
+  combined to **NOT_LISTENING** are shown in the detail but **not counted**:
+  some policy controllers refuse a policy-denied connection instead of
+  silently dropping it — the homelab k3s run of 2026-11-04 observed every
+  target refused, including 1.1.1.1:443, which is consistent with such a
+  controller, though the RST cause was not verified — and a no-policy baseline
+  is what separates a policy-induced refusal from a port nothing listens on.
+  That is exactly why the second, no-policy pod exists.
+- **`CNIUnenforced`** if any expected-BLOCKED target combined REACHABLE.
+- **`ProbeUnavailable`** if any row is UNRESOLVED (the detail names the
+  target), the DNS positive control was not REACHABLE in both passes, or no
+  host-network target was measurable at all.
+
+The same two-pass shape is what `make verify-cni`
+(`test/e2e/verify-cni.sh`, control pod `cni-probe-control`) and `make
+d38-cni-e2e` check on demand.
 
 ### ClusterAgentPolicy (P6a)
 
@@ -1100,14 +1159,26 @@ differing → the embedded controller enforces the policy. The probe got
 `Connection refused`.
 
 **What this means for coxswain's D38 gate:** the operator's CNI probe
-(`internal/cni/pod_prober.go`) runs its own self-test pod and checks whether
-the CNI enforces NetworkPolicy. The D38 probe is **not yet verified** on
-this cluster. H4 above proves the controller enforces Ingress pod-to-pod;
-the D38 probe tests Egress to host-network destinations (apiserver
-ClusterIP :443, node :6443, node :10250). Run `make verify-cni
-K8S_CONTEXT=<ctx>` before a coxswain run and expect
-`NetworkEnforced=True`; if it reports `CNIUnenforced`, the operator holds
-Loops Suspended.
+(`internal/cni/pod_prober.go`) runs its own probe pods ("How the network
+probe measures enforcement (D103)" above) and checks whether the CNI
+enforces NetworkPolicy. H4 above proves the controller enforces Ingress
+pod-to-pod; the D38 probe tests Egress to host-network destinations
+(apiserver ClusterIP :443, node :6443, node :10250).
+
+**2026-11-04 result (pre-D103 probe):** `make verify-cni` on this cluster
+gave all 37 probe targets `UNRESOLVED(refused)` — every target, including
+the external 1.1.1.1:443, was connection-refused rather than dropped. The
+probe had no no-policy baseline, so a refusal could not be told apart from
+a policy rejection: the run was **UNPROVEN**, not a pass or a failure. That
+is exactly what D103's two-pass probe fixes: the no-policy control pod
+(`coxswain-cni-probe-control`) is what lets a REJECT-style policy controller
+be measured (a target that refuses under policy but the control pod reaches
+combines to BLOCKED, i.e. enforcement).
+
+**The re-run of `make verify-cni` on this cluster with the D103 probe has
+not been done yet** — the reviewer will add the result. Run `make verify-cni
+K8S_CONTEXT=<ctx>` before a coxswain run and expect `NetworkEnforced=True`;
+if it reports `CNIUnenforced`, the operator holds Loops Suspended.
 
 **Check the k3s embedded controller is on:**
 
@@ -1191,7 +1262,7 @@ kubectl -n coxswain-system patch deploy coxswain-controller-manager \
 | agent-sandbox controller (v1.0.4) | **Not installed** | H1: `kubectl apply -f https://github.com/kubernetes-sigs/agent-sandbox/releases/download/v1.0.4/sandbox.yaml` |
 | KubeArmor BPF-LSM (policy gate, ADR-0007) | **Not installed; BPF-LSM requires `lsm=…,bpf` on kernel cmdline** | H5: enable BPF-LSM on pool nodes only, then install KubeArmor v1.7.5 with a nodeSelector to the pool |
 | VolumeSnapshot CRDs + snapshot-controller + VolumeSnapshotClass (checkpoints, fork, rollback) | **Not installed** (no snapshot CRDs found; ceph-csi's csi-snapshotter sidecar is present but there is no controller or class) | H1: install external-snapshotter CRDs + controller + a VolumeSnapshotClass for `rbd.csi.ceph.com` (the default StorageClass). Until this lands, `spec.checkpoints: Required` Loops will fail at start with `Failed:CheckpointUnavailable`; the default (best-effort) path sets `CheckpointsAvailable=False` and carries on |
-| flannel + k3s embedded network-policy controller (D38 gate) | **On by default** (H4 evidence above; 32 NetworkPolicies in use) | Confirm `disable-network-policy` is absent from the k3s config / unit / cmdline; the D38 CNI probe is **not yet verified** (H4 proved Ingress pod-to-pod; the D38 probe tests Egress to host-network destinations) — run `make verify-cni K8S_CONTEXT=<ctx>` before a coxswain run |
+| flannel + k3s embedded network-policy controller (D38 gate) | **On by default** (H4 evidence above; 32 NetworkPolicies in use) | Confirm `disable-network-policy` is absent from the k3s config / unit / cmdline; pre-D103 `make verify-cni` on 2026-11-04 gave all 37 targets REFUSED (UNPROVEN — the k3s embedded controller REJECTs rather than drops), and the D103 two-pass re-run has not been done yet — run `make verify-cni K8S_CONTEXT=<ctx>` before a coxswain run |
 | Multi-arch images (C1) | **Not yet** — release images are amd64-only | C1 (`.github/workflows/release.yml`) is an owner push. Until it lands, arm64 nodes cannot pull the release images. The homelab plan (H2) recommends tainting pi13 `kubernetes.io/arch=arm64:NoSchedule` until C1 merges |
 | `--loop-node-selector` / `--loop-tolerations` (C2) | **Merged** (main) | Use the C2 flags to pin Loops to a dedicated amd64 pool (the H2 pool) |
 | NetworkPolicy count | 32 existing NetworkPolicies | The D38 probe applies its own netpol in `coxswain-cni-probe`; the existing 32 do not interfere |
@@ -1203,12 +1274,14 @@ records what was verified from the coxswain side on 2026-11-03:
 
 - **H3 (SMB memory):** ✅ Verified (evidence above). The `smb` StorageClass
   works as a RWX class for the memory PVC on this cluster.
-- **H4 (flannel network gate):** ⚠️ Partly verified (Ingress pod-to-pod
-  only; the D38 egress probe not yet run — see above). The k3s embedded
-  network-policy controller enforces Ingress pod-to-pod NetworkPolicy
-  (H4 evidence above); the D38 CNI probe (Egress to host-network
-  destinations) is not yet verified — run `make verify-cni
-  K8S_CONTEXT=<ctx>` before a coxswain run.
+- **H4 (flannel network gate):** ⚠️ Partly verified. The k3s embedded
+  network-policy controller enforces Ingress pod-to-pod NetworkPolicy (H4
+  evidence above). The D38 egress probe HAS been run on 2026-11-04 but gave
+  all 37 targets REFUSED, i.e. **UNPROVEN** (pre-D103: no no-policy baseline
+  to tell a REJECT-style controller's rejection from a real refusal). The
+  D103 two-pass re-run that can turn that into a verdict has **not been done
+  yet** — run `make verify-cni K8S_CONTEXT=<ctx>` before a coxswain run.
+  This line stays ⚠️ until that re-run is recorded.
 - **H1 (agent-sandbox + VolumeSnapshot):** ❌ Not yet. The agent-sandbox
   controller is not installed; the VolumeSnapshot CRDs and
   VolumeSnapshotClass are not installed. Checkpoints and fork/rollback are

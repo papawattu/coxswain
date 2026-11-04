@@ -609,6 +609,21 @@ func TestDecideRules(t *testing.T) {
 			t.Fatalf("Rows must carry all %d labels, got %d", expectedResultLen, len(res.Rows))
 		}
 	})
+	t.Run("rule 4/5: APISERVER_SVC BLOCKED but every host-network target NOT_LISTENING -> ProbeUnavailable", func(t *testing.T) {
+		// Rule 4 fails on the host-network term (not the apiserver term):
+		// the apiserver svc being blocked alone must not read CNIEnforced
+		// when nothing on the node was measurable. This is the case
+		// mutation A3 (drop the host-network term) must fail.
+		combined := full(map[string]string{
+			"APISERVER_SVC": verdictBlocked, "NODE_API": verdictNotListening,
+			"KUBELET_NODE": verdictNotListening, "EXTERNAL": verdictBlocked,
+			"DNS_POSITIVE": verdictReachable,
+		})
+		res := decide(map[string]string{"DNS_POSITIVE": verdictReachable}, map[string]string{"DNS_POSITIVE": verdictReachable}, combined)
+		if res.Reason != ReasonProbeUnavailable || res.Detail != "no host-network target was measurable" {
+			t.Fatalf("want ProbeUnavailable (no host-network target was measurable), got %v %q", res.Reason, res.Detail)
+		}
+	})
 	t.Run("rule 5: all host-network targets NOT_LISTENING -> ProbeUnavailable", func(t *testing.T) {
 		// REFUSED in both passes for every host-network target (nothing
 		// listens); the apiserver route alone cannot prove the fence.
@@ -699,5 +714,21 @@ func TestParsePassStrict(t *testing.T) {
 				t.Fatalf("error %q must contain %q", err.Error(), tc.wantErr)
 			}
 		})
+	}
+}
+
+// D103 (slice A, R2 P2-2): a repeated label overwrites the map entry but
+// still counts toward expectedResultLen, so APISERVER_SVC twice plus no
+// EXTERNAL line would pass the count check and the missing label would slip
+// through (a CNIEnforced with EXTERNAL never measured). parsePass must reject
+// the duplicate. Reviewer mutation M-A5 (drop the check) must fail this test.
+func TestParsePassRejectsDuplicateLabel(t *testing.T) {
+	msg := "RESULT APISERVER_SVC BLOCKED\nRESULT APISERVER_SVC BLOCKED\nRESULT NODE_API BLOCKED\nRESULT KUBELET_NODE BLOCKED\nRESULT DNS_POSITIVE REACHABLE\nDONE"
+	_, err := parsePass(msg)
+	if err == nil {
+		t.Fatalf("a duplicate label must be an error (it would let a missing label slip the count check), got none")
+	}
+	if !strings.Contains(err.Error(), "duplicate") {
+		t.Fatalf("error %q must name the duplicate label", err.Error())
 	}
 }

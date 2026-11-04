@@ -595,6 +595,12 @@ func parsePass(msg string) (map[string]string, error) {
 		if verdict != verdictReachable && verdict != verdictBlocked && verdict != verdictRefused && verdict != verdictUnresolved {
 			return nil, fmt.Errorf("unrecognised verdict: %s %s", label, verdict)
 		}
+		// A repeated label would overwrite the map entry and still count toward
+		// expectedResultLen, so a missing other label would slip through the
+		// count check (the old row-based parser had the same hole).
+		if _, dup := pass[label]; dup {
+			return nil, fmt.Errorf("duplicate probe target label: %s", label)
+		}
 		pass[label] = verdict
 		seen++
 	}

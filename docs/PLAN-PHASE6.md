@@ -1,7 +1,8 @@
 # Next phase: Phase 6 — policy breadth, defence in depth, and the retry path
 
 **Status:** draft for owner review (docs only; the owner approves before any
-code). Built from the owner's 2026-11-01 decisions: the **homelab readiness
+code). The open decisions D95–D101 are decided (owner, 2026-11-01 and
+2026-11-04); see Owner decisions. Built from the owner's 2026-11-01 decisions: the **homelab readiness
 direction** (running on the homelab is the point of the next phase; the
 homelab side is planned in the homelab repo — `papawattu/homelab` PR #149,
 `docs/coxswain-homelab-readiness-plan.md` — so only the coxswain-side C1–C3
@@ -10,8 +11,9 @@ slices land here, first in the order), **D81(b)** (plan both the
 annotation slice is b2's in-progress work; the ValidatingAdmissionPolicy
 defence in depth is this phase's slice), and **D86** (queue the retry path
 for `Failed:SandboxFailed`). Also carries forward from PLAN.md: the Judge
-sidecar (D60) and the oscillation detector, which land under Questions for
-the owner, not the slice list.
+sidecar (D60), deferred to Phase 7 (owner, 2026-11-04), and the
+oscillation detector, deferred (owner, 2026-11-04); neither lands in this
+phase's slice list.
 
 **What the phase is:** the homelab prerequisites (C1 multi-arch release
 images — the homelab has schedulable arm64 nodes; C2 operator-level node
@@ -103,10 +105,9 @@ losing its history.
     to empty (no placement — today's behaviour).
   - Applied to every operator-owned object that runs Loop work: the
     sandbox (the Sandbox spec), the verify Job, the deliver Job, and the
-    memory-writer Job. The per-Loop model-proxy pod is a question (D101):
-    recommendation — place it the same way (it is Loop-scoped
-    infrastructure, and leaving it on the default pool is an invisible
-    surprise).
+    memory-writer Job. The per-Loop model-proxy pod joins the dedicated pool
+    (decided, owner 2026-11-01, D101): it is Loop-scoped infrastructure, and
+    leaving it on the default pool is an invisible surprise.
   - OPERATOR.md's deployment section: set the flags + a node-pool label +
     a taint, so Loops and only Loops land on the dedicated pool.
 - **Acceptance:**
@@ -127,9 +128,9 @@ losing its history.
   - Mutation: drop the tolerations from the Job specs (keeping the
     nodeSelector) → the "lands on the dedicated node" proof fails on the
     tainted node.
-- **Decisions needed:** D101 (proxy pod placement, recommendation above);
-  flags vs a Loop spec field (recommendation: flags for the first cut — a
-  per-Loop override can follow without breaking the flags).
+- **Decisions needed:** (decided, owner 2026-11-01, D101) the proxy pod
+  joins the pool; flags vs a Loop spec field (recommendation: flags for the
+  first cut — a per-Loop override can follow without breaking the flags).
 - **Done when:** setting the flags pins every operator-owned Loop workload
 to the node pool.
 
@@ -183,9 +184,9 @@ to the node pool.
   - New CRD `ClusterAgentPolicy` (cluster-scoped, same schema as
     `AgentPolicy` — reuse the types, second Kind). A `Loop.spec.policyRefs`
     entry may name a `ClusterAgentPolicy` (a disambiguation rule is needed
-    where a namespace and a cluster policy share a name — recommendation:
-    namespaced wins, and the collision is a Warning Event, not a reject;
-    flag for the owner).
+    where a namespace and a cluster policy share a name — decided, owner
+    2026-11-04, D98: namespaced wins, and the collision is a Warning Event,
+    not a reject).
   - The effective-policy union (ADR-0007 Q2) takes the union across
     both scopes; `status.policy.effectiveHash`
     (`api/v1alpha1/loop_types.go:897-905`) hashes the union of both.
@@ -206,8 +207,8 @@ to the node pool.
   - kind: a Loop in one namespace picks up allows from a
     `ClusterAgentPolicy`; operator log shows zero `forbidden` errors
     (positive control per the R28 I92 norm).
-- **Decisions needed:** the name-collision rule (recommended: namespaced
-  wins + Warning Event).
+- **Decisions needed:** (decided, owner 2026-11-04, D98) the name-collision
+  rule — namespaced wins + Warning Event.
 - **Done when:** an org-wide allow exists once and applies to Loops in any
   namespace that reference it.
 
@@ -222,13 +223,14 @@ to the node pool.
   **never the default**." No audit-only posture exists in code today (no
   `AuditOnly` reason anywhere in `api/` or `internal/`).
 - **What:**
-  - An explicit opt-in (recommended: a field on `AgentPolicy`, e.g.
-    `spec.auditOnly: true` — never defaulted) that makes the engine
+  - An explicit opt-in field on the `AgentPolicy` (and so the
+    `ClusterAgentPolicy`) — `spec.auditOnly: true`, never defaulted — that
+    makes the engine
     **record instead of block** for that policy's allows. The Loop's
     KubeArmorPolicy renders with the audit-only rules; status shows
-    `PolicyEnforced=False` reason `AuditOnly` (new condition/reason —
-    decision needed if the existing `PolicyEnforced` shape cannot carry a
-    per-policy audit subset).
+    `PolicyEnforced=False` reason `AuditOnly` (a new condition/reason if the
+    existing `PolicyEnforced` shape cannot carry a per-policy audit subset —
+    see the condition-shape decision below).
   - The activity-audit stream (already shipped for the eBPF engine, ADR-0007
     Q4) is the recorded source; the suggestion tool reads the Loop's audit
     records (the trusted sources that the operator can read) plus the
@@ -251,10 +253,11 @@ to the node pool.
     saved per the R28 I92 norm).
   - Mutation: make the renderer emit block rules when audit-only is set →
     the `AuditOnly` spec FAILS.
-- **Decisions needed:** where the opt-in lives (policy field vs Loop field —
-  recommendation: policy field); the condition shape if a Loop references
-  both an enforcing and an audit-only policy (recommendation: the condition
-  reflects the *enforcing* policies; the audit subset is recorded in
+- **Decisions needed:** (decided, owner 2026-11-04, D99) the audit-only
+  posture is a field on the `AgentPolicy` (and so the `ClusterAgentPolicy`),
+  not on the Loop; open: the condition shape if a Loop references both an
+  enforcing and an audit-only policy (recommendation: the condition reflects
+  the *enforcing* policies; the audit subset is recorded in
   `status.policy` + an Event).
 - **Done when:** a human can run an agent image once in audit-only and get a
   reviewable starting policy instead of trial and error.
@@ -347,8 +350,8 @@ to the node pool.
     (the CLI refuses; the operator ignores an annotation it did not accept);
     the spec must FAIL when the reason gate is removed.
   - envtest: the annotation clears after acting; re-setting it retries again
-    (bounded? **decision** — recommendation: unbounded, it is explicit human
-    intent, recorded in the decision audit).
+    (unbounded and audited, decided owner 2026-11-04, D100 — the retry is
+    explicit human intent, recorded in the decision audit).
   - CLI unit: `cox retry` refuses non-`SandboxFailed` reasons with the
     reason named in the error.
   - kind: wedge a Loop with a missing git-cred Secret, retry after creating
@@ -358,28 +361,32 @@ to the node pool.
     reaches the bound" spec FAILS.
 - **Decisions needed:** (i) annotation vs `cox retry` — recommendation:
   `cox retry` that *sets* the annotation (matches `redeliver`); (ii)
-  retry bound — recommendation: unbounded, audited; (iii) confirm the
+  retry bound — (decided, owner 2026-11-04, D100) unbounded and audited,
+  only for `SandboxFailed`; the per-episode attempt bound still applies; (iii)
+  confirm the
   resume-from-checkpoint state is the current checkpoint, not the last
   passed verify's (recommendation: same restore path a fresh sandbox uses).
 - **Done when:** the runbook remedy for a mount wedge is "fix the Secret,
   `cox retry <loop>`", with the Loop's history preserved.
 
 ## Explicitly deferred (keep their homes)
-- **The Judge sidecar** (PLAN.md Phase 6, `docs/PLAN.md:90`; D60) — deferred;
-  carried to Questions for the owner below.
+- **The Judge sidecar** (PLAN.md Phase 6, `docs/PLAN.md:90`; D60) — deferred
+  to Phase 7 (owner, 2026-11-04, D95).
 - **The oscillation detector** (PLAN.md Risks, `docs/PLAN.md:124` — "An
   agent that alternates between two failure modes never trips the
   consecutive-hash stall detector. Deferred; needs its own detector.") —
-  carried to Questions for the owner below.
+  deferred (owner, 2026-11-04, D96).
 - **D80(b): the per-node CNI probe** (owner, 2026-11-01). The CNI gate's
   evidence is ONE probe pod on ONE node (`internal/cni/pod_prober.go`); a
   multi-node cluster's non-enforcing node would not be detected. Documented
   as the D80 one-node limit in `docs/TROUBLESHOOTING.md` (D83 PR). The
   per-node probe (one probe pod per node; the gate satisfied only when every
   node passes) is deferred until multi-node clusters are a support target.
-- **The D94 revisit** (F60's out-of-band canary-token channel) — owner
-  question only; see below. Draft #375 (file-side comparison) was closed
-  because the token still reached the agent's package dir.
+- **The D94 revisit** (F60's out-of-band canary-token channel) — decided
+  2026-11-04 (D97): the out-of-band channel goes to Phase 7, with a design
+  note first; D94's accepted limit stands through Phase 6. Draft #375
+  (file-side comparison) was closed because the token still reached the
+  agent's package dir.
 - **The homelab H slices** (`papawattu/homelab` PR #149) — tracked in the
   homelab repo, not this plan; C1–C3 are the coxswain-side prerequisites,
   and C3 blocks on the H3/H4 results.
@@ -439,17 +446,17 @@ to the node pool.
   per Loop (D32), and policy changes apply at the iteration boundary with
   the hash recorded per iteration.
 
-## Questions for the owner
+## Owner decisions
 
-| ID | Question | Recommendation |
-|---|---|---|
-| D95 | **Judge sidecar (PLAN.md:90, D60):** include it in this phase, or keep it deferred to Phase 7? | Keep deferred: it is the one other LLM-judgment surface (like the Memory Curator, ADR-0002) and this phase is already four slices of security-adjacent machinery. Phase 7's hardening theme is its natural home. |
-| D96 | **Oscillation detector (PLAN.md:124):** include it in this phase, or keep it deferred? | Keep deferred: it is a stall-detector extension (a new normalisation + a new detection rule over `status.stallHistory`), independent of every slice here, and the stall gate it complements is working. |
-| D97 | **D94 revisit (F60's open limit, I199):** a real out-of-band canary-token channel — the token travels over a channel the agent's code cannot read (e.g. the canary passes the expected token to the operator out-of-band and the comparison happens operator-side, not file-side). Draft #375 was closed because the token still reached the agent's package dir. Include it in this phase? | **Question only, no slice drafted.** The canary is the negative control for the acceptance checks and the token read is a second-order subversion (R45 D94's own framing); if the owner treats the canary as load-bearing for release, it becomes the next slice after this phase. No design is in the slice list. |
-| D98 | **P6a name-collision rule:** a `policyRefs` entry that names both a namespaced `AgentPolicy` and a `ClusterAgentPolicy` — namespaced wins + Warning Event (recommended), or reject the Loop at admission? | Namespaced wins + Warning Event: a cluster policy is org-wide boilerplate; a namespaced one is the Loop author's explicit choice. Rejecting breaks Loops when an org policy happens to share a name. |
-| D99 | **P6b opt-in location:** the audit-only posture on the `AgentPolicy` (recommended — the engine mode is per-policy) or on the Loop (`spec.policyAuditOnly`)? | Policy field: the posture describes what the *policy* does to its allows, and a Loop that references it inherits the decision in one place. |
-| D100 | **P6d retry bound:** unbounded explicit retries (recommended — human intent, audited) or a per-Loop cap (e.g. 3, then the Loop needs a fork)? | Unbounded + audited: the retry refuses every reason except `SandboxFailed`, which by the F48b design says nothing about the agent's work; the per-episode attempt bound still applies. A cap would force a fork (losing status) for a transient infra class the owner can fix. |
-| D101 | **C2 proxy pod placement:** the per-Loop model-proxy pod is operator-owned (its usage endpoint is read by the operator, `loop_controller.go:577`) — does it join the dedicated pool (recommended), or stay on the default pool as operator-side infrastructure? | Join the pool: a reader who sets the placement flags expects every object the Loop creates to land there; a proxy pod silently on the default pool is the same class of surprise the D38 NetworkPolicy carve-outs exist to document. |
+| ID | Question | Recommendation | Decision |
+|---|---|---|---|
+| D95 | **Judge sidecar (PLAN.md:90, D60):** include it in this phase, or keep it deferred to Phase 7? | Keep deferred: it is the one other LLM-judgment surface (like the Memory Curator, ADR-0002) and this phase is already four slices of security-adjacent machinery. Phase 7's hardening theme is its natural home. | The judge sidecar is **deferred to Phase 7** (owner, 2026-11-04). |
+| D96 | **Oscillation detector (PLAN.md:124):** include it in this phase, or keep it deferred? | Keep deferred: it is a stall-detector extension (a new normalisation + a new detection rule over `status.stallHistory`), independent of every slice here, and the stall gate it complements is working. | The oscillation detector is **deferred** (owner, 2026-11-04). |
+| D97 | **D94 revisit (F60's open limit, I199):** a real out-of-band canary-token channel — the token travels over a channel the agent's code cannot read (e.g. the canary passes the expected token to the operator out-of-band and the comparison happens operator-side, not file-side). Draft #375 was closed because the token still reached the agent's package dir. Include it in this phase? | **Question only, no slice drafted.** The canary is the negative control for the acceptance checks and the token read is a second-order subversion (R45 D94's own framing); if the owner treats the canary as load-bearing for release, it becomes the next slice after this phase. No design is in the slice list. | The canary out-of-band channel goes to **Phase 7, with a design note first** (owner, 2026-11-04). D94's accepted limit stands through Phase 6. |
+| D98 | **P6a name-collision rule:** a `policyRefs` entry that names both a namespaced `AgentPolicy` and a `ClusterAgentPolicy` — namespaced wins + Warning Event (recommended), or reject the Loop at admission? | Namespaced wins + Warning Event: a cluster policy is org-wide boilerplate; a namespaced one is the Loop author's explicit choice. Rejecting breaks Loops when an org policy happens to share a name. | (already decided 2026-11-04) Namespaced wins, plus a Warning Event. Shipped in P6a / #389. |
+| D99 | **P6b opt-in location:** the audit-only posture on the `AgentPolicy` (recommended — the engine mode is per-policy) or on the Loop (`spec.policyAuditOnly`)? | Policy field: the posture describes what the *policy* does to its allows, and a Loop that references it inherits the decision in one place. | The P6b audit-only posture is a **field on the `AgentPolicy`** (and so the `ClusterAgentPolicy`), not on the Loop (owner, 2026-11-04). |
+| D100 | **P6d retry bound:** unbounded explicit retries (recommended — human intent, audited) or a per-Loop cap (e.g. 3, then the Loop needs a fork)? | Unbounded + audited: the retry refuses every reason except `SandboxFailed`, which by the F48b design says nothing about the agent's work; the per-episode attempt bound still applies. A cap would force a fork (losing status) for a transient infra class the owner can fix. | The P6d explicit retry is **unbounded and audited**, only for `SandboxFailed`; the per-episode attempt bound still applies (owner, 2026-11-04). |
+| D101 | **C2 proxy pod placement:** the per-Loop model-proxy pod is operator-owned (its usage endpoint is read by the operator, `loop_controller.go:577`) — does it join the dedicated pool (recommended), or stay on the default pool as operator-side infrastructure? | Join the pool: a reader who sets the placement flags expects every object the Loop creates to land there; a proxy pod silently on the default pool is the same class of surprise the D38 NetworkPolicy carve-outs exist to document. | (decided 2026-11-01) The C2 placement flags pin every Loop pod (owner, 2026-11-01). Shipped in #381. |
 
 ## Estimate
 

@@ -417,6 +417,24 @@ VP "$REACHABLE_P" "$REACHABLE_P" "enforce=0" "kindnet: policy REACHABLE -> not e
 # Both passes all REFUSED -> everything is NOT_LISTENING, no row is
 # REACHABLE, but the pass conditions are not met: UNPROVEN, not a FAIL.
 VP "$REFUSED_P" "$REFUSED_P" "enforce=0" "both passes all REFUSED -> not enforced (UNPROVEN, not a FAIL)"
+# Host-network PASS condition: APISERVER_SVC combined BLOCKED is NOT enough
+# on its own. APISERVER_SVC policy REFUSED + control REACHABLE (BLOCKED);
+# every APISERVER_NODE(*) and KUBELET_NODE(*) REFUSED in BOTH passes
+# (NOT_LISTENING); CROSS_NS_POD and EXTERNAL BLOCKED. No host-network row
+# is combined BLOCKED -> the apiserver term alone must not set enforce.
+# (Catches the mutation that drops the host-network term from CNI_ENFORCED.)
+HOSTNET_POLICY='RESULT APISERVER_SVC REFUSED
+RESULT APISERVER_NODE(10.0.0.1) REFUSED
+RESULT KUBELET_NODE(10.0.0.1) REFUSED
+RESULT CROSS_NS_POD(kube-dns) BLOCKED(TimeoutError)
+RESULT EXTERNAL BLOCKED(TimeoutError)'
+HOSTNET_CONTROL='RESULT APISERVER_SVC REACHABLE
+RESULT APISERVER_NODE(10.0.0.1) REFUSED
+RESULT KUBELET_NODE(10.0.0.1) REFUSED
+RESULT CROSS_NS_POD(kube-dns) BLOCKED
+RESULT EXTERNAL BLOCKED'
+VP "$HOSTNET_POLICY" "$HOSTNET_CONTROL" "enforce=0" "APISERVER_SVC BLOCKED but no host-network target BLOCKED -> not enforced (UNPROVEN)"
+VP "$HOSTNET_POLICY" "$HOSTNET_CONTROL" "reach=0 unres=0 nolist=2" "APISERVER_SVC BLOCKED, 2 host-network rows NOT_LISTENING -> not enforced (UNPROVEN)"
 
 # 4c. The verdict section's FAIL/UNPROVEN wording (R46 I209): the line for a
 # 0-REACHABLE, 0-UNRESOLVED run must not carry the affirmative count form

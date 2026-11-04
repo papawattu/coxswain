@@ -6,13 +6,22 @@
 # Two blocks are extracted VERBATIM from test/e2e/d38-cni-e2e.sh between their
 # sentinels, so this test cannot drift from the e2e:
 #
-#   d38-probe-function  the python probe() — driven against real local sockets:
+#   d38-probe-function  the python probe() — driven against real sockets:
 #                       a listener (REACHABLE), a closed port (the peer REFUSES
-#                       -> UNRESOLVED, the F51b bug), a .invalid name (no
-#                       address -> UNRESOLVED) and a blackholed address (the
-#                       connect is dropped -> BLOCKED(TimeoutError)).
-#   assert_blocked      the shell PASS/FAIL classifier — driven with synthetic
-#                       PROBE_OUT values: BLOCKED is the only PASS.
+#                       -> REFUSED, the F51b bug; the old copy misread a refusal
+#                       as UNRESOLVED), a .invalid name (no address ->
+#                       UNRESOLVED) and a blackholed address (the connect is
+#                       dropped -> BLOCKED(TimeoutError)).
+#   assert_blocked      the shell PASS/FAIL classifier — driven with PAIRED
+#                       synthetic PROBE_OUT / CONTROL_OUT values (D103: the
+#                       no-policy control pass combines in exactly like
+#                       verify-cni.sh's combine_pass): policy BLOCKED, or policy
+#                       REFUSED + control REACHABLE, is a PASS; REACHABLE,
+#                       UNRESOLVED, REFUSED + control REFUSED (NOT_LISTENING
+#                       note — and if every host-network target is
+#                       NOT_LISTENING the measurable-verdict fails), REFUSED +
+#                       any other control verdict, and a missing line, are
+#                       FAILs.
 #
 # …and the same two blocks out of test/e2e/verify-cni.sh (the operator-facing
 # D38 preflight, P2-1 of #342's pre-review):
@@ -25,9 +34,10 @@
 #
 # Exits non-zero on any failed case. Logs to stdout.
 
-# SC2034/SC2317: PROBE_OUT and the ok/bad stubs are used by the EXTRACTED block
-# (assert_blocked), which shellcheck cannot see into.
-# shellcheck disable=SC2034,SC2317
+# SC2034/SC2317/SC2154/SC2181: PROBE_OUT, CONTROL_OUT, NOT_LISTENING_COUNT
+# and the ok/bad stubs are used by the EXTRACTED block (assert_blocked),
+# which shellcheck cannot see into.
+# shellcheck disable=SC2034,SC2317,SC2154,SC2181
 
 set -uo pipefail
 
@@ -142,7 +152,7 @@ print(port)
 PYEOF
 )"
 out="$(python3 "$T/drive.py" "$T/probe.py" REFUSED_CASE 127.0.0.1 "$CLOSED_PORT" 2>&1)"
-expect_exact "RESULT REFUSED_CASE UNRESOLVED(refused)" "$out" "a refused connect is UNRESOLVED (never BLOCKED)"
+expect_exact "RESULT REFUSED_CASE REFUSED" "$out" "a refused connect is REFUSED (never BLOCKED; the combine step decides BLOCKED vs NOT_LISTENING)"
 
 # A name with no address (RFC 6761 .invalid): no measurement of the fence.
 out="$(python3 "$T/drive.py" "$T/probe.py" NOADDR_CASE d38-probe-selftest.invalid 443 2>&1)"
@@ -167,19 +177,38 @@ fi
 # shellcheck source=/dev/null
 . "$T/classify.sh"
 
-# run_case <want PASS|FAIL> <PROBE_OUT> <case name>
+# run_case <want PASS|FAIL> <PROBE_OUT> <CONTROL_OUT> <case name>
+# Sources the REAL assert_blocked, then drives it for ALL FIVE e2e labels —
+# exactly the way the e2e does: the extracted block's verdict check runs
+# against the per-label ok flags of the five calls (APISERVER_SVC ok + at
+# least one of APISERVER_NODE / KUBELET_NODE ok).
 run_case() {
-  local want="$1" line="$2" name="$3" out got
-  PROBE_OUT="$line"
+  local want="$1" pout="$2" cout="$3" name="$4"
+  local out got svcok nodeok kubok
+  PROBE_OUT="$pout" CONTROL_OUT="$cout"
+  ok() { echo "    P: $*"; }
+  bad() { echo "    F: $*"; }
+  APISERVER_SVC_OK=0 APISERVER_NODE_OK=0 KUBELET_NODE_OK=0
+  NOT_LISTENING_COUNT=0
+  assert_blocked APISERVER_SVC "case: $name (APISERVER_SVC)" && APISERVER_SVC_OK=1
+  assert_blocked APISERVER_NODE "case: $name (APISERVER_NODE)" && APISERVER_NODE_OK=1
+  assert_blocked KUBELET_NODE "case: $name (KUBELET_NODE)" && KUBELET_NODE_OK=1
+  assert_blocked INTERNAL_POD "case: $name (INTERNAL_POD)"
+  assert_blocked EXTERNAL "case: $name (EXTERNAL)"
+  # The D103 host-network verdict, exactly the way the e2e runs it: the 5
+  # calls above, then the measured target check (the bad lands in $out below).
   out="$(
-    ok() { echo "   PASS: $*"; }
-    bad() { echo "   FAIL: $*"; }
-    assert_blocked APISERVER_SVC "case: $name"
+    if [ "$APISERVER_SVC_OK" -ne 1 ] || { [ "$APISERVER_NODE_OK" -ne 1 ] && [ "$KUBELET_NODE_OK" -ne 1 ]; }; then
+      bad "no host-network target was measurable (UNPROVEN): APISERVER_SVC ok=$APISERVER_SVC_OK APISERVER_NODE ok=$APISERVER_NODE_OK KUBELET_NODE ok=$KUBELET_NODE_OK, NOT_LISTENING rows=$NOT_LISTENING_COUNT"
+    fi
   )"
+  # ok() (a combined BLOCKED row) is the only way a case PASSes, and only
+  # for a fully measurable case: a NOT_LISTENING note, an UNRESOLVED/
+  # REACHABLE bad, a missing line, or the host-network verdict's bad all
+  # leave no P: line. The case names below never contain "P: ".
   case "$out" in
-    *"PASS:"*) got=PASS ;;
-    *"FAIL:"*) got=FAIL ;;
-    *) got=UNKNOWN ;;
+    *"P: "*) got=PASS ;;
+    *) got=FAIL ;;
   esac
   if [ "$got" = "$want" ]; then
     ok "$name -> $got (want $want)"
@@ -188,13 +217,97 @@ run_case() {
   fi
 }
 
-run_case PASS "RESULT APISERVER_SVC BLOCKED(TimeoutError)" "a dropped connect is a PASS"
-run_case PASS "RESULT APISERVER_SVC BLOCKED(OSError)" "any dropped-connect reason is a PASS"
-run_case FAIL "RESULT APISERVER_SVC REACHABLE" "a reachable expected-BLOCKED target is a FAIL"
-run_case FAIL "RESULT APISERVER_SVC UNRESOLVED(refused)" "a REFUSED connect is a FAIL, not a pass (F51b)"
-run_case FAIL "RESULT APISERVER_SVC UNRESOLVED(no-address)" "an unresolvable target is a FAIL, not a pass (F51b)"
-run_case FAIL "RESULT OTHER_LABEL BLOCKED(TimeoutError)" "a missing label line is a FAIL"
-run_case FAIL "RESULT APISERVER_SVC FOO" "an unrecognised result is a FAIL"
+# The full five-label tables for the five e2e labels (the d38 probe's fixed
+# targets), one policy and one control line per label.
+D5_BLOCKED_P='RESULT APISERVER_SVC BLOCKED(TimeoutError)
+RESULT APISERVER_NODE BLOCKED(TimeoutError)
+RESULT KUBELET_NODE BLOCKED(TimeoutError)
+RESULT INTERNAL_POD BLOCKED(TimeoutError)
+RESULT EXTERNAL BLOCKED(TimeoutError)'
+# Every REFUSED (D103: a REJECT-style policy controller — Calico drops,
+# so this is what a DROP-style control pass against the control pod would
+# look like too: all BLOCKED, below).
+D5_REFUSED_P='RESULT APISERVER_SVC REFUSED
+RESULT APISERVER_NODE REFUSED
+RESULT KUBELET_NODE REFUSED
+RESULT INTERNAL_POD REFUSED
+RESULT EXTERNAL REFUSED'
+D5_REACHABLE_P='RESULT APISERVER_SVC REACHABLE
+RESULT APISERVER_NODE REACHABLE
+RESULT KUBELET_NODE REACHABLE
+RESULT INTERNAL_POD REACHABLE
+RESULT EXTERNAL REACHABLE'
+D5_BLOCKED_C='RESULT APISERVER_SVC BLOCKED(TimeoutError)
+RESULT APISERVER_NODE BLOCKED(TimeoutError)
+RESULT KUBELET_NODE BLOCKED(TimeoutError)
+RESULT INTERNAL_POD BLOCKED(TimeoutError)
+RESULT EXTERNAL BLOCKED(TimeoutError)'
+D5_REACHABLE_C='RESULT APISERVER_SVC REACHABLE
+RESULT APISERVER_NODE REACHABLE
+RESULT KUBELET_NODE REACHABLE
+RESULT INTERNAL_POD REACHABLE
+RESULT EXTERNAL REACHABLE'
+D5_REFUSED_C='RESULT APISERVER_SVC REFUSED
+RESULT APISERVER_NODE REFUSED
+RESULT KUBELET_NODE REFUSED
+RESULT INTERNAL_POD REFUSED
+RESULT EXTERNAL REFUSED'
+# The combine table (D103), one row at a time (APISERVER_SVC carries the
+# policy x control pair; the other rows stay BLOCKED in both passes).
+tbl5() { # <policy-verdict> <control-verdict|GONE> <want-status-substring>
+  local want="$3"
+  local p="${D5_BLOCKED_P/APISERVER_SVC BLOCKED(TimeoutError)/APISERVER_SVC $1}"
+  local c
+  if [ "$2" = "GONE" ]; then
+    c="${D5_BLOCKED_C/APISERVER_SVC BLOCKED(TimeoutError)/SOME_OTHER_LABEL BLOCKED}"
+  else
+    c="${D5_BLOCKED_C/APISERVER_SVC BLOCKED(TimeoutError)/APISERVER_SVC $2}"
+  fi
+  # The REFUSED/REFUSED cell is the NOT_LISTENING row: it prints a NOTE
+  # line (never a P:/F:) and must count in NOT_LISTENING_COUNT. Drive the
+  # REAL run_case with all five labels REFUSED in both passes — the
+  # NOT_LISTENING rows (all five) must not produce a P: line, and the
+  # counter must have ticked at least once.
+  if [ "$want" = "FAIL" ] && [ "$1" = "REFUSED" ] && [ "$2" = "REFUSED" ]; then
+    NOT_LISTENING_COUNT=0
+    run_case FAIL "$D5_REFUSED_P" "$D5_REFUSED_C" "combine: policy APISERVER_SVC $1 / control $2 (NOT_LISTENING, counted)"
+    [ "${NOT_LISTENING_COUNT:-0}" -ge 1 ] \
+      && ok "combine: NOT_LISTENING counted (NOT_LISTENING_COUNT=$NOT_LISTENING_COUNT)" \
+      || bad "combine: NOT_LISTENING not counted (NOT_LISTENING_COUNT=${NOT_LISTENING_COUNT:-unset})"
+    return 0
+  fi
+  run_case "$want" "$p" "$c" "combine: policy APISERVER_SVC $1 / control ${2}"
+}
+tbl5 "REACHABLE" "BLOCKED(TimeoutError)" "FAIL"
+tbl5 "BLOCKED(TimeoutError)" "BLOCKED(TimeoutError)" "PASS"
+tbl5 "REFUSED" "REACHABLE" "PASS"
+tbl5 "REFUSED" "REFUSED" "FAIL"  # APISERVER_SVC gets a NOT_LISTENING note; the host-network verdict fails
+tbl5 "REFUSED" "BLOCKED(TimeoutError)" "FAIL"
+tbl5 "REFUSED" "UNRESOLVED(no-address)" "FAIL"
+tbl5 "UNRESOLVED(no-address)" "BLOCKED(TimeoutError)" "FAIL"
+# A label missing from the control pass: policy REFUSED + control missing ->
+# UNRESOLVED (no baseline).
+tbl5 "REFUSED" "GONE" "FAIL"
+# Whole-pass verdicts.
+run_case PASS "$D5_BLOCKED_P" "$D5_BLOCKED_C" "Calico: all BLOCKED -> the DROP-style path, unchanged by D103"
+run_case PASS "$D5_REFUSED_P" "$D5_REACHABLE_C" "homelab: every policy target REFUSED, every control target REACHABLE"
+run_case FAIL "$D5_REACHABLE_P" "$D5_REACHABLE_C" "kindnet: policy REACHABLE (the CNI let it through)"
+# APISERVER_SVC BLOCKED but BOTH host-network targets NOT_LISTENING: no
+# host-network target was measurable -> FAIL (the D103 verdict check).
+HN_POLICY='RESULT APISERVER_SVC BLOCKED(TimeoutError)
+RESULT APISERVER_NODE REFUSED
+RESULT KUBELET_NODE REFUSED
+RESULT INTERNAL_POD BLOCKED(TimeoutError)
+RESULT EXTERNAL BLOCKED(TimeoutError)'
+HN_CONTROL='RESULT APISERVER_SVC REACHABLE
+RESULT APISERVER_NODE REFUSED
+RESULT KUBELET_NODE REFUSED
+RESULT INTERNAL_POD BLOCKED(TimeoutError)
+RESULT EXTERNAL BLOCKED(TimeoutError)'
+run_case FAIL "$HN_POLICY" "$HN_CONTROL" "APISERVER_SVC BLOCKED but both host-network targets NOT_LISTENING (no host-network target was measurable)"
+# A missing control line (control pass produced nothing): every REFUSED row
+# combines to UNRESOLVED -> FAIL.
+run_case FAIL "$D5_REFUSED_P" "" "a missing control line (UNRESOLVED)"
 
 # ===========================================================================
 # 3. verify-cni.sh's probe function (the operator-facing D38 preflight), run

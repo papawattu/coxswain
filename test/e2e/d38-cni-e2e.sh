@@ -327,6 +327,21 @@ fi
 AGENT_POD=$(K -n "$NS" get pods -l "app.kubernetes.io/component=agent,coxswain.io/loop=$LOOP" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
 [ -z "$AGENT_POD" ] && { echo "FATAL: no agent pod found"; exit 2; }
 echo "   agent pod: $AGENT_POD"
+# The kubectl cp below fails ("container not running") if the agent pod has
+# not started yet (seen on the lab twice: "FATAL: kubectl cp probe.py failed",
+# with the stderr hidden — the 2>/dev/null is gone from the cp lines). Wait
+# for Ready before copying; if it never becomes Ready, print its describe.
+K -n "$NS" wait --for=condition=Ready "pod/$AGENT_POD" --timeout=180s || { echo "FATAL: agent pod $AGENT_POD not Ready"; K -n "$NS" describe pod "$AGENT_POD" | tail -20; exit 2; }
+# The no-policy control pod (D103) is pinned to the agent pod's node, and its
+# namespace is deleted on script exit (the script has no other trap).
+AGENT_POD_NODE=$(K -n "$NS" get pod "$AGENT_POD" -o jsonpath='{.spec.nodeName}')
+[ -z "$AGENT_POD_NODE" ] && { echo "FATAL: could not read the agent pod's node (.spec.nodeName is empty)"; exit 2; }
+CONTROL_NS="d38-control-$$"
+CONTROL_POD=d38-control
+cleanup_control() {
+  [ -n "$CONTROL_NS" ] && K delete ns "$CONTROL_NS" >/dev/null 2>&1
+}
+trap cleanup_control EXIT
 NETPOL=$(K -n "$NS" get netpol --no-headers 2>/dev/null)
 echo "   NetworkPolicies in $NS:"
 echo "$NETPOL" | sed 's/^/     /'
@@ -387,8 +402,10 @@ def probe(label, host, port, timeout=4):
         print("RESULT %s REACHABLE" % label)
     except ConnectionRefusedError:
         # The peer answered with a refusal: the packet reached it, so the
-        # connect was NOT dropped by any policy. UNRESOLVED, never BLOCKED.
-        print("RESULT %s UNRESOLVED(refused)" % label)
+        # connect was NOT dropped by any policy. REFUSED — combined with the
+        # no-policy control pass (REFUSED + control REACHABLE = BLOCKED,
+        # REFUSED + control REFUSED = NOT_LISTENING; D103 combineVerdicts).
+        print("RESULT %s REFUSED" % label)
     except Exception as exc:
         print("RESULT %s BLOCKED(%s)" % (label, type(exc).__name__))
     finally:
@@ -405,49 +422,149 @@ cat > "$TMPDIR/probe.sh" <<EOF
 export APISERVER_SVC_IP=${APISERVER_SVC_IP} NODE_IP=${NODE_IP} TEST_IP=${TEST_IP} GH_IP=${GH_IP}
 exec python3 /tmp/d38-probe.py
 EOF
-K -n "$NS" cp "$TMPDIR/probe.py" "$AGENT_POD:/tmp/d38-probe.py" 2>/dev/null || { echo "FATAL: kubectl cp probe.py failed"; exit 2; }
-K -n "$NS" cp "$TMPDIR/probe.sh" "$AGENT_POD:/tmp/d38-probe.sh" 2>/dev/null || { echo "FATAL: kubectl cp probe.sh failed"; exit 2; }
+K -n "$NS" cp "$TMPDIR/probe.py" "$AGENT_POD:/tmp/d38-probe.py" || { echo "FATAL: kubectl cp probe.py failed"; exit 2; }
+K -n "$NS" cp "$TMPDIR/probe.sh" "$AGENT_POD:/tmp/d38-probe.sh" || { echo "FATAL: kubectl cp probe.sh failed"; exit 2; }
+
+# ===========================================================================
+# THE NO-POLICY CONTROL PASS (D103): a second pod in its OWN namespace (no
+# NetworkPolicy selects it), pinned to the agent pod's node, runs the same
+# targets. A policy-pass REFUSED + control REACHABLE means the enforcing
+# CNI/policy rejected a connection that succeeds without it -> BLOCKED;
+# REFUSED + REFUSED means nothing listens there -> NOT_LISTENING. The
+# verdicts combine in assert_blocked, exactly like verify-cni.sh's
+# combine_pass (C1, reviewer OK).
+# ===========================================================================
+echo
+echo "--- Control pass: a no-policy pod on node $AGENT_POD_NODE (D103) ---"
+K create ns "$CONTROL_NS" >/dev/null 2>&1 || true
+cat > "$TMPDIR/control-pod.yaml" <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${CONTROL_POD}
+  namespace: ${CONTROL_NS}
+spec:
+  automountServiceAccountToken: false
+  restartPolicy: Never
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchFields:
+              - key: metadata.name
+                operator: In
+                values:
+                  - ${AGENT_POD_NODE}
+  containers:
+    - name: control
+      image: python:3.13-alpine
+      command: ["sleep"]
+      args: ["999999"]
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop:
+            - ALL
+EOF
+K apply -f "$TMPDIR/control-pod.yaml" >/dev/null || { echo "FATAL: control pod $CONTROL_NS/$CONTROL_POD could not be created"; exit 2; }
+K -n "$CONTROL_NS" wait --for=condition=Ready "pod/$CONTROL_POD" --timeout=300s || { echo "FATAL: control pod $CONTROL_NS/$CONTROL_POD not Ready"; K -n "$CONTROL_NS" describe pod "$CONTROL_POD" | tail -20; exit 2; }
+K -n "$CONTROL_NS" cp "$TMPDIR/probe.py" "$CONTROL_POD:/tmp/d38-probe.py" || { echo "FATAL: kubectl cp probe.py (control pass) failed"; exit 2; }
+K -n "$CONTROL_NS" cp "$TMPDIR/probe.sh" "$CONTROL_POD:/tmp/d38-probe.sh" || { echo "FATAL: kubectl cp probe.sh (control pass) failed"; exit 2; }
 
 # ===========================================================================
 # CHECKS 1-5: the blocked endpoints (C1-C5). These are the real L1 assertions.
 # ===========================================================================
 echo
-echo "--- CHECKS 1-5: blocked endpoints from the agent pod ---"
+echo "--- CHECKS 1-5: blocked endpoints from the agent pod (policy pass + control pass) ---"
 PROBE_OUT=$(K -n "$NS" exec "$AGENT_POD" -- sh /tmp/d38-probe.sh 2>&1)
 echo "$PROBE_OUT" | sed 's/^/   /'
+echo "  control pass (pod $CONTROL_NS/$CONTROL_POD, no NetworkPolicy, node $AGENT_POD_NODE):"
+CONTROL_OUT=$(K -n "$CONTROL_NS" exec "$CONTROL_POD" -- sh /tmp/d38-probe.sh 2>&1)
+echo "$CONTROL_OUT" | sed 's/^/   /'
 
 # >>> assert_blocked (executed verbatim by test/e2e/d38-probe-selftest.sh)
 blocked_line() { # $1 = label
   echo "$PROBE_OUT" | grep "^RESULT $1 " || echo "RESULT $1 MISSING"
 }
-assert_blocked() { # $1 = label, $2 = human description
-  # The probe emits exactly one of pod_prober.go's verdicts (F51b):
-  #   RESULT <label> REACHABLE          the connect succeeded       -> FAIL
-  #   RESULT <label> BLOCKED(<reason>)  the connect was dropped     -> PASS
-  #   RESULT <label> UNRESOLVED(<why>)  no address, or the peer REFUSED the
-  #                                     connect: the packet was not dropped,
-  #                                     so this is UNPROVEN  -> FAIL, never
-  #                                     a PASS (an old refusal read BLOCKED)
-  line=$(blocked_line "$1")
-  case "$line" in
-    *"MISSING"*) bad "$2: probe line missing from output" ;;
-    *"REACHABLE"*) bad "$2: REACHABLE — the enforcing CNI failed to block it" ;;
-    *"UNRESOLVED"*) bad "$2: UNRESOLVED — $(echo "$line" | sed 's/^RESULT [A-Z_0-9]* //'); the connect was not dropped, so the fence is UNPROVEN here (not a pass)" ;;
-    *"BLOCKED"*) ok "$2 (blocked: $(echo "$line" | sed 's/^RESULT [A-Z_0-9]* //'))" ;;
-    *) bad "$2: unrecognised probe result: $line" ;;
+control_line() { # $1 = label — the no-policy control pass (D103)
+  echo "$CONTROL_OUT" | grep "^RESULT $1 " || echo "RESULT $1 MISSING"
+}
+# The D103 combine table, exactly like verify-cni.sh's combine_pass:
+#   policy REACHABLE                          -> REACHABLE (the CNI let it through)
+#   policy BLOCKED                            -> BLOCKED
+#   policy REFUSED + control REACHABLE        -> BLOCKED (the policy rejected a working connection)
+#   policy REFUSED + control REFUSED          -> NOT_LISTENING (nothing listens there)
+#   anything else (REFUSED + control
+#   BLOCKED/UNRESOLVED/missing, UNRESOLVED,
+#   a missing policy line)                    -> UNRESOLVED (unmeasurable)
+combine_line() { # $1 = policy line, $2 = control line
+  case "$1" in
+    *"REACHABLE"*) echo "REACHABLE" ;;
+    *"BLOCKED"*) echo "BLOCKED" ;;
+    *"REFUSED"*)
+      case "$2" in
+        *"REACHABLE"*) echo "BLOCKED" ;;
+        *"REFUSED"*) echo "NOT_LISTENING" ;;
+        *) echo "UNRESOLVED" ;;
+      esac ;;
+    *) echo "UNRESOLVED" ;;
   esac
 }
+assert_blocked() { # $1 = label, $2 = human description
+  # The two passes emit exactly one of pod_prober.go's verdicts (D103, F51b):
+  #   RESULT <label> REACHABLE / BLOCKED(<reason>) / REFUSED / UNRESOLVED(<why>)
+  # combine_line turns the (policy, control) pair into the combined verdict
+  # and the case below decides: only combined BLOCKED is a PASS (ok), and
+  # only NOT_LISTENING is a note (neither ok nor bad, but counted); every
+  # other combined verdict is UNPROVEN -> FAIL, never a PASS (an old refusal
+  # read BLOCKED; F51b, R25 I84: no PASS for an unproven step).
+  line=$(blocked_line "$1")
+  cline=$(control_line "$1")
+  combined=$(combine_line "$line" "$cline")
+  case "$combined" in
+    "REACHABLE") bad "$2: REACHABLE — the enforcing CNI failed to block it" ;;
+    "BLOCKED") ok "$2 (blocked: policy ${line} + control ${cline})" ;;
+    "NOT_LISTENING")
+      NOT_LISTENING_COUNT=${NOT_LISTENING_COUNT:-0}
+      NOT_LISTENING_COUNT=$((NOT_LISTENING_COUNT + 1))
+      echo "    NOTE: $2: NOT_LISTENING (policy REFUSED + control REFUSED — nothing listens there; not a measurement of the fence)" ;;
+    *)
+      if echo "$line" | grep -q '^[[:space:]]*RESULT [A-Z_0-9]* MISSING'; then
+        bad "$2: probe line missing from output"
+      else
+        bad "$2: UNRESOLVED — $(echo "$line" | sed 's/^RESULT [A-Z_0-9]* //'); the connect was not dropped, so the fence is UNPROVEN here (not a pass)"
+      fi ;;
+  esac
+}
+# The host-network verdict (D103): after the 5 calls, APISERVER_SVC must be
+# ok (combined BLOCKED) and at least one host-network target (APISERVER_NODE
+# / KUBELET_NODE) must be ok; NOT_LISTENING rows do not count as ok, so if
+# no host-network target was measurable the fence is UNPROVEN.
+APISERVER_SVC_OK=0
+APISERVER_NODE_OK=0
+KUBELET_NODE_OK=0
 # <<< assert_blocked
 echo "  (C1) apiserver service IP $APISERVER_SVC_IP:443"
-assert_blocked APISERVER_SVC "apiserver svc IP $APISERVER_SVC_IP:443"
+APISERVER_SVC_OK=0
+assert_blocked APISERVER_SVC "apiserver svc IP $APISERVER_SVC_IP:443" && APISERVER_SVC_OK=1
 echo "  (C2) apiserver node $NODE_IP:6443"
-assert_blocked APISERVER_NODE "apiserver node $NODE_IP:6443"
+APISERVER_NODE_OK=0
+assert_blocked APISERVER_NODE "apiserver node $NODE_IP:6443" && APISERVER_NODE_OK=1
 echo "  (C3) kubelet node $NODE_IP:10250"
-assert_blocked KUBELET_NODE "kubelet node $NODE_IP:10250"
+KUBELET_NODE_OK=0
+assert_blocked KUBELET_NODE "kubelet node $NODE_IP:10250" && KUBELET_NODE_OK=1
 echo "  (C4) cluster-internal pod IP $TEST_IP:8080"
 assert_blocked INTERNAL_POD "cluster-internal pod IP $TEST_IP:8080"
 echo "  (C5) disallowed external $GH_IP:443"
 assert_blocked EXTERNAL "disallowed external $GH_IP:443"
+# D103 verdict (the host-network measurable rule): the combined BLOCKED proof
+# above must include APISERVER_SVC and at least one host-network target
+# (REFUSED + control REACHABLE counts as BLOCKED); NOT_LISTENING rows do not.
+if [ "$APISERVER_SVC_OK" -ne 1 ] || { [ "$APISERVER_NODE_OK" -ne 1 ] && [ "$KUBELET_NODE_OK" -ne 1 ]; }; then
+  bad "no host-network target was measurable (UNPROVEN): APISERVER_SVC ok=$APISERVER_SVC_OK APISERVER_NODE ok=$APISERVER_NODE_OK KUBELET_NODE ok=$KUBELET_NODE_OK, NOT_LISTENING rows=$NOT_LISTENING_COUNT"
+fi
 
 # C8: the operator's OWN CNI self-test (D38 design point 3: the
 # NetworkEnforced condition on the Loop) must agree with what the e2e
@@ -477,7 +594,7 @@ code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 --retry 2 --retry-de
 ec=$?
 echo "curl-exit=$ec http=$code"
 EOF
-K -n "$NS" cp "$TMPDIR/probe-allowed.sh" "$AGENT_POD:/tmp/probe-allowed.sh" 2>/dev/null || bad "kubectl cp probe-allowed.sh failed"
+K -n "$NS" cp "$TMPDIR/probe-allowed.sh" "$AGENT_POD:/tmp/probe-allowed.sh" || bad "kubectl cp probe-allowed.sh failed"
 P6=$(K -n "$NS" exec "$AGENT_POD" -- sh /tmp/probe-allowed.sh 2>&1)
 echo "$P6" | sed 's/^/   /'
 case "$P6" in
@@ -495,7 +612,7 @@ code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 --retry 2 --retry-de
 ec=$?
 echo "curl-exit=$ec http=$code"
 EOF
-K -n "$NS" cp "$TMPDIR/probe-disallowed.sh" "$AGENT_POD:/tmp/probe-disallowed.sh" 2>/dev/null || bad "kubectl cp probe-disallowed.sh failed"
+K -n "$NS" cp "$TMPDIR/probe-disallowed.sh" "$AGENT_POD:/tmp/probe-disallowed.sh" || bad "kubectl cp probe-disallowed.sh failed"
 P7=$(K -n "$NS" exec "$AGENT_POD" -- sh /tmp/probe-disallowed.sh 2>&1)
 echo "$P7" | sed 's/^/   /'
 case "$P7" in

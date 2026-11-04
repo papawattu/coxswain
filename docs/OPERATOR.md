@@ -791,8 +791,8 @@ kubectl -n <ns> get events --field-selector reason=PolicyNameCollision
 kubectl -n <ns> get loop <name> -o jsonpath='{.metadata.annotations.coxswain\.io/policy-collisions}'
 ```
 
-Which scope wins on a collision is the open owner question D98; the
-namespaced-wins behaviour above is the current implementation.
+Which scope wins on a collision is D98 (owner decision, 2026-11-04):
+the namespaced policy wins.
 
 **Operator RBAC.** The operator's ClusterRole has `get;list;watch` on
 `clusteragentpolicies` (read-only — the operator never writes a policy), and

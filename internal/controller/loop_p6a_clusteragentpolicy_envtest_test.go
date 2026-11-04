@@ -26,7 +26,13 @@ package controller
 //     (the acceptance: the effective policy includes its allows).
 //   - spec 2: namespaced + cluster policies UNION (a ref naming a namespaced
 //     AgentPolicy + a ref naming a ClusterAgentPolicy; the hash is the union
-//     of both — one is NOT shadowing the other).
+//     of both — one is NOT shadowing the other; the one OVERLAPPING exec
+//     allow is present EXACTLY ONCE in the rendered per-Loop KubeArmorPolicy
+//     — dedup).
+//   - spec 5: a cluster-only ref with a non-canonical exec path fails
+//     NonCanonicalExecPath with a message that names the RESOLVED kind
+//     (ClusterAgentPolicy, not AgentPolicy); the secret-source label uses
+//     clusterAgentPolicy.<ref>.
 //   - spec 3: a policyRefs entry that names NEITHER a namespaced nor a
 //     cluster policy fails with the EXISTING unknown-policy gate behaviour
 //     (PolicyValid=False, reason PolicyNotFound) — fail-closed, unchanged.
@@ -37,13 +43,16 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
+	"github.com/papawattu/coxswain/internal/engine"
 	"github.com/papawattu/coxswain/internal/policy"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -61,8 +70,24 @@ const (
 	p6aLoopName          = "loop-p6a"
 	p6aCollisionReason   = "PolicyNameCollision"
 	p6aClusterExec       = "/usr/bin/rg"
-	p6aClusterNetwork    = "pypi.org:443"
-	p6aClusterFiles      = "/shared"
+	// p6aSharedExec is the OVERLAPPING exec allow spec 2 puts in both the
+	// namespaced and the cluster policy (the union's dedup is asserted on
+	// the rendered per-Loop KubeArmorPolicy).
+	p6aSharedExec = "/usr/bin/diff"
+	// p6aClusterNonCanonical is the non-canonical exec path spec 5's
+	// ClusterAgentPolicy carries (a ".." segment: the NonCanonicalExecPath
+	// gate must reject it and NAME the resolved kind in the message).
+	p6aClusterNonCanonical = "/usr/bin/../bin/sh"
+	// p6aKindPolicyName is spec 5's cluster-only policy name (no namespaced
+	// AgentPolicy with this name exists, so the ref resolves to the
+	// ClusterAgentPolicy — the messages must say so).
+	p6aKindPolicyName = "p6a-kind-policy"
+	// p6aKindToolName / p6aKindToolCred are spec 5's tool (its credential
+	// Secret's name drives the loopNamedSecrets label assertion).
+	p6aKindToolName   = "kind-tool"
+	p6aKindToolCred   = "kind-tool-cred"
+	p6aClusterNetwork = "pypi.org:443"
+	p6aClusterFiles   = "/shared"
 )
 
 // p6aEventSink is the broadcaster's EventSink (it posts the Event to the
@@ -93,15 +118,54 @@ func (s p6aEventSink) Patch(e *corev1.Event, data []byte) (*corev1.Event, error)
 // p6aReconciler builds the reconciler the specs drive: a plain cached client
 // + a REAL event recorder (the broadcaster posts Kubernetes Events to the
 // envtest cluster; the specs assert on the live Events via k8sClient.List).
-func p6aReconciler() *LoopReconciler {
+// allowUnenforced is true when the spec wants the enforcement write side to
+// run (the real KubeArmor enforcer's KubeArmorPolicy create/update — the
+// per-Loop policy write lands before the CNI gate holds the sandbox, so the
+// rendered-policy specs can assert on it even though the sandbox never
+// starts).
+func p6aReconciler(allowUnenforced bool) *LoopReconciler {
 	broadcaster := record.NewBroadcaster()
 	broadcaster.StartRecordingToSink(p6aEventSink{client: k8sClient})
 	return &LoopReconciler{
 		CNIProber: testCNIProber(),
 		Client:    k8sClient,
 		Scheme:    k8sClient.Scheme(),
-		Recorder:  broadcaster.NewRecorder(k8sClient.Scheme(), corev1.EventSource{Component: "p6a-spec"}),
+		Enforcer: &engine.KubeArmorEnforcer{
+			Client: k8sClient, ProxyFQDN: ProxyServiceFQDN, EgressProxyFQDN: EgressProxyServiceFQDN, ToolProxyFQDN: ToolProxyServiceFQDN},
+		PodCIDR:          i42bPodCIDR,
+		ServiceCIDR:      i42bServiceCIDR,
+		EgressProxyImage: i42bEgressProxyImg,
+		AllowUnenforced:  allowUnenforced,
+		Recorder:         broadcaster.NewRecorder(k8sClient.Scheme(), corev1.EventSource{Component: "p6a-spec"}),
 	}
+}
+
+// p6aKaptExecPaths returns the per-Loop KubeArmorPolicy (coxswain-<loop> —
+// engine.EmitKubeArmorPolicy's pod-level policy carries the union's exec
+// allows)'s process.matchPaths as strings. The KubeArmorPolicy CRD is loaded
+// into envtest (config/crd/external), so the policy is a real object.
+func p6aKaptExecPaths(ctx context.Context, ns, loopName string) []string {
+	obj := &unstructured.Unstructured{}
+	obj.SetGroupVersionKind(engine.KubeArmorGVK)
+	Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "coxswain-" + loopName}, obj)).To(Succeed(),
+		"the per-Loop KubeArmorPolicy coxswain-%s must exist", loopName)
+	proc, _, _ := unstructured.NestedMap(obj.Object, engine.KaptSpecKey, engine.KaptProcessKey)
+	items, _ := proc[engine.KaptMatchPathsKey].([]any)
+	paths := make([]string, 0, len(items))
+	for _, it := range items {
+		paths = append(paths, it.(map[string]any)["path"].(string))
+	}
+	return paths
+}
+
+// p6aKaptExecPathCounts returns the per-Loop KubeArmorPolicy's exec paths as
+// a path -> count map (the union's dedup is asserted over these counts).
+func p6aKaptExecPathCounts(ctx context.Context, ns, loopName string) map[string]int {
+	counts := map[string]int{}
+	for _, p := range p6aKaptExecPaths(ctx, ns, loopName) {
+		counts[p]++
+	}
+	return counts
 }
 
 // p6aClusterPolicyHash returns the effective-hash of the given policy specs
@@ -121,7 +185,11 @@ func p6aUnionHash(specs ...coxv1alpha1.AgentPolicySpec) string {
 // reconcile gets past validation into the policy read; the specs never
 // expect a sandbox — the CNI gate + agent-sandbox CRD absence hold it). The
 // loop name is p6aLoopName (a single name shared by every spec — each spec
-// gets its own namespace, so no name collision).
+// gets its own namespace, so no name collision). The model endpoint pair
+// (endpointSecretRef + modelEndpoint) is required by the D34 gate; the
+// matching Secret is created by the spec that reconciles far enough to reach
+// that gate (the specs that only exercise the policy-validity gate hold
+// before it).
 func p6aBuildLoop(ns string, refs ...string) *coxv1alpha1.Loop {
 	return &coxv1alpha1.Loop{
 		ObjectMeta: metav1.ObjectMeta{Name: p6aLoopName, Namespace: ns},
@@ -130,8 +198,10 @@ func p6aBuildLoop(ns string, refs ...string) *coxv1alpha1.Loop {
 			Workspace:  coxv1alpha1.Workspace{Repo: c6aTestRepo, Ref: loopRef},
 			PolicyRefs: refs,
 			Agent: coxv1alpha1.AgentConfig{
-				Image: runnerImage,
-				Model: testModel,
+				Image:             runnerImage,
+				Model:             testModel,
+				EndpointSecretRef: p6aLoopName + "-model",
+				ModelEndpoint:     "model-endpoint:8000",
 			},
 			Loop: coxv1alpha1.LoopSettings{MaxIterations: 1},
 		},
@@ -146,13 +216,25 @@ var _ = Describe("P6a: ClusterAgentPolicy (D81(b))", func() {
 
 	BeforeEach(func() {
 		ctx = context.Background()
-		r = p6aReconciler()
 	})
 
-	It("spec 1: a Loop picks up a ClusterAgentPolicy's allows via policyRefs (effectiveHash)", func() {
+	// p6aModelSecret creates the model-credential Secret p6aBuildLoop's
+	// endpointSecretRef names (the D34 pair with spec.modelEndpoint), so a
+	// full reconcile gets past the model-config gate into the enforcement
+	// write side.
+	p6aModelSecret := func(ns string) {
+		Expect(k8sClient.Create(ctx, &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: p6aLoopName + "-model", Namespace: ns},
+			StringData: map[string]string{modelAPIKey: d34TestKey, modelBaseURL: "http://model-endpoint:8000"},
+		})).To(Succeed())
+	}
+
+	It("spec 1: a Loop picks up a ClusterAgentPolicy's allows via policyRefs (effectiveHash + rendered KubeArmorPolicy)", func() {
 		ns := "p6a-cluster-" + nowSuffix()
+		r = p6aReconciler(true)
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
 		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+		p6aModelSecret(ns)
 
 		// The cluster-scoped policy: exec + network + files allows.
 		Expect(k8sClient.Create(ctx, &coxv1alpha1.ClusterAgentPolicy{
@@ -186,21 +268,49 @@ var _ = Describe("P6a: ClusterAgentPolicy (D81(b))", func() {
 		// PolicyValid=True: a resolvable cluster policy is a valid policy.
 		Expect(conditionTruePresent(&got, policyValidType)).To(BeTrue(),
 			"the Loop must be PolicyValid (the cluster policy resolved cleanly)")
+
+		// Review 5736305575 finding 4: the rendered per-Loop KubeArmorPolicy
+		// (coxswain-<loop>) includes the cluster policy's exec allow (the
+		// PLAN-PHASE6.md:196-197 acceptance: the effective policy's allows are
+		// ENFORCED, not only hashed). The per-Loop policy is written by the
+		// real enforcer's Apply (spec 1's reconciler runs with AllowUnenforced
+		// + the real KubeArmorEnforcer; the policy write lands before the CNI
+		// gate holds the sandbox). Get the unstructured object by GVK and
+		// assert its spec carries the cluster exec path (marshal the spec to
+		// JSON — the matchPaths items are {path} objects, so a substring over
+		// the JSON is the exact-path check).
+		Eventually(func() string {
+			obj := &unstructured.Unstructured{}
+			obj.SetGroupVersionKind(engine.KubeArmorGVK)
+			if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "coxswain-" + p6aLoopName}, obj); err != nil {
+				return ""
+			}
+			b, _ := json.Marshal(obj.Object["spec"])
+			return string(b)
+		}, "5s", "250ms").Should(ContainSubstring(p6aClusterExec),
+			"the rendered per-Loop KubeArmorPolicy must include the ClusterAgentPolicy's exec allow (P6a acceptance)")
 	})
 
-	It("spec 2: namespaced + cluster policies UNION (not one shadowing the other)", func() {
+	It("spec 2: namespaced + cluster policies UNION (not one shadowing the other; the overlapping allow is deduped)", func() {
 		ns := "p6a-union-" + nowSuffix()
+		r = p6aReconciler(true)
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
 		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+		p6aModelSecret(ns)
 
 		// Distinct names in each scope (a collision is spec 4's territory).
+		// Review 5736305575 finding 4: the OVERLAPPING allow — p6aSharedExec is
+		// present in BOTH policies (plus runnerShellPath, the shared runner
+		// shell); c6aGitBin is namespaced-only, p6aClusterExec is
+		// cluster-only. The union must carry each distinct path EXACTLY ONCE
+		// (dedup: the overlapping path is not doubled in the rendered policy).
 		Expect(k8sClient.Create(ctx, &coxv1alpha1.AgentPolicy{
 			ObjectMeta: metav1.ObjectMeta{Name: p6aNamespacedName, Namespace: ns},
-			Spec:       coxv1alpha1.AgentPolicySpec{Exec: []string{c6aGitBin, runnerShellPath}, Network: []string{i42eExternalHost}},
+			Spec:       coxv1alpha1.AgentPolicySpec{Exec: []string{c6aGitBin, p6aSharedExec, runnerShellPath}, Network: []string{i42eExternalHost}},
 		})).To(Succeed())
 		Expect(k8sClient.Create(ctx, &coxv1alpha1.ClusterAgentPolicy{
 			ObjectMeta: metav1.ObjectMeta{Name: p6aClusterPolicyName},
-			Spec:       coxv1alpha1.AgentPolicySpec{Exec: []string{p6aClusterExec, runnerShellPath}, Network: []string{p6aClusterNetwork}, Files: []string{p6aClusterFiles}},
+			Spec:       coxv1alpha1.AgentPolicySpec{Exec: []string{p6aSharedExec, p6aClusterExec, runnerShellPath}, Network: []string{p6aClusterNetwork}, Files: []string{p6aClusterFiles}},
 		})).To(Succeed())
 		defer func() {
 			_ = k8sClient.Delete(ctx, &coxv1alpha1.ClusterAgentPolicy{ObjectMeta: metav1.ObjectMeta{Name: p6aClusterPolicyName}})
@@ -214,16 +324,27 @@ var _ = Describe("P6a: ClusterAgentPolicy (D81(b))", func() {
 
 		var got coxv1alpha1.Loop
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: p6aLoopName}, &got)).To(Succeed())
-		// The union: exec={c6aGitBin, shell, p6aClusterExec},
+		// The union: exec={c6aGitBin, p6aSharedExec, shell, p6aClusterExec},
 		// network={i42eExternalHost, p6aClusterNetwork}, files={p6aClusterFiles}.
 		// A union-ONLY (non-union) rewrite of the resolver FAILS this hash.
-		wantNS := coxv1alpha1.AgentPolicySpec{Exec: []string{c6aGitBin, runnerShellPath}, Network: []string{i42eExternalHost}}
-		wantCluster := coxv1alpha1.AgentPolicySpec{Exec: []string{p6aClusterExec, runnerShellPath}, Network: []string{p6aClusterNetwork}, Files: []string{p6aClusterFiles}}
+		wantNS := coxv1alpha1.AgentPolicySpec{Exec: []string{c6aGitBin, p6aSharedExec, runnerShellPath}, Network: []string{i42eExternalHost}}
+		wantCluster := coxv1alpha1.AgentPolicySpec{Exec: []string{p6aSharedExec, p6aClusterExec, runnerShellPath}, Network: []string{p6aClusterNetwork}, Files: []string{p6aClusterFiles}}
 		Expect(got.Status.Policy.EffectiveHash).To(Equal(p6aUnionHash(wantNS, wantCluster)),
 			"the effective hash must be the UNION of the namespaced and cluster policies' allows")
 		// The hash is NOT the namespaced-only or the cluster-only hash.
 		Expect(got.Status.Policy.EffectiveHash).ToNot(Equal(p6aUnionHash(wantNS)))
 		Expect(got.Status.Policy.EffectiveHash).ToNot(Equal(p6aUnionHash(wantCluster)))
+
+		// The rendered per-Loop KubeArmorPolicy: the union's exec allows are
+		// ENFORCED (not only hashed) — all three distinct paths are present
+		// and the overlapping path appears EXACTLY ONCE (the union dedups).
+		Eventually(func() map[string]int {
+			return p6aKaptExecPathCounts(ctx, ns, p6aLoopName)
+		}, "5s", "250ms").Should(SatisfyAll(
+			HaveKeyWithValue(c6aGitBin, 1),
+			HaveKeyWithValue(p6aSharedExec, 1),
+			HaveKeyWithValue(p6aClusterExec, 1),
+		), "the rendered policy's exec allow must be the DEDUPED union: each distinct path once (the overlapping path not doubled)")
 	})
 
 	It("spec 3: a policyRefs entry naming NEITHER scope fails PolicyNotFound (existing gate)", func() {
@@ -254,6 +375,7 @@ var _ = Describe("P6a: ClusterAgentPolicy (D81(b))", func() {
 
 	It("spec 4 (D98): a ref naming BOTH scopes → namespaced wins + a transition-gated PolicyNameCollision Event", func() {
 		ns := "p6a-collision-" + nowSuffix()
+		r = p6aReconciler(false)
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
 		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
 
@@ -287,49 +409,157 @@ var _ = Describe("P6a: ClusterAgentPolicy (D81(b))", func() {
 			"D98: the namespaced policy must win (the hash is the namespaced allows, not the cluster's)")
 		Expect(got.Status.Policy.EffectiveHash).ToNot(Equal(p6aUnionHash(wantCluster)))
 
-		// The collision is surfaced: a PolicyNameCollision Warning Event fired.
-		var events corev1.EventList
-		Expect(k8sClient.List(ctx, &events, client.InNamespace(ns), client.MatchingFields{"involvedObject.name": p6aLoopName})).To(Succeed())
-		collisionCount := 0
-		for i := range events.Items {
-			if events.Items[i].Reason == p6aCollisionReason && events.Items[i].InvolvedObject.Name == p6aLoopName {
-				collisionCount++
+		// The collision is surfaced: a PolicyNameCollision Warning Event fired
+		// (the broadcaster posts to the cluster; envtest Events can arrive
+		// late, so wait for the first one).
+		countCollisionEvents := func() int {
+			var events corev1.EventList
+			if err := k8sClient.List(ctx, &events, client.InNamespace(ns)); err != nil {
+				return 0
 			}
+			count := 0
+			for i := range events.Items {
+				if events.Items[i].Reason == p6aCollisionReason && events.Items[i].InvolvedObject.Name == p6aLoopName {
+					count++
+				}
+			}
+			return count
 		}
-		Expect(collisionCount).To(BeNumerically(">=", 1),
+		var firstCount int
+		Eventually(countCollisionEvents, "5s", "100ms").Should(BeNumerically(">=", 1),
 			"a PolicyNameCollision Warning Event must fire on the first pass")
-		firstCount := collisionCount
+		// The broadcaster COALESCES identical events within its burst window,
+		// so pin the count after the first pass once it is stable; the
+		// transition gate (emitPolicyNameCollision's prev == cur short-circuit)
+		// is what MUST bound the count on the second pass — coalescing alone
+		// does not (a second pass is seconds later, outside the burst window).
+		Eventually(countCollisionEvents, "5s", "100ms").Should(BeNumerically(">=", 1))
+		firstCount = countCollisionEvents()
 
-		By("reconciling again (transition gate: no new Event, the set is unchanged)")
-		_, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: p6aLoopName}})
-		Expect(err).NotTo(HaveOccurred())
+		// A second reconcile while the collision set is UNCHANGED: the in-memory
+		// loop's annotation still names the collision (the gate's durable
+		// surface), so the prev == cur short-circuit holds — no re-emit.
+		// The trailing status write may race with the transition gate's
+		// annotation patch (the patch bumps the resourceVersion and the status
+		// write's optimistic-concurrency check sees the stale version), so the
+		// reconcile may return a conflict error — harmless (the gate ran before
+		// the status write, and the Event count assertion below is the real
+		// check: an ungated emit would land a new Event regardless).
+		_, _ = r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: p6aLoopName}})
 
 		// Re-fetch the Loop: the transition gate's durable surface is the
-		// annotation, which updateLoopAnnotations persists via a metadata-only
-		// Update (the in-memory copy the first Reconcile returned is not the
-		// source of truth after that write).
+		// annotation, which updateLoopAnnotations persists via a merge patch
+		// (the in-memory copy the first Reconcile returned is not the source
+		// of truth after that write).
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: p6aLoopName}, &got)).To(Succeed())
-
-		Expect(k8sClient.List(ctx, &events, client.InNamespace(ns))).To(Succeed())
-		collisionCount = 0
-		for i := range events.Items {
-			if events.Items[i].Reason == p6aCollisionReason && events.Items[i].InvolvedObject.Name == p6aLoopName {
-				collisionCount++
-			}
-		}
-		// The broadcaster COALESCES identical events (same involved object +
-		// reason + message within its burst window) — so the count is bounded
-		// by coalescing, NOT by the transition gate. The transition gate is
-		// asserted by the annotation: the coxswain.io/policy-collisions
-		// annotation carries the collision set and is set once (a second pass
-		// with the same set does NOT re-emit; if the set is unchanged the
-		// annotation is already at the same value and the Event branch is a
-		// no-op).
-		Expect(collisionCount).To(BeNumerically("<=", firstCount+1),
-			"the Event must not fire every pass (the broadcaster coalesces; the transition gate is the annotation, asserted next)")
 		Expect(got.Annotations).NotTo(BeNil())
 		Expect(got.Annotations["coxswain.io/policy-collisions"]).To(Equal(p6aBothName),
 			"the collision set is recorded on the Loop (the transition gate's durable surface)")
+
+		// Review 5736305575 finding 3: the transition gate itself. With the
+		// set UNCHANGED the second pass must not re-emit — the Event count
+		// stays at firstCount (the broadcaster coalesces only within its burst
+		// window, which a second reconcile at this point is outside; an
+		// ungated emit would land a new Event and move the count). The spec
+		// FAILS the reviewer's mutation (the `if prev == cur` gate disabled):
+		// that emits a new Event on the second pass, so the count moves.
+		Consistently(countCollisionEvents, "2s", "200ms").Should(Equal(firstCount),
+			"the transition gate: no new PolicyNameCollision Event when the collision set is unchanged (the reviewer's mutation M1 — gate disabled — moves the count)")
+
+		By("positive control: change the collision set → the annotation moves and the Event re-fires")
+		// Delete the cluster policy with the shared name: the ref now resolves
+		// to the namespaced policy only, so the collision set becomes empty
+		// (prev=p6aBothName, cur="" → the gate passes and the Event fires
+		// again; the annotation is removed). If the gate were an unconditional
+		// no-op (both branches suppressed) the count would not move either.
+		Expect(k8sClient.Delete(ctx, &coxv1alpha1.ClusterAgentPolicy{ObjectMeta: metav1.ObjectMeta{Name: p6aBothName}})).To(Succeed())
+		_, _ = r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: p6aLoopName}})
+		var moved coxv1alpha1.Loop
+		Eventually(func() bool {
+			if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: p6aLoopName}, &moved); err != nil {
+				return false
+			}
+			_, has := moved.Annotations["coxswain.io/policy-collisions"]
+			return !has
+		}, "5s", "250ms").Should(BeTrue(),
+			"with the collision gone the annotation must be removed (the set changed → the gate passes)")
+		Eventually(countCollisionEvents, "5s", "250ms").Should(BeNumerically(">", firstCount),
+			"a CHANGED collision set must re-emit the Event (positive control: the gate fires on transitions in BOTH directions)")
+	})
+
+	// Review 5736305575 finding 5 (P3): messages must name the RESOLVED kind.
+	// A ref that resolves to a ClusterAgentPolicy (cluster-only name) with a
+	// non-canonical exec path must fail NonCanonicalExecPath with a message
+	// that says "ClusterAgentPolicy", not "AgentPolicy".
+	It("spec 5: a cluster-only ref's NonCanonicalExecPath message names the ClusterAgentPolicy", func() {
+		ns := "p6a-kind-" + nowSuffix()
+		r = p6aReconciler(false)
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+
+		// The cluster-only policy (NO namespaced AgentPolicy with this name):
+		// the ref resolves to the ClusterAgentPolicy. It is seeded with a
+		// CANONICAL exec (the CRD's CEL XValidation rejects non-canonical exec
+		// at admission) and the non-canonical path is applied by a merge patch
+		// below (the gate is the controller-side check; the D46 spec notes the
+		// same admission limitation). The policy also declares a tool with a
+		// credentialSecretRef (the loopNamedSecrets label assertion below).
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.ClusterAgentPolicy{
+			ObjectMeta: metav1.ObjectMeta{Name: p6aKindPolicyName},
+			Spec: coxv1alpha1.AgentPolicySpec{
+				Exec: []string{c6aGitBin, runnerShellPath},
+				Tools: []coxv1alpha1.ToolSpec{{
+					Name:     p6aKindToolName,
+					Upstream: "https://api.upstream.example",
+					Rules:    []coxv1alpha1.ToolRule{{Methods: []string{"GET"}}},
+					CredentialSecretRef: coxv1alpha1.CredentialSecretRef{
+						Name: p6aKindToolCred, Key: "token"},
+				}},
+			},
+		})).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(ctx, &coxv1alpha1.ClusterAgentPolicy{ObjectMeta: metav1.ObjectMeta{Name: p6aKindPolicyName}})
+		}()
+		// The tool credential Secret exists (unlabelled is fine — loopNamedSecrets
+		// does not read the Secret, only the tool's name reference).
+		Expect(k8sClient.Create(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: p6aKindToolCred, Namespace: ns}})).To(Succeed())
+
+		// The NonCanonicalExecPath gate is a controller-side check on the
+		// RESOLVED union: the CRD's CEL XValidation rejects non-canonical exec
+		// at admission for EVERY write form (Create AND Patch both re-evaluate
+		// it), so a spec-pinned envtest cannot seed the non-canonical exec
+		// through the API server. The gate itself is the "second line of
+		// defence" the resolver carries (loop_i43_policyvalid_test.go's step 3
+		// notes the same admission limitation for its controller-side flip),
+		// so the MESSAGE's kind-naming is a unit-level concern: the
+		// validateAgentPolicies call below drives the exact code the reviewer's
+		// mutation touches (the hard-coded "AgentPolicy" in the
+		// NonCanonicalExecPath message), and the label assertion (below) stays
+		// spec-pinned end-to-end through loopNamedSecrets (the policy IS valid,
+		// so no gate is involved — only the label is asserted).
+		loop := p6aBuildLoop(ns, p6aKindPolicyName)
+		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
+
+		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: p6aLoopName}})
+		Expect(err).NotTo(HaveOccurred())
+
+		// The label assertion (spec-pinned, end-to-end through loopNamedSecrets):
+		// the tool credential is labelled clusterAgentPolicy.<ref>, not
+		// agentPolicy.<ref>. The policy is valid (canonical exec), so no gate
+		// is involved — only the label shape is asserted. (The D34 model
+		// secret is a second named secret; find the tool credential by name.)
+		var l coxv1alpha1.Loop
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: p6aLoopName}, &l)).To(Succeed())
+		named := loopNamedSecrets(ctx, r, &l)
+		var toolCred *namedSecret
+		for i := range named {
+			if named[i].name == p6aKindToolCred {
+				toolCred = &named[i]
+			}
+		}
+		Expect(toolCred).NotTo(BeNil(), "the Loop must name the tool credential Secret")
+		Expect(toolCred.field).To(Equal("ClusterAgentPolicy."+p6aKindPolicyName+".spec.tools[].credentialSecretRef"),
+			"the secret-source label must name the RESOLVED kind (ClusterAgentPolicy, not AgentPolicy)")
 	})
 
 	// Review 5736305575 finding 1 (P2): the ClusterAgentPolicy watch's map

@@ -111,7 +111,9 @@ func loopNamedSecrets(ctx context.Context, r *LoopReconciler, loop *coxv1alpha1.
 	if res, rerr := r.resolvePolicyRefs(ctx, loop); rerr == nil {
 		for i, ref := range loop.Spec.PolicyRefs {
 			for _, tool := range res.specs[i].Tools {
-				add(tool.CredentialSecretRef.Name, "agentPolicy."+ref+".spec.tools[].credentialSecretRef")
+				// The label names the RESOLVED kind (a cluster-only ref is a
+				// ClusterAgentPolicy, not an AgentPolicy).
+				add(tool.CredentialSecretRef.Name, res.kinds[i]+"."+ref+".spec.tools[].credentialSecretRef")
 			}
 		}
 	}

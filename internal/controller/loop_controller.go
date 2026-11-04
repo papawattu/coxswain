@@ -1755,7 +1755,12 @@ func (r *LoopReconciler) effectivePolicy(ctx context.Context, loop *coxv1alpha1.
 // to the existing unknown-policy gate (PolicyValid=False PolicyNotFound), so
 // the fail-closed behaviour is unchanged.
 type policyRefsResolution struct {
-	specs      []coxv1alpha1.AgentPolicySpec
+	specs []coxv1alpha1.AgentPolicySpec
+	// kinds names the RESOLVED kind of each ref, parallel to specs ("AgentPolicy"
+	// or "ClusterAgentPolicy"): the validation + secret-source messages must
+	// name the scope that actually resolved (a cluster-only ref is not an
+	// AgentPolicy).
+	kinds      []string
 	collisions []string // policyRefs names that name BOTH a namespaced and a cluster policy
 }
 
@@ -1769,14 +1774,17 @@ func (r *LoopReconciler) resolvePolicyRefs(ctx context.Context, loop *coxv1alpha
 		switch {
 		case nsErr == nil && apierrors.IsNotFound(clusterErr):
 			res.specs = append(res.specs, ap.Spec) // namespaced only
+			res.kinds = append(res.kinds, "AgentPolicy")
 		case apierrors.IsNotFound(nsErr) && clusterErr == nil:
 			res.specs = append(res.specs, cap.Spec) // cluster only (the fallback)
+			res.kinds = append(res.kinds, "ClusterAgentPolicy")
 		case nsErr == nil && clusterErr == nil:
 			// D98: BOTH scopes name it — the namespaced one wins (the author's
 			// explicit choice); the collision is surfaced by the caller
 			// (transition-gated PolicyNameCollision Warning Event), not
 			// rejected (a shared-name org policy must not break Loops).
 			res.specs = append(res.specs, ap.Spec)
+			res.kinds = append(res.kinds, "AgentPolicy")
 			res.collisions = append(res.collisions, name)
 		case apierrors.IsNotFound(nsErr) && apierrors.IsNotFound(clusterErr):
 			// Neither scope names it: the caller maps to PolicyNotFound.
@@ -7094,7 +7102,7 @@ func (r *LoopReconciler) validateAgentPolicies(ctx context.Context, loop *coxv1a
 		for _, e := range spec.Exec {
 			if isNonCanonicalPath(e) {
 				return policyValidationResult{valid: false, reason: "NonCanonicalExecPath",
-					message: fmt.Sprintf("AgentPolicy %s: exec entry %q is non-canonical (no ., .., //, or trailing /)", name, e)}
+					message: fmt.Sprintf("%s %s: exec entry %q is non-canonical (no ., .., //, or trailing /)", res.kinds[i], name, e)}
 			}
 		}
 		unionExec = append(unionExec, spec.Exec...)

@@ -1011,20 +1011,20 @@ egress. On a flannel-only setup, flannel's VXLAN provides no enforcement.
 
 **k3s embeds a separate network-policy controller.** k3s ships an embedded
 network-policy controller (not a separate pod — it runs inside the k3s
-server process). It is enabled with the `--network-policy` flag on the
-k3s server, or by setting `network-policy: true` in
-`/etc/rancher/k3s/config.yaml`. When enabled, it enforces
-`networking.k8s.io/v1` NetworkPolicy objects independently of the CNI —
-flannel + k3s embedded network-policy controller is a working enforcing
-setup.
+server process). It is **on by default**; the only way to turn it off is
+the `--disable-network-policy` flag on the k3s server (or
+`disable-network-policy: true` in `/etc/rancher/k3s/config.yaml`). There
+is no `--network-policy` flag and no `network-policy: true` config key.
+When enabled, it enforces `networking.k8s.io/v1` NetworkPolicy objects
+independently of the CNI — flannel + k3s embedded network-policy
+controller is a working enforcing setup.
 
-**The homelab k3s has this enabled (verified by the H4 probe below)** —
-even though neither the `--network-policy` flag nor the config.yaml entry
-are visible in the process cmdline (the flag may be passed via an env var
-or the service file that is not visible to this check). The empirical
-proof is the BLOCKED/REACHABLE probe result.
+**The homelab k3s has this on by default (verified by the H4 probe below).**
+Nothing in config.yaml, the unit, or the cmdline disables it, so nothing
+turns it off — the absence is the confirmation. The empirical proof is the
+BLOCKED/REACHABLE probe result.
 
-**H4 evidence (2026-11-03, pi6, namespace c3-h4):**
+**H4 evidence — Ingress pod-to-pod (2026-11-03, pi6, namespace c3-h4):**
 
 ```
 Setup: target Deployment (httpd:2.4) pinned to pi6, Service target.c3-h4:80.
@@ -1045,41 +1045,41 @@ Cluster NetworkPolicies at time of probe: 32
 ```
 
 **Interpretation:** the same probe pod, same service, only the NetworkPolicy
-differing → the embedded controller enforces the policy. The `Connection
-refused` (not a timeout) is the expected TCP behaviour when the kernel
-drops the connection after the network-policy controller marks it denied.
+differing → the embedded controller enforces the policy. The probe got
+`Connection refused`.
 
 **What this means for coxswain's D38 gate:** the operator's CNI probe
 (`internal/cni/pod_prober.go`) runs its own self-test pod and checks whether
-the CNI enforces NetworkPolicy. On flannel + k3s embedded network-policy
-controller, the probe **should pass** — the embedded controller enforces
-the netpol the probe applies. The gate reads `NetworkEnforced=True reason
-CNIEnforced` and the Loop runs. If the k3s embedded controller is not
-enabled (check `systemctl cat k3s | grep network-policy`), the probe will
-report `CNIUnenforced` and the operator holds Loops `Suspended` with
-`NetworkEnforced=False`.
+the CNI enforces NetworkPolicy. The D38 probe is **not yet verified** on
+this cluster. H4 above proves the controller enforces Ingress pod-to-pod;
+the D38 probe tests Egress to host-network destinations (apiserver
+ClusterIP :443, node :6443, node :10250). Run `make verify-cni
+K8S_CONTEXT=<ctx>` before a coxswain run and expect
+`NetworkEnforced=True`; if it reports `CNIUnenforced`, the operator holds
+Loops Suspended.
 
-**Check the k3s embedded controller is enabled:**
+**Check the k3s embedded controller is on:**
 
 The most reliable check is the empirical one: apply a deny-all
 NetworkPolicy to a test pod and verify that connections to that pod are
-blocked (the H4 probe above). For a config check:
+blocked (the H4 probe above). For a config check: confirm
+`disable-network-policy` is **absent** in config.yaml, the k3s unit, and
+the k3s cmdline — its absence everywhere is what keeps the controller on:
 
 ```sh
 # On the k3s control-plane node(s):
 # Check config.yaml (may not be present on all k3s installs):
-grep network-policy /etc/rancher/k3s/config.yaml 2>/dev/null || echo "not in config.yaml"
-# The k3s server process may have the flag via env or a service file
-# that is not always visible via ps:
-sudo -n cat /proc/$(pgrep -x k3s | head -1)/cmdline 2>/dev/null | tr '\0' '\n' | grep network-policy || echo "not in cmdline (may be enabled via env)"
+grep disable-network-policy /etc/rancher/k3s/config.yaml 2>/dev/null || echo "not in config.yaml (expected — controller stays on)"
+sudo systemctl cat k3s 2>/dev/null | grep disable-network-policy || echo "not in the k3s unit (expected — controller stays on)"
+sudo -n cat /proc/$(pgrep -x k3s | head -1)/cmdline 2>/dev/null | tr '\0' '\n' | grep disable-network-policy || echo "not in cmdline (expected — controller stays on)"
 ```
 
-If the probe reports `CNIUnenforced`, the embedded controller is not
-active. Enable it (requires k3s restart on each node):
+If the probe reports `CNIUnenforced`, the embedded controller was
+disabled. Turn it back on (requires k3s restart on each node): remove
+`disable-network-policy` from `/etc/rancher/k3s/config.yaml` or the k3s
+unit, then
 
 ```sh
-# Add to /etc/rancher/k3s/config.yaml:
-network-policy: true
 sudo systemctl restart k3s
 ```
 
@@ -1140,7 +1140,7 @@ kubectl -n coxswain-system patch deploy coxswain-controller-manager \
 | agent-sandbox controller (v1.0.4) | **Not installed** | H1: `kubectl apply -f https://github.com/kubernetes-sigs/agent-sandbox/releases/download/v1.0.4/sandbox.yaml` |
 | KubeArmor BPF-LSM (policy gate, ADR-0007) | **Not installed; BPF-LSM requires `lsm=…,bpf` on kernel cmdline** | H5: enable BPF-LSM on pool nodes only, then install KubeArmor v1.7.5 with a nodeSelector to the pool |
 | VolumeSnapshot CRDs + snapshot-controller + VolumeSnapshotClass (checkpoints, fork, rollback) | **Not installed** (no snapshot CRDs found; ceph-csi's csi-snapshotter sidecar is present but there is no controller or class) | H1: install external-snapshotter CRDs + controller + a VolumeSnapshotClass for `rbd.csi.ceph.com` (the default StorageClass). Until this lands, `spec.checkpoints: Required` Loops will fail at start with `Failed:CheckpointUnavailable`; the default (best-effort) path sets `CheckpointsAvailable=False` and carries on |
-| flannel + k3s embedded network-policy controller (D38 gate) | **Enabled** (H4 evidence above; 32 NetworkPolicies in use) | Confirm `network-policy: true` is set in the k3s config; the D38 CNI probe should pass |
+| flannel + k3s embedded network-policy controller (D38 gate) | **On by default** (H4 evidence above; 32 NetworkPolicies in use) | Confirm `disable-network-policy` is absent from the k3s config / unit / cmdline; the D38 CNI probe is **not yet verified** (H4 proved Ingress pod-to-pod; the D38 probe tests Egress to host-network destinations) — run `make verify-cni K8S_CONTEXT=<ctx>` before a coxswain run |
 | Multi-arch images (C1) | **Not yet** — release images are amd64-only | C1 (`.github/workflows/release.yml`) is an owner push. Until it lands, arm64 nodes cannot pull the release images. The homelab plan (H2) recommends tainting pi13 `kubernetes.io/arch=arm64:NoSchedule` until C1 merges |
 | `--loop-node-selector` / `--loop-tolerations` (C2) | **Merged** (main) | Use the C2 flags to pin Loops to a dedicated amd64 pool (the H2 pool) |
 | NetworkPolicy count | 32 existing NetworkPolicies | The D38 probe applies its own netpol in `coxswain-cni-probe`; the existing 32 do not interfere |
@@ -1152,9 +1152,12 @@ records what was verified from the coxswain side on 2026-11-03:
 
 - **H3 (SMB memory):** ✅ Verified (evidence above). The `smb` StorageClass
   works as a RWX class for the memory PVC on this cluster.
-- **H4 (flannel network gate):** ✅ Verified (evidence above). The k3s
-  embedded network-policy controller enforces NetworkPolicy; the D38 CNI
-  probe should pass.
+- **H4 (flannel network gate):** ⚠️ Partly verified (Ingress pod-to-pod
+  only; the D38 egress probe not yet run — see above). The k3s embedded
+  network-policy controller enforces Ingress pod-to-pod NetworkPolicy
+  (H4 evidence above); the D38 CNI probe (Egress to host-network
+  destinations) is not yet verified — run `make verify-cni
+  K8S_CONTEXT=<ctx>` before a coxswain run.
 - **H1 (agent-sandbox + VolumeSnapshot):** ❌ Not yet. The agent-sandbox
   controller is not installed; the VolumeSnapshot CRDs and
   VolumeSnapshotClass are not installed. Checkpoints and fork/rollback are

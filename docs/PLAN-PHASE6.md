@@ -1,7 +1,7 @@
 # Next phase: Phase 6 — policy breadth, defence in depth, and the retry path
 
-**Status:** draft for owner review (docs only; the owner approves before any
-code). The open decisions D95–D101 are decided (owner, 2026-11-01 and
+**Status:** approved by the owner, 2026-11-04 (decisions D95–D101 recorded
+under Owner decisions). The open decisions D95–D101 are decided (owner, 2026-11-01 and
 2026-11-04); see Owner decisions. Built from the owner's 2026-11-01 decisions: the **homelab readiness
 direction** (running on the homelab is the point of the next phase; the
 homelab side is planned in the homelab repo — `papawattu/homelab` PR #149,

@@ -210,15 +210,17 @@ run_case() {
     # its 5 assert_blocked calls.
     d38_hostnet_verdict
   )"
-  # A NOT_LISTENING note is not a bad, but it is not a full PASS either
-  # (the e2e never PASSes a NOT_LISTENING row; R25 I84: no PASS for an
-  # unproven step). Count the NOTE lines in the captured output.
-  nl=$(printf '%s\n' "$out" | grep -c "^    NOTE: .*NOT_LISTENING" || true)
+  # got follows the F: lines ALONE, exactly as the real e2e does: there a
+  # NOT_LISTENING row is a NOTE only (assert_blocked returns 1, but the
+  # e2e's verdict is the F: output + d38_hostnet_verdict), so the e2e PASSes
+  # when the verdict holds even if a host-network target is NOT_LISTENING.
+  # (Round-2 P2: an earlier [ "$nl" -ge 1 ] && got=FAIL override made every
+  # NOT_LISTENING case a forced FAIL, which both misstated the e2e and
+  # masked mutation M2 — the verdict no longer mattered to that case.)
   case "$out" in
     *"F: "*) got=FAIL ;;
     *) got=PASS ;;
   esac
-  [ "$nl" -ge 1 ] && got=FAIL
   if [ "$got" = "$want" ]; then
     ok "$name -> $got (want $want)"
   else
@@ -323,6 +325,45 @@ RESULT KUBELET_NODE REFUSED
 RESULT INTERNAL_POD BLOCKED(TimeoutError)
 RESULT EXTERNAL BLOCKED(TimeoutError)'
 run_case FAIL "$HN_POLICY" "$HN_CONTROL" "APISERVER_SVC BLOCKED but both host-network targets NOT_LISTENING (no host-network target was measurable)"
+# Beyond the want-FAIL above, assert the verdict's OWN line: with got now
+# following the F: lines alone, a d38_hostnet_verdict that is mutated into a
+# no-op would print no F: line at all, so the case would PASS on its own —
+# this direct check (the SAME five assert_blocked calls + d38_hostnet_verdict)
+# greps the captured output for the verdict's bad line (catches M2).
+hn_out=$(
+  ok() { echo "    P: $*"; }
+  bad() { echo "    F: $*"; }
+  PROBE_OUT="$HN_POLICY" CONTROL_OUT="$HN_CONTROL"
+  APISERVER_SVC_OK=0 APISERVER_NODE_OK=0 KUBELET_NODE_OK=0
+  NOT_LISTENING_COUNT=0
+  assert_blocked APISERVER_SVC "case: both host-network NOT_LISTENING (verdict line)" && APISERVER_SVC_OK=1
+  assert_blocked APISERVER_NODE "case: both host-network NOT_LISTENING (verdict line)" && APISERVER_NODE_OK=1
+  assert_blocked KUBELET_NODE "case: both host-network NOT_LISTENING (verdict line)" && KUBELET_NODE_OK=1
+  assert_blocked INTERNAL_POD "case: both host-network NOT_LISTENING (verdict line)"
+  assert_blocked EXTERNAL "case: both host-network NOT_LISTENING (verdict line)"
+  d38_hostnet_verdict
+)
+if printf '%s\n' "$hn_out" | grep -q 'F: no host-network target was measurable'; then
+  ok "both host-network targets NOT_LISTENING: the verdict's own line is printed (F: no host-network target was measurable)"
+else
+  bad "both host-network targets NOT_LISTENING: want the verdict line 'F: no host-network target was measurable', got: $(printf '%s' "$hn_out" | tr '\n' ' ')"
+fi
+# The homelab worker shape: the apiserver node has no apiserver (control
+# REFUSED -> NOT_LISTENING note, a NOTE in the real e2e, never a failure),
+# but the kubelet target IS measurable (policy REFUSED + control REACHABLE ->
+# BLOCKED) and everything else is BLOCKED. The verdict holds, so the real
+# e2e PASSes: a NOTE must not flip a holding verdict to a failure.
+HW_POLICY='RESULT APISERVER_SVC BLOCKED(TimeoutError)
+RESULT APISERVER_NODE REFUSED
+RESULT KUBELET_NODE REFUSED
+RESULT INTERNAL_POD BLOCKED(TimeoutError)
+RESULT EXTERNAL BLOCKED(TimeoutError)'
+HW_CONTROL='RESULT APISERVER_SVC REACHABLE
+RESULT APISERVER_NODE REFUSED
+RESULT KUBELET_NODE REACHABLE
+RESULT INTERNAL_POD BLOCKED(TimeoutError)
+RESULT EXTERNAL BLOCKED(TimeoutError)'
+run_case PASS "$HW_POLICY" "$HW_CONTROL" "homelab worker: APISERVER_NODE NOT_LISTENING (no apiserver on a worker), KUBELET_NODE BLOCKED, the verdict holds -> PASS"
 # A missing control line (control pass produced nothing): every REFUSED row
 # combines to UNRESOLVED -> FAIL.
 run_case FAIL "$D5_REFUSED_P" "" "a missing control line (UNRESOLVED)"

@@ -169,7 +169,7 @@ AGENTS I68).
   **Acceptance:** no session-ready mark in the next window without a named full-suite log; no
   "pre-existing" claim on a file the PR's diff touches.
 
-- [ ] **I205: the `kind-calico-up` Makefile target regressed in the I85 fix (`41635e9`) and the regression FATAL'd the first real lab run**
+- [x] **I205: the `kind-calico-up` Makefile target regressed in the I85 fix (`41635e9`) and the regression FATAL'd the first real lab run** (`2f33945` (#390))
 
   **Where:** log 11-04 10:06Z: "LAB d38 e2e run3: FATAL admission deploy failed — 'cd: null
   directory': Makefile kind-calico-up I85 comment lines (Makefile:376-378) lack trailing '\', so
@@ -278,7 +278,7 @@ AGENTS I68).
   **Acceptance:** the message is kind-neutral (or kind-accurate) and the ClusterAgentPolicy-ref spec
   asserts it.
 
-- [ ] **I209: `verify-cni.sh:568`'s FAIL line reports UNRESOLVED rows as REACHABLE**
+- [x] **I209: `verify-cni.sh:568`'s FAIL line reports UNRESOLVED rows as REACHABLE** (`a6f469b` (#392))
 
   **Where:** `test/e2e/verify-cni.sh:568`: `echo "FAIL: $TOTAL_FAIL of $TOTAL probe targets were
   REACHABLE despite the NetworkPolicy"`; the homelab run's own output is the demonstration
@@ -297,7 +297,7 @@ AGENTS I68).
   **Acceptance:** a dry run of the FAIL branch with a stubbed RESULT mix prints the split counts,
   and no row that is not REACHABLE is reported as one.
 
-- [ ] **I210: the C3 k3s doc section is stale where the 11-04 evidence speaks**
+- [x] **I210: the C3 k3s doc section is stale where the 11-04 evidence speaks** (`a6f469b` (#392), `a44c04d` (#393))
 
   **Where:** `docs/OPERATOR.md:1194` (C3 deltas table): "the D38 CNI probe is **not yet verified**
   (H4 proved Ingress pod-to-pod; the D38 probe tests Egress to host-network destinations) — run

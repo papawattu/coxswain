@@ -32,6 +32,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
 // fakeReader is a client.Reader backed by an empty fake client (the reader and
@@ -216,7 +217,7 @@ func TestWaitForTerminationEmptyMessageIsFailure(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	start := time.Now()
-	msg, err := p.waitForTermination(ctx, &corev1.Pod{
+	msg, _, err := p.waitForTermination(ctx, &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: probePodName, Namespace: probePodName},
 	})
 	elapsed := time.Since(start)
@@ -248,7 +249,7 @@ func TestWaitForTerminationReturnsMessageOnTermination(t *testing.T) {
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	got, err := p.waitForTermination(ctx, &corev1.Pod{
+	got, read, err := p.waitForTermination(ctx, &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: probePodName, Namespace: probePodName},
 	})
 	if err != nil {
@@ -256,6 +257,105 @@ func TestWaitForTerminationReturnsMessageOnTermination(t *testing.T) {
 	}
 	if got != msg {
 		t.Fatalf("want the termination message %q, got %q", msg, got)
+	}
+	// The pod it read (with the scheduler's node and the container status) is
+	// what runPod returns its node from — not the created object.
+	if read == nil {
+		t.Fatal("waitForTermination must return the pod it read (runPod reads spec.nodeName off it)")
+	}
+}
+
+// D103 (slice B, round 2, P1): the probe pod has NO node at creation — the
+// scheduler assigns spec.nodeName later — so runPod must read the node off
+// the pod it READ (waitForTermination's Get), not the object it created.
+// The interceptor plays the scheduler: the Get of the probe pod comes back
+// with spec.nodeName set and the probe container terminated. Reviewer
+// mutation M-B5 (return the created pod's NodeName again) must fail this.
+func TestRunPodReturnsTheScheduledNode(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = networkingv1.AddToScheme(scheme)
+	cl := fake.NewClientBuilder().WithScheme(scheme).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if err := c.Get(ctx, key, obj, opts...); err != nil {
+					return err
+				}
+				if pod, ok := obj.(*corev1.Pod); ok && key.Name == probePodName {
+					// The scheduler's assignment arrives AFTER creation, so the
+					// interceptor applies it after the real read (mutating the
+					// object before the read would hit a fresh object, not the
+					// stored one).
+					pod.Spec.NodeName = "n1"
+					pod.Status.Phase = corev1.PodSucceeded
+					pod.Status.ContainerStatuses = []corev1.ContainerStatus{{
+						Name: "probe",
+						State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+							ExitCode: 0,
+							Reason:   "Completed",
+							Message:  controlOK,
+						}},
+					}}
+				}
+				return nil
+			},
+		}).Build()
+	p := NewPodProber(PodProberConfig{Namespace: probePodName, ProbeImage: probeTestImage, ProbeTimeout: 30 * time.Second, Client: cl, Reader: cl})
+	// Built with NO node: the created object's spec.nodeName is ""; only the
+	// scheduler's assignment (via the interceptor) knows the node.
+	pod := p.buildPod(probePodName, probeLabelValue, "")
+	if pod.Spec.NodeName != "" {
+		t.Fatalf("precondition: the created pod must have no node, got %q", pod.Spec.NodeName)
+	}
+	msg, node, err := p.runPod(context.Background(), pod)
+	if err != nil {
+		t.Fatalf("runPod: %v", err)
+	}
+	if node != "n1" {
+		t.Fatalf("runPod node = %q, want \"n1\" (the scheduler's assignment, read off the terminated pod — the created object has none)", node)
+	}
+	if msg != controlOK {
+		t.Fatalf("runPod msg = %q, want the termination message", msg)
+	}
+}
+
+// D103 (slice B, round 2, P2): a pass whose probe container terminated with a
+// NON-ZERO exit code is a hard failure ("probe exited non-zero: <code>" →
+// ProbeUnavailable), even if the termination message would parse — tested
+// through the REAL runPod, not a stub. Reviewer mutation M-B6 (drop the
+// non-zero exit check) must fail this.
+func TestRunPodNonZeroExitIsError(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = networkingv1.AddToScheme(scheme)
+	cl := fake.NewClientBuilder().WithScheme(scheme).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if err := c.Get(ctx, key, obj, opts...); err != nil {
+					return err
+				}
+				if pod, ok := obj.(*corev1.Pod); ok && key.Name == probePodName {
+					pod.Spec.NodeName = "n1"
+					pod.Status.Phase = corev1.PodFailed
+					pod.Status.ContainerStatuses = []corev1.ContainerStatus{{
+						Name: "probe",
+						State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+							ExitCode: 3,
+							Reason:   "Error",
+							Message:  controlOK, // a message that WOULD parse — the exit code must still win
+						}},
+					}}
+				}
+				return nil
+			},
+		}).Build()
+	p := NewPodProber(PodProberConfig{Namespace: probePodName, ProbeImage: probeTestImage, ProbeTimeout: 30 * time.Second, Client: cl, Reader: cl})
+	_, node, err := p.runPod(context.Background(), p.buildPod(probePodName, probeLabelValue, ""))
+	if err == nil {
+		t.Fatalf("runPod: a non-zero probe exit must be an error, got node %q", node)
+	}
+	if !strings.Contains(err.Error(), "non-zero") {
+		t.Fatalf("want a 'probe exited non-zero' error, got: %v", err)
 	}
 }
 
@@ -498,7 +598,7 @@ func TestBuildPodIsPinnedAndCredentialFree(t *testing.T) {
 			if c.Spec.Containers[0].Image == "" {
 				t.Error("the probe container must carry the configured image")
 			}
-			pin := c.Spec.NodeSelector["kubernetes.io/hostname"]
+			pin := nodeAffinityMatchFieldsValue(c)
 			if pin != tc.wantPinned {
 				t.Errorf("NodeSelector[\"kubernetes.io/hostname\"] = %q, want %q", pin, tc.wantPinned)
 			}
@@ -846,9 +946,36 @@ func TestPolicyPodPinnedToControlNode(t *testing.T) {
 	if got := policyPod.Labels[probeLabelKey]; got != probeLabelValue {
 		t.Fatalf("the policy pod must carry the netpol-selected label %s=%q", probeLabelKey, got)
 	}
-	if got := policyPod.Spec.NodeSelector["kubernetes.io/hostname"]; got != "n1" {
-		t.Fatalf("the policy pod must be pinned to the control pod's node via NodeSelector kubernetes.io/hostname=n1, got NodeSelector %v", policyPod.Spec.NodeSelector)
+	// The pin is a required node affinity on the node's NAME (a MatchFields
+	// metadata.name In [node] term) — the kubernetes.io/hostname label is not
+	// guaranteed to equal the node name, so a hostname NodeSelector would not
+	// schedule on a renamed node (D103 round 2, P3).
+	if got := nodeAffinityMatchFieldsValue(policyPod); got != "n1" {
+		t.Fatalf("the policy pod must be pinned to the control pod's node by a required node affinity metadata.name In [n1], got affinity %v", policyPod.Spec.Affinity)
 	}
+	if len(policyPod.Spec.NodeSelector) != 0 {
+		t.Errorf("the policy pod must not use a NodeSelector (the hostname label is not guaranteed to equal the node name), got %v", policyPod.Spec.NodeSelector)
+	}
+}
+
+// nodeAffinityMatchFieldsValue returns the value of the policy pod's required
+// node affinity MatchFields term for metadata.name ("" when absent).
+func nodeAffinityMatchFieldsValue(pod *corev1.Pod) string {
+	if pod.Spec.Affinity == nil || pod.Spec.Affinity.NodeAffinity == nil {
+		return ""
+	}
+	req := pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution
+	if req == nil {
+		return ""
+	}
+	for _, term := range req.NodeSelectorTerms {
+		for _, mf := range term.MatchFields {
+			if mf.Key == "metadata.name" && mf.Operator == corev1.NodeSelectorOpIn && len(mf.Values) == 1 {
+				return mf.Values[0]
+			}
+		}
+	}
+	return ""
 }
 
 // D103 (slice B): the homelab case, end-to-end through the seam. Control

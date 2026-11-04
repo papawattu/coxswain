@@ -84,6 +84,9 @@ const (
 	probeControlPod = "coxswain-cni-probe-control"
 	probeNetpolName = "coxswain-cni-probe-netpol"
 	probeLabelKey   = "coxswain.io/probe"
+	// probeContainerName is the probe pod's single container name; every read
+	// of its ContainerStatus keys on it.
+	probeContainerName = "probe"
 	// probeLabelValue is the policy pass's probe label value: the probe
 	// NetworkPolicy selects exactly coxswain.io/probe=cni-probe, so the control
 	// pass (cni-probe-control) runs with NO policy applied (D103).
@@ -363,7 +366,7 @@ func (p *PodProber) runPod(ctx context.Context, pod *corev1.Pod) (string, string
 	if err := p.cfg.Client.Create(ctx, pod); err != nil {
 		return "", "", fmt.Errorf("%s pod create: %w", pod.Name, err)
 	}
-	msg, err := p.waitForTermination(ctx, pod)
+	msg, read, err := p.waitForTermination(ctx, pod)
 	// Best-effort pod deletion on any exit path (the stale cleanup at the
 	// start of the next probe is the backstop).
 	defer func() {
@@ -374,7 +377,11 @@ func (p *PodProber) runPod(ctx context.Context, pod *corev1.Pod) (string, string
 	if err != nil {
 		return "", "", fmt.Errorf("%s pod: %w", pod.Name, err)
 	}
-	return msg, pod.Spec.NodeName, nil
+	// The node is the SCHEDULER's assignment, read back off the terminated
+	// pod. The object we created carries no spec.nodeName (the scheduler
+	// fills it in later), so returning pod.Spec.NodeName here would return
+	// "" on a real cluster and every probe would be ProbeUnavailable.
+	return msg, read.Spec.NodeName, nil
 }
 
 // LatestResult implements CNIProber: it returns the holder's cached result
@@ -456,22 +463,22 @@ func (p *PodProber) ensureNetpol(ctx context.Context) error {
 // pod, D38 design point 2). Both passes share the shape (same image, command,
 // env, security context, no token automount); they differ in name, the probe
 // label value (the netpol selects only probeLabelValue) and node pinning (the
-// policy pass is pinned to the control pod's node via kubernetes.io/hostname
-// when nodeName != "", so both passes measure the same node — D103).
-func (p *PodProber) buildPod(name, probeLabelValue, nodeName string) *corev1.Pod {
+// policy pass is pinned to the control pod's node by NAME via a required node
+// affinity when nodeName != "", so both passes measure the same node — D103).
+func (p *PodProber) buildPod(name, labelValue, nodeName string) *corev1.Pod {
 	nonRoot := int64(65532)
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: p.cfg.Namespace,
-			Labels:    map[string]string{probeLabelKey: probeLabelValue},
+			Labels:    map[string]string{probeLabelKey: labelValue},
 		},
 		Spec: corev1.PodSpec{
 			RestartPolicy:      corev1.RestartPolicyNever,
 			ServiceAccountName: "coxswain-cni-probe",
 			Containers: []corev1.Container{
 				{
-					Name:    "probe",
+					Name:    probeContainerName,
 					Image:   p.cfg.ProbeImage,
 					Command: p.probeCommand(),
 					// F65 (P2-2): an EXPLICIT pull policy. Unset, the kubelet derives it
@@ -514,7 +521,25 @@ func (p *PodProber) buildPod(name, probeLabelValue, nodeName string) *corev1.Pod
 		},
 	}
 	if nodeName != "" {
-		pod.Spec.NodeSelector = map[string]string{"kubernetes.io/hostname": nodeName}
+		// Pin by the node's NAME via a required node affinity with a
+		// metadata.name MatchFields term. A kubernetes.io/hostname NodeSelector
+		// assumes the hostname LABEL equals the node name, which is not
+		// guaranteed (a renamed node, or a custom hostname label, would not
+		// schedule the policy pass and it would time out ProbeUnavailable).
+		pod.Spec.Affinity = &corev1.Affinity{
+			NodeAffinity: &corev1.NodeAffinity{
+				RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+					NodeSelectorTerms: []corev1.NodeSelectorTerm{{
+						MatchFields: []corev1.NodeSelectorRequirement{{
+							Key:      "metadata.name",
+							Operator: corev1.NodeSelectorOpIn,
+							Values:   []string{nodeName},
+						}},
+					},
+					},
+				},
+			},
+		}
 	}
 	return pod
 }
@@ -525,7 +550,7 @@ func (p *PodProber) buildPod(name, probeLabelValue, nodeName string) *corev1.Pod
 // to logs on error covers a FAILED exit.
 func containerTerminationMessage(pod *corev1.Pod) string {
 	for _, cs := range pod.Status.ContainerStatuses {
-		if cs.Name == "probe" {
+		if cs.Name == probeContainerName {
 			if cs.State.Terminated != nil {
 				return cs.State.Terminated.Message
 			}
@@ -537,7 +562,12 @@ func containerTerminationMessage(pod *corev1.Pod) string {
 // waitForTermination polls the pod until the probe container has terminated
 // (its termination message is then available) or the context is done. A
 // not-Ready / no-exit / pull-failure within the timeout is a ProbeUnavailable
-// (the caller maps it).
+// (the caller maps it). It returns the pod it READ (not the created object):
+// spec.nodeName is the scheduler's assignment and exists only on the read
+// object, and the probe container's exit code is only known from its
+// ContainerStatus. A non-zero exit is a hard failure ("probe exited
+// non-zero: <code>") — never a verdict about the fence, even if the
+// termination message (FallbackToLogsOnError's log tail) parses cleanly.
 //
 // Once the container has Terminated the message is read — even if it is
 // EMPTY. An empty message is a hard failure ("empty termination message" →
@@ -546,26 +576,31 @@ func containerTerminationMessage(pod *corev1.Pod) string {
 // itself writes /dev/termination-log. A Terminated container with an empty
 // message from either path will never produce one — spinning to the timeout
 // (60s per run) would just delay the same fail-closed result.
-func (p *PodProber) waitForTermination(ctx context.Context, pod *corev1.Pod) (string, error) {
+func (p *PodProber) waitForTermination(ctx context.Context, pod *corev1.Pod) (string, *corev1.Pod, error) {
 	probe := &corev1.Pod{}
 	reader := p.getReader()
 	for {
 		if err := reader.Get(ctx, client.ObjectKey{Namespace: pod.Namespace, Name: pod.Name}, probe); err != nil {
-			return "", fmt.Errorf("probe pod get: %w", err)
+			return "", nil, fmt.Errorf("probe pod get: %w", err)
 		}
-		if podTerminated(probe, "probe") {
+		if podTerminated(probe, probeContainerName) {
+			for _, cs := range probe.Status.ContainerStatuses {
+				if cs.Name == probeContainerName && cs.State.Terminated != nil && cs.State.Terminated.ExitCode != 0 {
+					return "", nil, fmt.Errorf("probe exited non-zero: %d", cs.State.Terminated.ExitCode)
+				}
+			}
 			msg := containerTerminationMessage(probe)
 			if msg == "" {
-				return "", fmt.Errorf("empty termination message (probe container terminated with no output)")
+				return "", nil, fmt.Errorf("empty termination message (probe container terminated with no output)")
 			}
-			return msg, nil
+			return msg, probe, nil
 		}
 		if probe.Status.Phase == corev1.PodFailed {
-			return "", fmt.Errorf("probe pod failed")
+			return "", nil, fmt.Errorf("probe pod failed")
 		}
 		select {
 		case <-ctx.Done():
-			return "", fmt.Errorf("probe pod not Ready within timeout")
+			return "", nil, fmt.Errorf("probe pod not Ready within timeout")
 		case <-time.After(2 * time.Second):
 		}
 	}

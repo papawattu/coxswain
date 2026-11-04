@@ -670,9 +670,10 @@ func (r *LoopReconciler) agentPoliciesValid(ctx context.Context, loop *coxv1alph
 		// the resolver's own (validateAgentPolicies already ran both Gets per
 		// ref) — no extra API calls here. Transition-gated on the sorted
 		// collision set: a Loop that stays collided re-reconciles on the
-		// requeue cadence, so one Event per change, not per pass. An Event
-		// emission never blocks the gate (a Recorder failure is not a policy
-		// failure).
+		// requeue cadence, so one Event per change, not per pass. Neither an
+		// Event emission (Recorder failure) nor a persist failure
+		// (updateLoopAnnotations logs it) blocks the gate — a lost write
+		// degrades to a later Event, never a missed one.
 		r.emitPolicyNameCollision(ctx, loop, polResult.policyNameCollisions)
 		return true
 	}
@@ -1821,23 +1822,47 @@ func (r *LoopReconciler) emitPolicyNameCollision(ctx context.Context, loop *coxv
 	} else {
 		loop.Annotations[key] = cur
 	}
-	r.updateLoopAnnotations(ctx, loop)
+	if err := r.updateLoopAnnotations(ctx, loop); err != nil {
+		logf.FromContext(ctx).Error(err, "persist the policy-collisions annotation",
+			"loop", loop.Name, "namespace", loop.Namespace)
+	}
 }
 
-// updateLoopAnnotations persists loop.Annotations (the collision set's
-// durable surface, the PolicyValid condition, and the other annotation
-// writes) via a re-fetch + metadata-only Update (the I42e/conditional-update
-// pattern: re-fetch to avoid clobbering a concurrent writer; a lost race
-// re-lands on the next pass — the transition gate re-fires only when the
-// set actually changes, so a lost write degrades to a later Event, never a
-// missed one).
-func (r *LoopReconciler) updateLoopAnnotations(ctx context.Context, loop *coxv1alpha1.Loop) {
-	var fresh coxv1alpha1.Loop
-	if err := r.Get(ctx, client.ObjectKeyFromObject(loop), &fresh); err != nil {
-		return
+// updateLoopAnnotations persists the coxswain.io/policy-collisions annotation
+// via a re-fetch + MERGE patch (the D85 removeApprovalAnnotations pattern):
+// the patch sets or removes ONLY the collision key, so a concurrent writer
+// (e.g. the D85 approve/reject annotation) lands between this pass's read and
+// write and is NOT clobbered — the old full-map Update replaced the whole
+// annotation map with the copy read at the top of Reconcile, dropping
+// concurrent annotations. A patch failure is logged by the caller and the
+// reconcile does not fail on it: the transition gate re-fires only when the
+// collision set changes, so a lost write degrades to a later Event, never a
+// missed one. The patched value is copied back onto the in-memory loop so the
+// rest of the pass sees it.
+func (r *LoopReconciler) updateLoopAnnotations(ctx context.Context, loop *coxv1alpha1.Loop) error {
+	const key = "coxswain.io/policy-collisions"
+	fresh := &coxv1alpha1.Loop{}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(loop), fresh); err != nil {
+		return client.IgnoreNotFound(err)
 	}
-	fresh.Annotations = loop.Annotations
-	_ = r.Update(ctx, &fresh)
+	updated := fresh.DeepCopy()
+	if updated.Annotations == nil {
+		updated.Annotations = map[string]string{}
+	}
+	if cur, ok := loop.Annotations[key]; ok {
+		updated.Annotations[key] = cur
+	} else {
+		delete(updated.Annotations, key)
+	}
+	if err := r.Patch(ctx, updated, client.MergeFrom(fresh)); err != nil {
+		return err
+	}
+	// The patch bumped the Loop's resourceVersion; copy the patched
+	// annotation back onto the in-memory loop so the rest of this pass (and
+	// the transition gate's read of the durable surface) sees the written
+	// value.
+	loop.Annotations[key] = updated.Annotations[key]
+	return nil
 }
 
 // dedupToolsBySpec removes duplicate ToolSpecs from the union by full struct
@@ -6706,6 +6731,12 @@ func (r *LoopReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		// PolicyNotFound; a policy edit must refresh the recorded hash).
 		Watches(&coxv1alpha1.AgentPolicy{}, handler.EnqueueRequestsFromMapFunc(
 			r.agentPolicyToLoopRequests))
+	// Watch ClusterAgentPolicy: a cluster policy is referenced across
+	// namespaces, so the map lists ALL namespaces (a ClusterAgentPolicy edit,
+	// including a narrowing one, must refresh every referencing Loop's
+	// recorded hash).
+	b.Watches(&coxv1alpha1.ClusterAgentPolicy{}, handler.EnqueueRequestsFromMapFunc(
+		r.clusterAgentPolicyToLoopRequests))
 	// The operator owns the per-Loop KubeArmorPolicy (A1/D52 fact 3, name
 	// "coxswain-<loop>"). Watch it so a tamper (a spec change after the
 	// operator applied the canonical policy) re-reconciles the Loop at once
@@ -6814,6 +6845,36 @@ func (r *LoopReconciler) agentPolicyToLoopRequests(ctx context.Context, obj clie
 	); err != nil {
 		logf.FromContext(ctx).Error(err, "list Loops by policyRefs index for AgentPolicy watch",
 			"policy", ap.Name, "namespace", ap.Namespace)
+		return nil
+	}
+	requests := make([]reconcile.Request, 0, len(loops.Items))
+	for i := range loops.Items {
+		requests = append(requests, reconcile.Request{
+			NamespacedName: types.NamespacedName{
+				Namespace: loops.Items[i].Namespace,
+				Name:      loops.Items[i].Name,
+			},
+		})
+	}
+	return requests
+}
+
+// clusterAgentPolicyToLoopRequests maps a ClusterAgentPolicy to the Loops in
+// ALL namespaces whose spec.policyRefs contains its name (a ClusterAgentPolicy
+// is cluster-scoped, so it can be referenced from any namespace). Same field
+// index as agentPolicyToLoopRequests; the only difference is the absence of
+// client.InNamespace.
+func (r *LoopReconciler) clusterAgentPolicyToLoopRequests(ctx context.Context, obj client.Object) []reconcile.Request {
+	cap, ok := obj.(*coxv1alpha1.ClusterAgentPolicy)
+	if !ok {
+		return nil
+	}
+	loops := &coxv1alpha1.LoopList{}
+	if err := r.List(ctx, loops,
+		client.MatchingFields{loopPolicyRefsFieldIndex: cap.Name},
+	); err != nil {
+		logf.FromContext(ctx).Error(err, "list Loops by policyRefs index for ClusterAgentPolicy watch",
+			"policy", cap.Name)
 		return nil
 	}
 	requests := make([]reconcile.Request, 0, len(loops.Items))

@@ -331,6 +331,172 @@ var _ = Describe("P6a: ClusterAgentPolicy (D81(b))", func() {
 		Expect(got.Annotations["coxswain.io/policy-collisions"]).To(Equal(p6aBothName),
 			"the collision set is recorded on the Loop (the transition gate's durable surface)")
 	})
+
+	// Review 5736305575 finding 1 (P2): the ClusterAgentPolicy watch's map
+	// function. A ClusterAgentPolicy is cluster-scoped, so the map must list
+	// Loops in ALL namespaces (not just one): a cluster policy referenced
+	// from two namespaces, plus a Loop that names a different policy, must
+	// yield exactly the two referencing Loops.
+	It("maps a ClusterAgentPolicy to the Loops in ALL namespaces that reference it", func() {
+		nsA := "p6a-cap-map-a-" + nowSuffix()
+		nsB := "p6a-cap-map-b-" + nowSuffix()
+		for _, ns := range []string{nsA, nsB} {
+			Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+		}
+
+		capObj := &coxv1alpha1.ClusterAgentPolicy{
+			ObjectMeta: metav1.ObjectMeta{Name: p6aClusterPolicyName},
+			Spec:       coxv1alpha1.AgentPolicySpec{Exec: []string{p6aClusterExec, runnerShellPath}},
+		}
+		Expect(k8sClient.Create(ctx, capObj)).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(ctx, &coxv1alpha1.ClusterAgentPolicy{ObjectMeta: metav1.ObjectMeta{Name: p6aClusterPolicyName}})
+		}()
+
+		// Two Loops in TWO namespaces that both name the cluster policy, plus
+		// one Loop that names a different policy (must not be returned).
+		// p6aBuildLoop uses p6aLoopName for the loop name; for loopOther we
+		// need a different name (it is in the same namespace as loopB).
+		loopA := p6aBuildLoop(nsA, p6aClusterPolicyName)
+		loopB := p6aBuildLoop(nsB, p6aClusterPolicyName)
+		loopOther := &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: "loop-p6a-other", Namespace: nsB},
+			Spec: coxv1alpha1.LoopSpec{
+				Goal:       "P6a ClusterAgentPolicy map spec (other)",
+				Workspace:  coxv1alpha1.Workspace{Repo: c6aTestRepo, Ref: loopRef},
+				PolicyRefs: []string{p6aNamespacedName},
+				Agent:      coxv1alpha1.AgentConfig{Image: runnerImage, Model: testModel},
+				Loop:       coxv1alpha1.LoopSettings{MaxIterations: 1},
+			},
+		}
+		for _, l := range []*coxv1alpha1.Loop{loopA, loopB, loopOther} {
+			Expect(k8sClient.Create(ctx, l)).To(Succeed())
+		}
+
+		// Use the cached client (loopCache, the spec in the P6a test file's
+		// setup helper: k8sClient + loopCache) so the field-indexed path
+		// (MatchingFields on spec.policyRefs) is exercised — the same pattern
+		// as the agentPolicyToLoopRequests unit spec. The Loops were created
+		// via the direct API; wait for the cache to see them.
+		cachedClient, err := client.New(cfg, client.Options{
+			Scheme: k8sClient.Scheme(),
+			Cache:  &client.CacheOptions{Reader: loopCache},
+		})
+		Expect(err).NotTo(HaveOccurred())
+		// Wait for the cache to see our three Loops (loopCache may also see
+		// Loops left over from other specs in the same suite run, so match
+		// by name rather than by total count).
+		wantNames := map[string]bool{
+			nsA + "/" + p6aLoopName: true,
+			nsB + "/" + p6aLoopName: true,
+			nsB + "/loop-p6a-other": true,
+		}
+		Eventually(func() bool {
+			loops := &coxv1alpha1.LoopList{}
+			if err := cachedClient.List(ctx, loops); err != nil {
+				return false
+			}
+			got := map[string]bool{}
+			for i := range loops.Items {
+				got[loops.Items[i].Namespace+"/"+loops.Items[i].Name] = true
+			}
+			for n := range wantNames {
+				if !got[n] {
+					return false
+				}
+			}
+			return true
+		}, "10s").Should(BeTrue(), "the cache must see all three of our Loops")
+
+		cachedReconciler := &LoopReconciler{CNIProber: testCNIProber(), Client: cachedClient, Scheme: k8sClient.Scheme()}
+		requests := cachedReconciler.clusterAgentPolicyToLoopRequests(ctx, capObj)
+		// Build the set of returned requests.
+		got := map[string]bool{}
+		for _, req := range requests {
+			got[req.Namespace+"/"+req.Name] = true
+		}
+		// The two Loops we created (both namespaces) must be in the result.
+		Expect(got[nsA+"/"+p6aLoopName]).To(BeTrue(),
+			"the map must include the Loop in namespace A that references the cluster policy")
+		Expect(got[nsB+"/"+p6aLoopName]).To(BeTrue(),
+			"the map must include the Loop in namespace B that references the cluster policy")
+		// The Loop that names a different policy must NOT be in the result.
+		Expect(got[nsB+"/loop-p6a-other"]).To(BeFalse(),
+			"the map must NOT include the Loop that references a different policy")
+
+		// A non-ClusterAgentPolicy object maps to nothing.
+		Expect(cachedReconciler.clusterAgentPolicyToLoopRequests(ctx, &corev1.Pod{})).To(BeNil(),
+			"a non-ClusterAgentPolicy object must map to no requests")
+	})
+
+	// Review 5736305575 finding 2 (P2): updateLoopAnnotations must not clobber
+	// concurrent annotation writes. The old full-map Update replaced the whole
+	// annotation map with the copy read at the top of Reconcile, dropping
+	// a concurrent annotation (e.g. a D85 approve/reject) that landed between
+	// the read and the write. The fix is a merge patch that sets or removes
+	// ONLY the coxswain.io/policy-collisions key.
+	It("updateLoopAnnotations: a concurrent foreign annotation survives the patch (no clobber)", func() {
+		ns := "p6a-anno-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+
+		// Create a Loop that triggers a collision (same setup as spec 4).
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.AgentPolicy{
+			ObjectMeta: metav1.ObjectMeta{Name: p6aBothName, Namespace: ns},
+			Spec:       coxv1alpha1.AgentPolicySpec{Exec: []string{c6aGitBin, runnerShellPath}, Network: []string{i42eExternalHost}},
+		})).To(Succeed())
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.ClusterAgentPolicy{
+			ObjectMeta: metav1.ObjectMeta{Name: p6aBothName},
+			Spec:       coxv1alpha1.AgentPolicySpec{Exec: []string{p6aClusterExec, runnerShellPath}, Network: []string{p6aClusterNetwork}},
+		})).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(ctx, &coxv1alpha1.ClusterAgentPolicy{ObjectMeta: metav1.ObjectMeta{Name: p6aBothName}})
+			_ = k8sClient.Delete(ctx, &coxv1alpha1.AgentPolicy{ObjectMeta: metav1.ObjectMeta{Name: p6aBothName, Namespace: ns}})
+		}()
+
+		loop := p6aBuildLoop(ns, p6aBothName)
+		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
+
+		// Call updateLoopAnnotations directly with an in-memory loop that
+		// lacks the foreign key — this simulates the case where a concurrent
+		// annotation (D85 approve) was written after the top-of-Reconcile read.
+		// The foreign annotation is set on the stored Loop via a separate
+		// patch (a direct k8sClient.Patch, not via the helper, so the helper
+		// does not overwrite it).
+		storedLoop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: p6aLoopName}, storedLoop)).To(Succeed())
+		// The in-memory loop (as read at the top of Reconcile) has NO foreign
+		// annotation; the stored Loop does.
+		inMemLoop := storedLoop.DeepCopy()
+		if inMemLoop.Annotations == nil {
+			inMemLoop.Annotations = map[string]string{}
+		}
+		inMemLoop.Annotations["coxswain.io/policy-collisions"] = p6aBothName
+		// The foreign annotation (e.g. a D85 approve) is written to the
+		// stored Loop by a concurrent writer — a separate merge patch that
+		// sets it alongside (and does not touch) the collision annotation.
+		// The key is set on the stored object now, before the helper runs.
+		foreignPatch := client.MergeFrom(storedLoop.DeepCopy())
+		if storedLoop.Annotations == nil {
+			storedLoop.Annotations = map[string]string{}
+		}
+		storedLoop.Annotations["coxswain.io/approve"] = "true"
+		Expect(k8sClient.Patch(ctx, storedLoop, foreignPatch)).To(Succeed())
+
+		// Now call the helper: it re-reads the stored Loop (which now has
+		// the foreign annotation) and must patch ONLY the collision key,
+		// leaving the foreign annotation in place.
+		Expect(r.updateLoopAnnotations(ctx, inMemLoop)).To(Succeed())
+
+		var got coxv1alpha1.Loop
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: p6aLoopName}, &got)).To(Succeed())
+		Expect(got.Annotations).NotTo(BeNil(), "the Loop must have annotations")
+		Expect(got.Annotations["coxswain.io/approve"]).To(Equal("true"),
+			"the foreign (concurrent) annotation must survive the patch")
+		Expect(got.Annotations["coxswain.io/policy-collisions"]).To(Equal(p6aBothName),
+			"the collision annotation must be set")
+	})
 })
 
 // p6aLoopName is the loop name every spec drives (a real repo/ref so the

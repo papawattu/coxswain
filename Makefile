@@ -353,31 +353,45 @@ kind-calico-up: ## D38: create the coxswain-calico kind cluster (Calico $(CALICO
 	# pre-loaded for offline hosts). F65: the probe image is DIGEST-pinned in
 	# cmd/main.go, and `kind load` matches on the TAG, so this preload line must
 	# carry the same tag as the pin (python:3.13-alpine) or the node pulls the
-	# digest over the network mid-probe.
+	# digest over the network mid-probe. Pull the third-party images first so a
+	# fresh host does not fail the kind load with `image ... not present
+	# locally`; the locally built images (coxswain-controller:d38, $(EGRESS_IMG),
+	# $(PROXY_IMG)) are never pulled.
+	@for img in golang:1.26 busybox:1.36 python:3.13-alpine; do \
+		$(CONTAINER_TOOL) image inspect "$$img" >/dev/null 2>&1 || $(CONTAINER_TOOL) pull "$$img" || { echo "FATAL: pull $$img failed"; exit 1; }; \
+	done
 	@for img in coxswain-controller:d38 $(EGRESS_IMG) $(PROXY_IMG) golang:1.26 busybox:1.36 python:3.13-alpine; do \
 		echo "     kind load: $$img"; \
 		$(KIND) load docker-image "$$img" --name $(CALICO_CLUSTER) || { echo "FATAL: kind load $$img failed"; exit 1; }; \
 	done
+	# D38: the enforcing-CNI profile deploys the config/calico overlay
+	# (config/default + --allow-unenforced ONLY; the D38 network gate is
+	# LIVE — no --allow-unenforced-network). --allow-unenforced bypasses
+	# the D30 KubeArmor gate, which on this cluster (Calico, no KubeArmor,
+	# ADR-0007 F2) would otherwise hold every Loop Suspended regardless of
+	# D38 (Loops run with PolicyEnforced=False/EnforcementDisabled). The
+	# config/cni-probe ns+RBAC is standalone (see
+	# config/cni-probe/kustomization.yaml) and must be applied separately
+	# so the operator's CNI self-test probe can run.
+	# I85: the admission (VAP + binding) is a standalone kustomization
+	# (not under config/calico — the namespace transform would break the
+	# cluster-scoped VAP). Applied separately, like cni-probe.
+	# The whole block below is ONE shell command: every line ends with a
+	# backslash continuation and no bare comment line splits the block
+	# (41635e9/I85 regression: a comment without a trailing backslash
+	# ended the shell, so the admission/cni-probe applies ran in a fresh
+	# shell where TMP_OVERLAY was empty — `cd: null directory`). The trap
+	# removes TMP_OVERLAY on every exit path, replacing the old separate
+	# rm line that ran in its own shell after the block had already ended.
 	@CTX=kind-$(CALICO_CLUSTER); \
 		$(MAKE) kustomize >/dev/null 2>&1; \
 		TMP_OVERLAY=$$(mktemp -d); \
+		trap 'rm -rf "$$TMP_OVERLAY"' EXIT; \
 		cp -r config "$$TMP_OVERLAY/config"; \
 		(cd "$$TMP_OVERLAY/config/manager" && "$(LOCALBIN)/kustomize" edit set image controller=coxswain-controller:d38); \
-		# D38: the enforcing-CNI profile deploys the config/calico overlay \
-		# (config/default + --allow-unenforced ONLY; the D38 network gate is \
-		# LIVE — no --allow-unenforced-network). --allow-unenforced bypasses \
-		# the D30 KubeArmor gate, which on this cluster (Calico, no KubeArmor, \
-		# ADR-0007 F2) would otherwise hold every Loop Suspended regardless of \
-		# D38 (Loops run with PolicyEnforced=False/EnforcementDisabled). The \
-		# config/cni-probe ns+RBAC is standalone (see \
-		# config/cni-probe/kustomization.yaml) and must be applied separately \
-		# so the operator's CNI self-test probe can run. \
 		(cd "$$TMP_OVERLAY" && "$(LOCALBIN)/kustomize" build config/calico | kubectl --context $$CTX apply -f -) || { echo "FATAL: controller deploy failed"; exit 1; }; \
-		# I85: the admission (VAP + binding) is a standalone kustomization
-		# (not under config/calico — the namespace transform would break the
-		# cluster-scoped VAP). Applied separately, like cni-probe.
-		(cd "$$TMP_OVERLAY" && "$(LOCALBIN)/kustomize" build config/admission | kubectl --context $$CTX apply -f -) || { echo "FATAL: admission deploy failed"; exit 1; }; 		(cd "$$TMP_OVERLAY" && "$(LOCALBIN)/kustomize" build config/cni-probe | kubectl --context $$CTX apply -f -) || { echo "FATAL: cni-probe ns/RBAC deploy failed"; exit 1; }
-	@rm -rf "$${TMP_OVERLAY:-}"
+		(cd "$$TMP_OVERLAY" && "$(LOCALBIN)/kustomize" build config/admission | kubectl --context $$CTX apply -f -) || { echo "FATAL: admission deploy failed"; exit 1; }; \
+		(cd "$$TMP_OVERLAY" && "$(LOCALBIN)/kustomize" build config/cni-probe | kubectl --context $$CTX apply -f -) || { echo "FATAL: cni-probe ns/RBAC deploy failed"; exit 1; }
 	@echo "kind-calico-up complete (cluster ready, images loaded; make d38-cni-e2e runs the assertions)."
 
 

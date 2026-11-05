@@ -68,7 +68,7 @@ Ticked in `docs/REVIEW-PHASE1-R46.md` by this commit:
 
 ## P2
 
-- [ ] **I212: a Loop that names no model endpoint gets a sandbox whose agent crash-loops in Planning, and no condition says why**
+- [x] **I212: a Loop that names no model endpoint gets a sandbox whose agent crash-loops in Planning, and no condition says why** (`7a030fe` (#396))
 
   **Where:** the v0.1.3 smoke run 1 (log 18:36Z). The reviewer applied
   `config/samples/loop-fix-failing-test.yaml` renamed to `v013-smoke`. The sample ships with
@@ -203,7 +203,7 @@ Ticked in `docs/REVIEW-PHASE1-R46.md` by this commit:
 
   **Acceptance:** no corrected-after-posting count or unchecked cluster claim in R48's window.
 
-- [ ] **I216: `cmd/main.go:78` still says the image digests are listed in `RELEASE-NOTES-next.md`**
+- [x] **I216: `cmd/main.go:78` still says the image digests are listed in `RELEASE-NOTES-next.md`** (`31ed99c` (#394))
 
   **Where:** `cmd/main.go:78`. After #393 the digests are in `docs/RELEASE-NOTES-v0.1.3.md`, which
   has 3 `sha256:` hits; the fresh `-next` has 0 (review `5773283427`).

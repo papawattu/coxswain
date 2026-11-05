@@ -5,7 +5,22 @@ landed as, like `RELEASE-NOTES-v0.1.3.md`.
 
 ## Upgrade
 
-_(none yet)_
+### D84b (F77): a completed rollback re-verifies at the restored iteration — #400
+
+**What was wrong:** the phase and iteration survived a rollback: a terminal
+Loop restored its tree and nothing ran, and a Loop at maxIterations failed at
+once.
+
+**What changed:** when a rollback (`spec.restoreFrom: iter-N`) completes, the
+operator sets `status.iteration = N`, `phase = Verifying` and
+`desiredPhase = Verifying`, and clears the `Failed` and `Succeeded`
+conditions. The restored tree is re-verified, then follows the normal flow
+(pass → Succeeded/deliver; fail → iterate). A lost-PVC restore or a fork seed
+does NOT reset (spec (f)). The verify pin was already cleared on rollback (the
+F77 pin half). Owner decisions: D84(a) and D106.
+
+**On upgrade:** a rollback on a Failed or Succeeded Loop now runs a verify
+again.
 
 ## New features
 
@@ -40,7 +55,7 @@ fork-reject precedent: the bootstrap hold prevents
 usable checkpoint still restores as before (the A2 restore path is
 untouched).
 
-### I208: PolicyValid's message names both policy kinds — #TBD
+### I208: PolicyValid's message names both policy kinds — #398
 
 A Loop whose `spec.policyRefs` resolves to a `ClusterAgentPolicy` (P6a) was
 left with `PolicyValid=True` and the message "all referenced AgentPolicies

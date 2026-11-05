@@ -259,7 +259,7 @@ AGENTS I68).
 
 ## P3
 
-- [ ] **I208: the `PolicyValid` "True" message names only AgentPolicies while a Loop may reference ClusterAgentPolicies**
+- [x] **I208: the `PolicyValid` "True" message names only AgentPolicies while a Loop may reference ClusterAgentPolicies** (`bb3d583` (#398))
 
   **Where:** `internal/controller/loop_controller.go:666` (at `2a2edeb`):
   `setCondition(loop, "PolicyValid", metav1.ConditionTrue, "Valid", "all referenced AgentPolicies

@@ -20,6 +20,7 @@ package controller
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -514,5 +515,56 @@ func TestNoRealDiffDecision(t *testing.T) {
 				t.Fatalf("fire=%v run=%d, want fire=%v run=%d", fired, run, tc.wantFire, tc.wantRun)
 			}
 		})
+	}
+}
+
+// D79(b): three failures with DIFFERENT output but the SAME agent diff fire
+// the stall (no-real-diff rule); the Stalled message names the rule. A
+// different diff on the third does not fire.
+func TestApplyStallGateNoRealDiff(t *testing.T) {
+	const diff = "d79bd79bd79bd79bd79bd79bd79bd79bd79bd79bd79bd79bd79bd79bd79bd79b"
+	podWith := func(dh string) *corev1.Pod {
+		term := func(msg string) corev1.ContainerState {
+			return corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 1, Message: msg, FinishedAt: metav1.Now()}}
+		}
+		return &corev1.Pod{Status: corev1.PodStatus{InitContainerStatuses: []corev1.ContainerStatus{
+			{Name: verifyTamperInit, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0, Message: "diffhash: " + dh, FinishedAt: metav1.Now()}}},
+			{Name: s5aCheck0, State: term("third output")},
+		}}}
+	}
+	r := &LoopReconciler{CNIProber: testCNIProber(), readCheckOutput: func(*corev1.Pod, string) (string, bool) { return "third output", true }}
+	mk := func() *coxv1alpha1.Loop {
+		n := int32(3)
+		l := &coxv1alpha1.Loop{}
+		l.Name, l.Namespace = "lp", p2eStallNS
+		l.Status.Phase = coxv1alpha1.LoopPhaseVerifying
+		l.Status.Iteration = 2
+		l.Spec.Loop.StallAfter = &n
+		l.Spec.Loop.StallAction = coxv1alpha1.StallActionFail
+		l.Status.StallHistory = []coxv1alpha1.StallEntry{
+			{JobName: p2eStallSeededJob0, Hash: "first", NormalisationVersion: "v1", DiffHash: diff},
+			{JobName: p2eStallSeededJob1, Hash: "second", NormalisationVersion: "v1", DiffHash: diff},
+		}
+		return l
+	}
+	loop := mk()
+	if !r.applyStallGate(context.Background(), loop, podWith(diff), s5aCheck0) {
+		t.Fatalf("three failures with the same agent diff must fire (varying output)")
+	}
+	if got := loop.Status.StallHistory[len(loop.Status.StallHistory)-1].DiffHash; got != diff {
+		t.Fatalf("the appended entry's diffHash = %q, want %q", got, diff)
+	}
+	var msg string
+	for _, c := range loop.Status.Conditions {
+		if c.Type == string(coxv1alpha1.StalledCondition) {
+			msg = c.Message
+		}
+	}
+	if !strings.Contains(msg, "no real diff") {
+		t.Fatalf("the Stalled message must name the no-real-diff rule: %q", msg)
+	}
+	other := mk()
+	if r.applyStallGate(context.Background(), other, podWith(strings.Repeat("e", 64)), s5aCheck0) {
+		t.Fatalf("a different agent diff on the third failure must not fire")
 	}
 }

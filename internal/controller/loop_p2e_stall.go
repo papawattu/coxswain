@@ -34,6 +34,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"strings"
 
 	"slices"
 
@@ -277,6 +278,29 @@ func (r *LoopReconciler) readCheckOutputSeam(pod *corev1.Pod, checkName string) 
 	return r.readCheckOutput(pod, checkName)
 }
 
+// readTamperDiffHash is D79(b): the tamper init's termination message carries
+// "diffhash: <64 hex>" on a clean run (tamperCheckScript). Empty when absent.
+func readTamperDiffHash(pod *corev1.Pod) string {
+	if pod == nil {
+		return ""
+	}
+	for i := range pod.Status.InitContainerStatuses {
+		ics := &pod.Status.InitContainerStatuses[i]
+		if ics.Name != verifyTamperInit {
+			continue
+		}
+		for _, t := range []*corev1.ContainerStateTerminated{ics.State.Terminated, ics.LastTerminationState.Terminated} {
+			if t == nil {
+				continue
+			}
+			if h, ok := strings.CutPrefix(strings.TrimSpace(t.Message), "diffhash: "); ok && len(h) == 64 {
+				return h
+			}
+		}
+	}
+	return ""
+}
+
 // normalizeCheckOutput normalises a raw check output via internal/stall and
 // returns (normalised, hash) — the stall gate's hash source.
 func normalizeCheckOutput(raw string) (string, string) {
@@ -340,7 +364,22 @@ func (r *LoopReconciler) applyStallGate(ctx context.Context, loop *coxv1alpha1.L
 	at := stallEntryAt(pod, failedCheck)
 	historyBefore := loop.Status.StallHistory // the history BEFORE this entry (the dedup key: the last entry's jobName, a pre-existing one)
 	entry := appendStallEntry(loop, jobName, hash, failedCheck, at)
-	fired, run := stallDecision(historyBefore, entry, resolveStallAfter(ctx, r, loop))
+	// D79(b): the agent diff's hash from the tamper init, recorded on the
+	// just-appended entry (appendStallEntry dedups by jobName).
+	if dh := readTamperDiffHash(pod); dh != "" {
+		entry.DiffHash = dh
+		if n := len(loop.Status.StallHistory); n > 0 && loop.Status.StallHistory[n-1].JobName == entry.JobName {
+			loop.Status.StallHistory[n-1].DiffHash = dh
+		}
+	}
+	stallAfter := resolveStallAfter(ctx, r, loop)
+	fired, run := stallDecision(historyBefore, entry, stallAfter)
+	what := "identical verify failures"
+	if !fired {
+		if f2, r2 := noRealDiffDecision(historyBefore, entry, stallAfter); f2 {
+			fired, run, what = true, r2, "verify failures with no real diff (the same agent diff)"
+		}
+	}
 	if !fired {
 		return false
 	}
@@ -374,40 +413,40 @@ func (r *LoopReconciler) applyStallGate(ctx context.Context, loop *coxv1alpha1.L
 		loop.Status.PausedReason = coxv1alpha1.PausedReasonStall
 		setCondition(loop, coxv1alpha1.PausedCondition, metav1.ConditionTrue,
 			pausedCondReasonPaused,
-			"paused (stall): stall detector fired after "+fmt.Sprintf("%d", run)+" consecutive identical verify failures")
+			"paused (stall): stall detector fired after "+fmt.Sprintf("%d", run)+" consecutive "+what)
 		setCondition(loop, string(coxv1alpha1.StalledCondition), metav1.ConditionTrue,
-			"Stalled", fmt.Sprintf("stall detector fired: %d consecutive identical verify failures (stallAction=Pause)", run))
+			"Stalled", fmt.Sprintf("stall detector fired: %d consecutive %s (stallAction=Pause)", run, what))
 		if r.Recorder != nil {
 			r.Recorder.Eventf(loop, corev1.EventTypeNormal, pauseEventReason,
 				"paused: source stall, from phase %s (stall detector fired)", loop.Status.PausedFrom)
-			r.Recorder.Eventf(loop, corev1.EventTypeWarning, "StallDetected", "stall detector fired: %d consecutive identical verify failures (stallAction=Pause)", run)
+			r.Recorder.Eventf(loop, corev1.EventTypeWarning, "StallDetected", "stall detector fired: %d consecutive %s (stallAction=Pause)", run, what)
 		}
 	case coxv1alpha1.StallActionContinue:
 		// Keep iterating: the Stalled condition is set, the phase stays
 		// Verifying->Implementing (the caller proceeds to the iterate).
 		setCondition(loop, string(coxv1alpha1.StalledCondition), metav1.ConditionTrue,
-			"Stalled", fmt.Sprintf("stall detector fired: %d consecutive identical verify failures (stallAction=Continue, keeping the loop)", run))
+			"Stalled", fmt.Sprintf("stall detector fired: %d consecutive %s (stallAction=Continue, keeping the loop)", run, what))
 		if r.Recorder != nil {
-			r.Recorder.Eventf(loop, corev1.EventTypeWarning, "StallDetected", "stall detector fired: %d consecutive identical verify failures (stallAction=Continue, keeping the loop)", run)
+			r.Recorder.Eventf(loop, corev1.EventTypeWarning, "StallDetected", "stall detector fired: %d consecutive %s (stallAction=Continue, keeping the loop)", run, what)
 		}
 		return false // keep iterating
 	default: // StallActionFail
 		setCondition(loop, string(coxv1alpha1.LoopPhaseFailed), metav1.ConditionTrue,
-			"Stalled", fmt.Sprintf("stall detector fired: %d consecutive identical verify failures (stallAction=Fail)", run))
+			"Stalled", fmt.Sprintf("stall detector fired: %d consecutive %s (stallAction=Fail)", run, what))
 		// The Stalled condition is set (the stall's decision): the stall gate's
 		// Fail action sets BOTH the Failed condition (the phase outcome, reason
 		// Stalled) AND the Stalled condition (the detector's record). Item 8's
 		// precedence: the stall's outcome wins over the budget's (Failed:
 		// Stalled, not Failed:BudgetExceeded).
 		setCondition(loop, string(coxv1alpha1.StalledCondition), metav1.ConditionTrue,
-			"Stalled", fmt.Sprintf("stall detector fired: %d consecutive identical verify failures (stallAction=Fail)", run))
+			"Stalled", fmt.Sprintf("stall detector fired: %d consecutive %s (stallAction=Fail)", run, what))
 		loop.Status.Phase = coxv1alpha1.LoopPhaseFailed
 		loop.Status.DesiredPhase = coxv1alpha1.LoopPhaseFailed
 		// B5a: terminal transition — bump the completion counter and clear the
 		// active gauge.
 		bumpLoopCompletion("failed", "stalled")
 		if r.Recorder != nil {
-			r.Recorder.Eventf(loop, corev1.EventTypeWarning, "StallDetected", "stall detector fired: %d consecutive identical verify failures (stallAction=Fail)", run)
+			r.Recorder.Eventf(loop, corev1.EventTypeWarning, "StallDetected", "stall detector fired: %d consecutive %s (stallAction=Fail)", run, what)
 		}
 	}
 	return true

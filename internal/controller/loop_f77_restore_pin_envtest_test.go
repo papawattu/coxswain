@@ -122,8 +122,10 @@ var _ = Describe("F77: a completed restore clears the verify pin", func() {
 		delivering := restored.DeepCopy()
 		delivering.Spec.Delivery = &cov.DeliveryConfig{Mode: cov.DeliveryModePullRequest}
 		delivering.Spec.Workspace.Repo = f77Repo
-		Expect(restored.Status.Phase).To(Equal(cov.LoopPhaseSucceeded),
-			"precondition: the phase stays Succeeded (the phase half of F77 waits on D84)")
+		// The gate is tested at Succeeded. Since D84b a completed ROLLBACK moves
+		// the Loop to Verifying (asserted in loop_d84b_rollback_resets_envtest_test.go),
+		// so the copy is pinned to Succeeded here: the pin, not the phase, is under test.
+		delivering.Status.Phase = cov.LoopPhaseSucceeded
 		Expect(deliveryEnabled(delivering)).To(BeFalse(),
 			"F77: with no pin the deliver step must not run")
 		requested, why := deliveryRequested(delivering)

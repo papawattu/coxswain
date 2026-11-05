@@ -725,6 +725,13 @@ fork, not an edit.
 **What to do:** to roll back to a different checkpoint, create a fork (`cox
 fork`) or a new Loop seeded from that checkpoint; do not edit the field.
 
+When a rollback **completes**, the operator resets the Loop to the restored
+iteration and re-verifies (D84b, F77): `status.iteration` is set to the
+restored iteration N, `phase` and `desiredPhase` become `Verifying`, and the
+`Failed` and `Succeeded` conditions are cleared. The restored tree is then
+re-verified and follows the normal flow (pass → Succeeded/deliver;
+fail → iterate). A lost-PVC restore or a fork seed does not reset (spec (f)).
+
 A **completed** restore (a rollback, a fork's seed, or a lost-PVC restore) also
 clears the verify pin — `status.currentVerify` and `status.verify`'s
 `verifiedCommit`, with the `tamperExitCode`/`tamperJobUID` record written for it

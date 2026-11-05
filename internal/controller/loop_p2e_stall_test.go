@@ -486,3 +486,33 @@ func itoa(i int) string {
 	}
 	return string(b[pos:])
 }
+
+// D79(b): the no-real-diff rule fires on N consecutive equal diffHashes even
+// when the output hash varies; an empty diffHash never fires.
+func TestNoRealDiffDecision(t *testing.T) {
+	e := func(job, out, diff string) coxv1alpha1.StallEntry {
+		return coxv1alpha1.StallEntry{JobName: job, Hash: out, NormalisationVersion: "v1", DiffHash: diff}
+	}
+	cases := []struct {
+		name     string
+		history  []coxv1alpha1.StallEntry
+		newEntry coxv1alpha1.StallEntry
+		wantFire bool
+		wantRun  int
+	}{
+		{"three equal diffs, varying output, fires", []coxv1alpha1.StallEntry{e("j0", "a", "d"), e("j1", "b", "d")}, e("j2", "c", "d"), true, 3},
+		{"two of three does not fire", []coxv1alpha1.StallEntry{e("j1", "b", "d")}, e("j2", "c", "d"), false, 2},
+		{"a different diff resets", []coxv1alpha1.StallEntry{e("j0", "a", "d"), e("j1", "b", "x")}, e("j2", "c", "d"), false, 1},
+		{"empty diffHash never fires", []coxv1alpha1.StallEntry{e("j0", "a", ""), e("j1", "a", "")}, e("j2", "a", ""), false, 0},
+		{"an empty entry breaks the run", []coxv1alpha1.StallEntry{e("j0", "a", "d"), e("j1", "b", "")}, e("j2", "c", "d"), false, 1},
+		{"a re-read of the same Job does not fire", []coxv1alpha1.StallEntry{e("j0", "a", "d"), e("j1", "b", "d")}, e("j1", "b", "d"), false, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fired, run := noRealDiffDecision(tc.history, tc.newEntry, 3)
+			if fired != tc.wantFire || run != tc.wantRun {
+				t.Fatalf("fire=%v run=%d, want fire=%v run=%d", fired, run, tc.wantFire, tc.wantRun)
+			}
+		})
+	}
+}

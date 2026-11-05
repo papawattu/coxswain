@@ -1337,6 +1337,13 @@ spec:
                     check:
                       description: check is the failing check's name.
                       type: string
+                    diffHash:
+                      description: |-
+                        diffHash is the SHA-256 hex of the agent's diff baseCommit..verifiedCommit
+                        EXCLUDING the protected paths (D79(b)): N consecutive failures with the
+                        same diffHash are a stall even when the failing output varies. Empty
+                        when the verify Job did not report one (an older Job, no tamper step).
+                      type: string
                     hash:
                       description: hash is the SHA-256 hex of the normalised failing
                         output (P2e).

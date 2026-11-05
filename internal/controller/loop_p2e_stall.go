@@ -111,6 +111,33 @@ func stallDecision(history []coxv1alpha1.StallEntry, newEntry coxv1alpha1.StallE
 	return run >= int(stallAfter), run
 }
 
+// noRealDiffDecision is D79(b): it fires when the trailing run of entries
+// with the SAME non-empty diffHash (the agent's diff excluding the protected
+// paths), including newEntry, reaches stallAfter. Varying failure text does
+// not reset it. The per-Job re-read rule is the same as stallDecision's.
+func noRealDiffDecision(history []coxv1alpha1.StallEntry, newEntry coxv1alpha1.StallEntry, stallAfter int32) (bool, int) {
+	if newEntry.DiffHash == "" {
+		return false, 0
+	}
+	if len(history) > 0 {
+		last := history[len(history)-1]
+		if last.JobName != "" && last.JobName == newEntry.JobName {
+			return false, 0
+		}
+	}
+	if stallAfter <= 0 {
+		stallAfter = 3
+	}
+	run := 1
+	for _, e := range slices.Backward(history) {
+		if e.DiffHash != newEntry.DiffHash {
+			break
+		}
+		run++
+	}
+	return run >= int(stallAfter), run
+}
+
 // stallDefaultsConfigMap is the cluster-wide stall-default ConfigMap (plan
 // P2e "Effective config": the operator namespace, keys stallAfter /
 // stallAction) — the FALLBACK when the Loop's spec.loop.stallAfter is

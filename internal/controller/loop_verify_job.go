@@ -1004,8 +1004,17 @@ const (
 // bare "git diff" with no pathspec would flag every change, so the script
 // reports clean without running it.
 func tamperCheckScript(baseCommit, verifyCommit string, globs []string) string {
+	diffHash := fmt.Sprintf(`
+# D79(b): the agent's whole diff base..verified, hashed. N verify failures
+# with the same diffhash are a stall even when the failing output varies.
+if ! AGENTDIFF=$(git diff --no-ext-diff --no-color --binary %s %s); then
+  echo "tamper: git diff failed; refusing to report clean"
+  exit %d
+fi
+echo "diffhash: $(printf '%%s' "$AGENTDIFF" | sha256sum | cut -c1-64)"
+`, shellQuote(baseCommit), shellQuote(verifyCommit), tamperGitErrorExit)
 	if len(globs) == 0 {
-		return "set -e\necho \"tamper: clean (no protected paths)\"\nexit 0\n"
+		return "set -e\ncd " + verifyScratchPath + "\n" + diffHash + "echo \"tamper: clean (no protected paths)\"\nexit 0\n"
 	}
 	quoted := make([]string, len(globs))
 	for i, g := range globs {
@@ -1026,9 +1035,10 @@ if [ -n "$CHANGED" ]; then
   echo "$CHANGED"
   exit 1
 fi
+%s
 echo "tamper: clean"
 exit 0
-`, verifyScratchPath, shellQuote(baseCommit), shellQuote(verifyCommit), strings.Join(quoted, " "), tamperGitErrorExit)
+`, verifyScratchPath, shellQuote(baseCommit), shellQuote(verifyCommit), strings.Join(quoted, " "), tamperGitErrorExit, diffHash)
 }
 
 // verifyNotDescendantExit is the import-agent script's exit status when the

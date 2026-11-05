@@ -168,3 +168,45 @@ func TestTamperScriptCustomGlob(t *testing.T) {
 		t.Fatalf("custom glob: exit=%d output=%q", code, out)
 	}
 }
+
+// D79(b): a clean tamper run prints "diffhash: <64 hex>". The same agent diff
+// gives the same hash in two repos; a different diff gives a different hash;
+// a tampered run prints none.
+func TestTamperScriptDiffHash(t *testing.T) {
+	globs := tamper.ExpandPreset(tamper.PresetGo, nil, false)
+	hashOf := func(out string) string {
+		for l := range strings.SplitSeq(out, "\n") {
+			if h, ok := strings.CutPrefix(l, "diffhash: "); ok {
+				return h
+			}
+		}
+		return ""
+	}
+	d1, b1, v1 := f39Repo(t, f39Edit("pkg/x.go", "package pkg\n// work A\n"))
+	c1, o1 := f39Run(t, d1, b1, v1, globs)
+	d2, b2, v2 := f39Repo(t, f39Edit("pkg/x.go", "package pkg\n// work A\n"))
+	c2, o2 := f39Run(t, d2, b2, v2, globs)
+	d3, b3, v3 := f39Repo(t, f39Edit("pkg/x.go", "package pkg\n// work B\n"))
+	c3, o3 := f39Run(t, d3, b3, v3, globs)
+	if c1 != 0 || c2 != 0 || c3 != 0 {
+		t.Fatalf("clean runs must exit 0: %d %d %d\n%s", c1, c2, c3, o1)
+	}
+	h1, h2, h3 := hashOf(o1), hashOf(o2), hashOf(o3)
+	if len(h1) != 64 {
+		t.Fatalf("no 64-hex diffhash line in %q", o1)
+	}
+	if h1 != h2 {
+		t.Errorf("the same agent diff gave different hashes: %s vs %s", h1, h2)
+	}
+	if h1 == h3 {
+		t.Errorf("a different agent diff gave the same hash %s", h1)
+	}
+	dn, bn, vn := f39Repo(t, f39Edit("pkg/x.go", "package pkg\n// work A\n"))
+	if _, on := f39Run(t, dn, bn, vn, nil); hashOf(on) != h1 {
+		t.Errorf("the no-globs path must print the same diffhash: %q", on)
+	}
+	dt, bt, vt := f39Repo(t, f39Edit("pkg/x_test.go", "package pkg\n// doctored\n"))
+	if ct, ot := f39Run(t, dt, bt, vt, globs); ct != 1 || hashOf(ot) != "" {
+		t.Errorf("a tampered run must exit 1 with no diffhash: exit=%d %q", ct, ot)
+	}
+}

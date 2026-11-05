@@ -1280,3 +1280,21 @@ func TestD73RescreenRemovesUnsafeExisting(t *testing.T) {
 		}
 	}
 }
+
+// D73(b) through run(): the re-screen runs on a write and is in the summary.
+func TestD73RunAuditsRescreen(t *testing.T) {
+	mem := t.TempDir()
+	unsafe := "password: " + "hunter2" + " in config/dev/env"
+	s := sha256.Sum256([]byte(unsafe))
+	unsafeName := hex.EncodeToString(s[:]) + ".txt"
+	if err := os.WriteFile(filepath.Join(mem, unsafeName), []byte(unsafe+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	summary := runCapped(t, mem, []string{"retry the 503 with backoff (internal/http/retry.go)"})
+	if _, ok := readMemoryFiles(t, mem)[unsafeName]; ok {
+		t.Errorf("run() left the unsafe existing lesson in memory")
+	}
+	if want := "rescreened " + shaPrefix(unsafe) + " "; !strings.Contains(summary, want) {
+		t.Errorf("summary lacks %q:\n%s", want, summary)
+	}
+}

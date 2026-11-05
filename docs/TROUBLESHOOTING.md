@@ -1283,16 +1283,19 @@ nothing is restored from it.
   backwards and takes the last entry whose verdict is `checkpointTrusted`
   or `checkpointGone` — an untrusted entry is skipped entirely, so it is
   never used as a restore source. If **every** recorded entry is
-  untrusted, the restore does not pick a snapshot at all: it takes the
-  visible A2 fallback — the workspace PVC is recreated **empty**, the
-  `Restored` condition is set to `RestoreReasonNoUsableCheckpoint` with a
-  message saying none of the `status.checkpoints` entries is a checkpoint
-  of this Loop, and a `NoUsableCheckpoint` Event is emitted. It is
-  visible, never a silent restore from a foreign snapshot.
+  untrusted, the restore does not pick a snapshot at all: the Loop is
+  failed terminally (the `Failed` condition with reason `WorkspaceLost`,
+  D84(c)) and the `Restore` condition is set to `RestoreReasonNoUsableCheckpoint`
+  with a message saying none of the `status.checkpoints` entries is a checkpoint
+  of this Loop. A `NoUsableCheckpoint` Event is emitted. It is
+  visible, never a silent restore from a foreign snapshot, and the operator
+  does not seed the failed Loop with an empty workspace (the pre-D84
+  fallback that recreated the PVC empty and carried on is gone).
 - A well-formed name whose snapshot simply does not exist (`checkpointGone`)
   is a different case, not an Event: the entry is dropped from status in
-  GC, and on the restore path it stays the target and resolves to the
-  visible `NoUsableCheckpoint` fallback (I90).
+  GC, and on the restore path it stays the target and the Loop is failed
+  terminally (the `WorkspaceLost` terminal, D84(c); the `NoUsableCheckpoint`
+  cause record is on the `Restore` condition).
 - A failed snapshot *read* (neither absent nor found, e.g. a transient
   API error) is `checkpointUnknown`: the operator makes no decision and
   requeues.
@@ -1515,3 +1518,44 @@ removed), so pausing the Loop while the owner fixes the node pool prevents
 the failure; the clock re-starts on the first stuck pass after resume.
 Fixing the node pool (adding or labelling a node) clears the condition on
 the next reconcile before the bound trips.
+
+### Failed with reason `WorkspaceLost` — the workspace PVC was lost and no usable checkpoint exists (F74/D84)
+
+The Loop fails with `Failed: WorkspaceLost` when the workspace PVC
+(`<loop>-workspace`) is lost and the operator cannot find a usable
+checkpoint to restore from. The condition message names the lost
+checkpoint (the `NoUsableCheckpoint` cause record on the `Restore`
+condition) and the fix: a fresh Loop clones from scratch — delete and
+re-apply the Loop.
+
+**What it means.** The checkpoint's content is gone: either the
+checkpoint's VolumeSnapshot was deleted (or never created — the
+VolumeSnapshot CRD is not installed, which the message names), or every
+`status.checkpoints` entry is untrusted (none is a checkpoint of this
+Loop). Before D84 the operator would recreate the workspace PVC empty
+and carry on (the A2 fallback); the decision (owner, 2026-11-01, D84(c))
+is a terminal failure instead, because the agent would run in an empty
+workspace and `status.baseCommit` staying set means init-workspace never
+re-clones.
+
+**Diagnosis.**
+
+1. `kubectl get pvc -n <ns>` — the workspace PVC (`<loop>-workspace`) is
+   absent.
+2. `kubectl get volumesnapshot -n <ns> -l coxswain.wattu.com/loop=<loop>`
+   — the checkpoint's snapshot (named in the Failed condition's message) is
+   absent (or the VolumeSnapshot CRD is not installed, which the message
+   names).
+3. `kubectl get loop <loop> -n <ns> -o jsonpath='{.status.conditions[?(@.type=="Restore")].message}'`
+   — the `NoUsableCheckpoint` cause record (the variant names the cause:
+   the missing snapshot, the all-untrusted entries, or the missing CRD).
+
+**Resolution.** The checkpoint's content is lost; the operator will not
+seed the failed Loop with an empty workspace. A fresh Loop clones from
+scratch — delete and re-apply the Loop. A `forkOf` of the Loop (when the
+fork's source is still a ready snapshot) is an alternate re-apply that
+preserves the content. To make the loss survivable in the first place,
+keep the checkpoint's snapshot alive: the checkpoint's VolumeSnapshot and
+its content are the restore source, so a cluster without a
+snapshot-controller (or with the PVC's content deleted out from under it)
+makes every lost-PVC loss a terminal one.

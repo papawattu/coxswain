@@ -17,6 +17,29 @@ _(none yet)_
 
 ## Other changes
 
+### D84a (F74): a lost workspace PVC with no usable checkpoint fails the Loop — #399
+
+**What was wrong:** When the workspace PVC was lost and no usable checkpoint
+existed (the checkpoint's snapshot was gone, every `status.checkpoints`
+entry was untrusted, or the VolumeSnapshot CRD was not installed), the
+operator's A2 fallback recreated the workspace PVC **empty** and the Loop
+carried on. Because `status.baseCommit` stayed set, init-workspace never
+re-cloned, and the agent ran in an empty workspace — the content was lost
+but the Loop never said so in a way that stopped it (the F74 finding,
+`REVIEW-PHASE1-R32.md:102-110`).
+
+**What changed:** The operator now fails the Loop terminally (the F93a
+pattern): the `Failed` condition with reason `WorkspaceLost`, a message
+naming the lost checkpoint and the fix (a fresh Loop clones from scratch —
+delete and re-apply the Loop), the phase flipped to `Failed`, and one
+Warning Event. The `Restore` condition keeps the `NoUsableCheckpoint` cause
+record (the three-variant message: the missing snapshot, the all-untrusted
+entries, or the missing CRD). No empty PVC is created (the F36
+fork-reject precedent: the bootstrap hold prevents
+`ensureWorkspacePVC` from seeding the failed Loop in the same pass). A
+usable checkpoint still restores as before (the A2 restore path is
+untouched).
+
 ### I208: PolicyValid's message names both policy kinds — #TBD
 
 A Loop whose `spec.policyRefs` resolves to a `ClusterAgentPolicy` (P6a) was

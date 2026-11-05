@@ -513,3 +513,35 @@ func (r *LoopReconciler) failLoopUnschedulable(loop *coxv1alpha1.Loop, stuck []s
 	}
 	return true
 }
+
+// failLoopLostWorkspace fails the Loop with the WorkspaceLost reason (the
+// D84a terminal, F74 decision (c)): the workspace PVC is lost and no usable
+// checkpoint exists, so the agent would run in an empty workspace — the
+// owner's decision is a terminal failure instead. It mirrors
+// failLoopUnschedulable: the isTerminalPhase guard makes it idempotent (the
+// restore arm re-enters every pass while the PVC is gone — b2LostPVCTarget
+// re-triggers and the snapshot stays Missing — and a Failed condition with
+// the same reason and message is not re-set, so no second Event fires), the
+// Failed condition carries the durable record (the cause — lostMsg, which
+// carries one of the three NoUsableCheckpoint variants — plus the fix: a
+// fresh Loop clones from scratch), the phase flips to Failed, and one
+// Warning Event is emitted. The caller keeps the Restore condition
+// (NoUsableCheckpoint) as the cause record; this function does not touch it
+// (clearCondition is not called — unlike the F93a surface clear, the
+// Restore condition here is not superseded, it is the CAUSE the Failed
+// condition refers to). It returns whether the Loop's status changed.
+func (r *LoopReconciler) failLoopLostWorkspace(loop *coxv1alpha1.Loop, lostMsg string) bool {
+	if isTerminalPhase(loop.Status.Phase) {
+		return false
+	}
+	msg := lostMsg + "; the Loop cannot run in the empty workspace that would be left (a fresh Loop clones from scratch — delete and re-apply the Loop)"
+	setCondition(loop, string(coxv1alpha1.LoopPhaseFailed), metav1.ConditionTrue,
+		"WorkspaceLost", msg)
+	loop.Status.Phase = coxv1alpha1.LoopPhaseFailed
+	loop.Status.DesiredPhase = coxv1alpha1.LoopPhaseFailed
+	bumpLoopCompletion("failed", "workspace-lost")
+	if r.Recorder != nil {
+		r.Recorder.Eventf(loop, corev1.EventTypeWarning, "WorkspaceLostFailed", "%s", msg)
+	}
+	return true
+}

@@ -84,8 +84,9 @@ limitations under the License.
 // Loop) and the sandbox does not exist yet, so it skips the stop + delete
 // and goes straight to the create (step 3). A LOST-PVC restore is the
 // reactive case: the PVC is already gone, so it also goes straight to the
-// create (step 3), with the A2 fallback (empty PVC + a visible condition +
-// Event) when the latest checkpoint is missing.
+// create (step 3), with the terminal WorkspaceLost fail (D84(c), F74) when
+// the latest checkpoint is missing — the A2 empty fallback that recreated
+// the PVC empty and carried on is gone.
 //
 // The Restore condition is set on every restore decision (the I83 pattern:
 // the condition is the durable record; the Event is the transient signal).
@@ -187,7 +188,7 @@ type b2RestoreTarget struct {
 	kind      b2Kind // the restore's kind (the condition's message)
 	// untrusted (F47) marks a lost-PVC target built when status.checkpoints
 	// has entries but none is a checkpoint of this Loop: there is no source, so
-	// the visible NoUsableCheckpoint fallback applies (iteration is -1).
+	// the terminal WorkspaceLost fail applies (D84(c), F74; iteration is -1).
 	untrusted bool
 }
 
@@ -198,7 +199,7 @@ const (
 	b2KindLostPVC  b2Kind = "lostPVC"    // the workspace PVC was lost (reactive restore)
 	b2KindRollback b2Kind = "rollback"   // spec.restoreFrom (explicit)
 	b2KindFork     b2Kind = "fork"       // spec.forkOf (explicit, at creation)
-	b2KindFallback b2Kind = "noSnapshot" // the PVC was lost with no usable checkpoint (A2 fallback)
+	b2KindFallback b2Kind = "noSnapshot" // the PVC was lost with no usable checkpoint (D84(c): the terminal fail)
 )
 
 // b2RestoreTarget computes the Loop's restore target (nil when no restore
@@ -216,9 +217,9 @@ const (
 //     bypassing client or by setting restoreFrom on a Loop that had none.
 //   - a LOST workspace PVC (NotFound) with no completed restore for the
 //     current generation: the reactive case — the latest recorded
-//     checkpoint (nil when none — the A2 fallback recreates the PVC
-//     empty). The reactive case re-evaluates every reconcile until the
-//     PVC is back.
+//     checkpoint (nil when none — the terminal WorkspaceLost fail applies,
+//     D84(c), F74). The reactive case re-evaluates every reconcile until the
+//     PVC is back (or the Loop is Failed).
 //
 // The in-progress markers (StoppingSandbox / DeletingPVC) do NOT stop the
 // target from applying: they ARE the restore's progress, and the step
@@ -270,8 +271,9 @@ func (r *LoopReconciler) b2RestoreTarget(ctx context.Context, loop *coxv1alpha1.
 // b2LostPVCTarget returns the reactive restore target when the workspace
 // PVC is LOST (NotFound) and no explicit restore applies: the latest
 // recorded checkpoint (status.checkpoints' last entry), or nil (no usable
-// checkpoint — the caller applies the A2 fallback). It returns nil when the
-// PVC is present (the reactive case does not apply — the PVC is there).
+// checkpoint — the caller applies the terminal WorkspaceLost fail, D84(c)).
+// It returns nil when the PVC is present (the reactive case does not apply —
+// the PVC is there).
 func (r *LoopReconciler) b2LostPVCTarget(ctx context.Context, loop *coxv1alpha1.Loop) *b2RestoreTarget {
 	if r.workspacePVCPresent(ctx, loop) {
 		return nil // the PVC is present: no reactive restore
@@ -283,7 +285,7 @@ func (r *LoopReconciler) b2LostPVCTarget(ctx context.Context, loop *coxv1alpha1.
 		return nil
 	}
 	// The PVC is LOST. The latest recorded checkpoint is the restore source
-	// (nil when none — the A2 fallback recreates the PVC empty).
+	// (nil when none — the terminal WorkspaceLost fail applies, D84(c)).
 	cps := loop.Status.Checkpoints
 	if len(cps) == 0 {
 		return nil
@@ -298,7 +300,8 @@ func (r *LoopReconciler) b2LostPVCTarget(ctx context.Context, loop *coxv1alpha1.
 		case checkpointTrusted, checkpointGone:
 			// Gone (a well-formed name whose snapshot is absent) stays the
 			// target: resolveCheckpointSource reports it Missing and the
-			// visible NoUsableCheckpoint fallback (I90) applies, as before.
+			// terminal WorkspaceLost fail applies (D84(c), F74; the I90 cause
+			// record is on the Restore condition).
 			last, found = cp, true
 		case checkpointUnknown:
 			return nil // a failed read is no decision
@@ -308,7 +311,8 @@ func (r *LoopReconciler) b2LostPVCTarget(ctx context.Context, loop *coxv1alpha1.
 		}
 	}
 	if !found {
-		// Entries recorded but none trusted: take the VISIBLE fallback (I90),
+		// Entries recorded but none trusted: take the VISIBLE terminal fail
+		// (D84(c), F74; the I90 cause record is on the Restore condition),
 		// not a silent empty workspace.
 		return &b2RestoreTarget{loopName: loop.Name, iteration: -1, kind: b2KindLostPVC, untrusted: true}
 	}
@@ -873,9 +877,10 @@ func (r *LoopReconciler) emitRestoreEvent(loop *coxv1alpha1.Loop, status bool, r
 //  4. on error: requeues (no decision on a transient read failure),
 //  5. on missing: the kind decides — a rollback/fork is TERMINAL
 //     (Restore=False reason RestoreSourceMissing + the Event; no requeue —
-//     the object is gone); a lost-PVC restore falls back to the A2 path
-//     (recreate the PVC empty + Restore=False reason NoUsableCheckpoint +
-//     the Restore Event — I90: the fallback is VISIBLE),
+//     the object is gone); a lost-PVC restore falls back to the terminal
+//     WorkspaceLost fail (D84(c), F74) when the checkpoint is missing
+//     (Restore=False reason NoUsableCheckpoint as the cause record + the
+//     Restore Event — I90: the decision is VISIBLE),
 //  6. on ready: the PVC replacement, level-based:
 //     - the sandbox running -> STOP it (Suspended) + Restore=False reason
 //     StoppingSandbox (the PVC is held by pvc-protection while mounted —
@@ -1277,36 +1282,46 @@ func (r *LoopReconciler) b2ApplyRestoreStep(ctx context.Context, loop *coxv1alph
 			// fork's Loop, or wait for the source's snapshot to reappear.
 			return true, false, true, nil
 		default: // b2KindLostPVC
-			// The A2 fallback: the PVC is lost and the (latest) checkpoint
-			// is gone. Recreate the PVC EMPTY (the A2 PVC-resume — the
-			// content is lost, the Loop continues from the untouched base)
-			// and surface the fallback (I90: VISIBLE).
-			if err := r.ensureWorkspacePVC(ctx, loop); err != nil {
-				return false, true, false, fmt.Errorf("A2 fallback: recreate workspace PVC empty: %w", err)
-			}
-			lostMsg := "the workspace PVC was lost and checkpoint " + target.snapshot + " does not exist; fell back to the A2 PVC-resume (an EMPTY workspace — the checkpoint's content is lost, I90)"
+			// D84a (F74, decision (c)): the PVC is lost and no usable checkpoint
+			// exists. The A2 fallback used to recreate the PVC EMPTY and let the
+			// Loop carry on (the content is lost, status.baseCommit stays set, so
+			// init-workspace never re-clones and the agent runs in an empty
+			// workspace); the owner's decision is to FAIL the Loop terminally
+			// instead. The Restore condition keeps NoUsableCheckpoint as the
+			// CAUSE record; the terminal fail is modelled on
+			// failLoopUnschedulable (the F93a pattern): a Failed condition with
+			// a reason and a message naming the fix, the phase flipped to
+			// Failed, and one Warning Event.
+			//
+			// NO empty PVC is created (the F36 fork-reject precedent): the
+			// fallback arm returns with a HOLD (the 4th return value), which
+			// skips the bootstrap — ensureWorkspacePVC in ensureLoopArtifacts
+			// would otherwise seed the failed Loop with an empty workspace in
+			// the same pass (the hold is permanent: the PVC stays gone and
+			// resolveCheckpointSource stays Missing, so the arm re-enters
+			// every pass, the isTerminalPhase guard is a no-op, and no
+			// condition is re-set because it is already correct).
+			lostMsg := "the workspace PVC was lost and checkpoint " + target.snapshot + " does not exist; no usable checkpoint — the checkpoint's content is lost, I90"
 			if target.untrusted {
-				lostMsg = "the workspace PVC was lost and none of the status.checkpoints entries is a checkpoint of this Loop (wrong name, iteration or owner); fell back to the A2 PVC-resume (an EMPTY workspace, I90)"
+				lostMsg = "the workspace PVC was lost and none of the status.checkpoints entries is a checkpoint of this Loop (wrong name, iteration or owner); no usable checkpoint, I90"
 			} else if crdMissing {
-				lostMsg = "the workspace PVC was lost and checkpoint " + target.snapshot + " cannot be read: the VolumeSnapshot CRD (snapshot.storage.k8s.io) is not installed, so the cluster holds no checkpoints; fell back to the A2 PVC-resume (an EMPTY workspace — the checkpoint's content is lost, I90)"
+				lostMsg = "the workspace PVC was lost and checkpoint " + target.snapshot + " cannot be read: the VolumeSnapshot CRD (snapshot.storage.k8s.io) is not installed, so the cluster holds no checkpoints; no usable checkpoint — the checkpoint's content is lost, I90"
 			}
 			setRestoreCondition(loop, false, coxv1alpha1.RestoreReasonNoUsableCheckpoint, lostMsg)
-			// F48h: an A2 fallback that rebuilds the workspace EMPTY is the same
-			// episode boundary as the two Restored completions (the lost-PVC/fork
-			// branch below and b2ApplyRestoreStep's rollback branch): the workspace
-			// the pre-fallback run failed against is gone — more literally than on
-			// a snapshot restore, because the content is not rolled back — and
-			// neither iteration nor desiredPhase moves, so the run key cannot see
-			// it. Without this, a count of 2 planted before the PVC was lost makes
-			// the first failure in the rebuilt workspace read attempt 3 and fail
-			// the Loop terminally (Failed:SandboxFailed has no retry). It is
-			// one-shot per PVC loss (b2LostPVCTarget returns nil once the PVC
-			// exists again), so this cannot hand out a repeating budget.
-			clearSandboxInfraEpisode(loop)
+			// failLoopLostWorkspace is idempotent (the isTerminalPhase guard:
+			// a Failed condition with the same reason and message is not
+			// re-set, no second Event) — safe to call on every pass of the
+			// re-entering arm.
+			r.failLoopLostWorkspace(loop, lostMsg)
+			// clearSandboxInfraEpisode is DROPPED: the Loop is terminal, so no
+			// episode can follow — the workspace is never rebuilt and no new
+			// sandbox run starts (the F48h boundary had to exist because the
+			// fallback carried ON into a rebuilt workspace; a failed Loop has
+			// no next run to protect).
 			persist()
 			r.emitRestoreEvent(loop, false, coxv1alpha1.RestoreReasonNoUsableCheckpoint,
-				"workspace PVC lost, no usable checkpoint; A2 fallback (empty workspace)")
-			return true, false, false, nil
+				"workspace PVC lost, no usable checkpoint; the Loop is failed (no empty-workspace run)")
+			return true, false, true, nil
 		}
 	case b2SourceError:
 		// A transient read failure: no decision, requeue.

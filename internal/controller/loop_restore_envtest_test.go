@@ -619,10 +619,11 @@ var _ = Describe("B2 workspace restore, rollback and fork (envtest)", func() {
 		By("NOT recreating the workspace PVC (D84a: no empty PVC for a failed Loop)")
 		pvcAfter, err := b2GetPVC(ctx, ns, name)
 		if err == nil {
-			// The PVC may be in Terminating state (the delete is async); assert
-			// it is NOT a fresh empty PVC (no dataSource, bound to a PV).
-			Expect(pvcAfter.Spec.DataSource).NotTo(BeNil(),
-				"D84a: the A2 fallback no longer recreates the PVC empty")
+			Expect(pvcAfter.DeletionTimestamp).NotTo(BeNil(),
+				"D84a: only the lost PVC (terminating) may remain; no fresh empty PVC is created for a failed Loop")
+		} else {
+			Expect(apierrors.IsNotFound(err)).To(BeTrue(),
+				"D84a: the PVC lookup may only fail with NotFound")
 		}
 	})
 
@@ -1044,7 +1045,7 @@ var _ = Describe("B2 workspace restore, rollback and fork (envtest)", func() {
 		Expect(cause.Message).NotTo(ContainSubstring("GC'd"))
 
 		By("NOT creating an empty PVC for the failed Loop")
-		pvc, gerr := b2GetPVC(ctx, ns, name)
+		_, gerr := b2GetPVC(ctx, ns, name)
 		Expect(gerr).To(HaveOccurred())
 		Expect(apierrors.IsNotFound(gerr)).To(BeTrue(),
 			"D84a(c): the fallback does not seed the failed Loop with an empty workspace (the F36 fork-reject precedent)")

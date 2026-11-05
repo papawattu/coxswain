@@ -1247,3 +1247,54 @@ func TestMemoryWriteIdenticalLessonsInBatchAgreeWithCounts(t *testing.T) {
 		t.Errorf("per-lesson lines say written=%d dropped=%d, want 1 and 1:\n%s", w, d, sum)
 	}
 }
+
+// D73(b): an existing lesson that fails the current rules is removed on the
+// next write; a safe one stays.
+func TestD73RescreenRemovesUnsafeExisting(t *testing.T) {
+	mem := t.TempDir()
+	unsafe := "password: " + "hunter2" + " in config/dev/env"
+	safe := "the token is read from the environment (internal/agent/env.go)"
+	name := func(l string) string { s := sha256.Sum256([]byte(l)); return hex.EncodeToString(s[:]) + ".txt" }
+	for _, l := range []string{unsafe, safe} {
+		if err := os.WriteFile(filepath.Join(mem, name(l)), []byte(l+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	audit, err := rescreenExisting(mem)
+	if err != nil {
+		t.Fatalf("rescreen: %v", err)
+	}
+	files := readMemoryFiles(t, mem)
+	if _, ok := files[name(unsafe)]; ok {
+		t.Errorf("the unsafe existing lesson %s is still in memory", name(unsafe))
+	}
+	if _, ok := files[name(safe)]; !ok {
+		t.Errorf("the safe existing lesson %s was removed", name(safe))
+	}
+	if len(audit) != 1 || !strings.HasPrefix(audit[0], "rescreened "+shaPrefix(unsafe)+" ") {
+		t.Errorf("audit = %q, want one line starting %q", audit, "rescreened "+shaPrefix(unsafe)+" ")
+	}
+	for _, a := range audit {
+		if strings.Contains(a, "hunter2") {
+			t.Errorf("the audit line leaks the lesson content: %q", a)
+		}
+	}
+}
+
+// D73(b) through run(): the re-screen runs on a write and is in the summary.
+func TestD73RunAuditsRescreen(t *testing.T) {
+	mem := t.TempDir()
+	unsafe := "password: " + "hunter2" + " in config/dev/env"
+	s := sha256.Sum256([]byte(unsafe))
+	unsafeName := hex.EncodeToString(s[:]) + ".txt"
+	if err := os.WriteFile(filepath.Join(mem, unsafeName), []byte(unsafe+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	summary := runCapped(t, mem, []string{"retry the 503 with backoff (internal/http/retry.go)"})
+	if _, ok := readMemoryFiles(t, mem)[unsafeName]; ok {
+		t.Errorf("run() left the unsafe existing lesson in memory")
+	}
+	if want := "rescreened " + shaPrefix(unsafe) + " "; !strings.Contains(summary, want) {
+		t.Errorf("summary lacks %q:\n%s", want, summary)
+	}
+}

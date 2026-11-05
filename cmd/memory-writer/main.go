@@ -312,6 +312,11 @@ func run(outcome string) (int, error) {
 	if err != nil {
 		return 1, fmt.Errorf("write lessons to %s: %w", md, err)
 	}
+	// D73(b): re-screen the existing lessons against the current rules (non-fatal).
+	rescreened, rerr := rescreenExisting(md)
+	if rerr != nil {
+		fmt.Fprintf(os.Stderr, "memory-write: %v (non-fatal; the lessons were written)\n", boundedError(rerr))
+	}
 
 	// Mark the survivors that were NOT written (duplicates) as "dropped
 	// duplicate" in the per-lesson reasons (the summary reports them). A
@@ -325,6 +330,7 @@ func run(outcome string) (int, error) {
 		sha := strings.TrimSuffix(n, ".txt")
 		audit = append(audit, "evicted "+sha[:min(shaPrefixLen, len(sha))]+" cap")
 	}
+	audit = append(audit, rescreened...)
 	if overBatch > 0 {
 		audit = append(audit, fmt.Sprintf("truncated %d lessons over the batch cap %d",
 			overBatch, memorywrite.MaxLessonsPerWrite))
@@ -640,6 +646,44 @@ func writeLessons(dir string, survivors []string) (int, []string, []string, erro
 		fmt.Fprintf(os.Stderr, "memory-write: %v (non-fatal; the lessons were written)\n", boundedError(err))
 	}
 	return written, writtenNames, evicted, nil
+}
+
+// rescreenExisting is D73(b): it re-screens the existing <sha256>.txt lesson
+// files in dir against the current static rules (memorywrite.Screen) and
+// removes the ones that no longer pass. It returns one audit line per removal,
+// "rescreened <sha12> <reason>" (no lesson content).
+func rescreenExisting(dir string) ([]string, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("list %s: %w", dir, err)
+	}
+	var audit []string
+	for _, e := range entries {
+		if !e.Type().IsRegular() || !isLessonFileName(e.Name()) {
+			continue
+		}
+		data, err := os.ReadFile(dir + "/" + e.Name())
+		if err != nil {
+			return audit, fmt.Errorf("read %s: %w", e.Name(), err)
+		}
+		survivors, reasons := memorywrite.Screen([]string{strings.TrimSpace(string(data))})
+		if len(survivors) == 1 {
+			continue
+		}
+		reason := "rescreen"
+		if len(reasons) == 1 && reasons[0] != "" {
+			reason = stripReasonCR(reasons[0])
+		}
+		if err := os.Remove(dir + "/" + e.Name()); err != nil {
+			return audit, fmt.Errorf("remove %s: %w", e.Name(), err)
+		}
+		sha := strings.TrimSuffix(e.Name(), ".txt")
+		audit = append(audit, "rescreened "+sha[:min(shaPrefixLen, len(sha))]+" "+reason)
+	}
+	return audit, nil
 }
 
 // evictOldest enforces the D71 cap: if the existing lesson files plus the new

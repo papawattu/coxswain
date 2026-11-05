@@ -72,11 +72,11 @@ func testPatternSpec(t *testing.T, patternName, matchingSample, proseLesson stri
 	}
 
 	// The prose lesson survives (no rule trips).
-	survivors, reasons := Screen([]string{proseLesson})
+	survivors, reasons2 := Screen([]string{proseLesson})
 	if len(survivors) != 1 {
 		t.Fatalf(
 			"pattern %s: prose lesson %q: survivors=%v, want it kept (reasons=%v)",
-			patternName, proseLesson, survivors, reasons,
+			patternName, proseLesson, survivors, reasons2,
 		)
 	}
 }
@@ -462,23 +462,26 @@ func TestPatternSpecCredentialAssignmentCaseAndPrefix(t *testing.T) {
 		"the api key is read from the environment (internal/cfg/env.go)")
 }
 
-// The ":" form: a token-shaped value (8+ chars of [A-Za-z0-9+/=_.-]) is
-// dropped; prose after a colon is kept.
+// D78(b): any `credkey:` followed by a non-space value is dropped, whatever
+// its length. The owner accepted that prose such as "the token: parser lives
+// in …" will now be dropped too.
 func TestCredentialAssignmentColonForm(t *testing.T) {
 	testPatternSpec(t, "credential-assignment",
 		"the secret yaml has token: "+"abc123xyz"+" in deploy/secret.yaml",
-		"the token: parser lives in internal/lex/token.go")
+		"the token is read from the environment (internal/agent/env.go)")
 	for _, l := range []string{
-		"password: " + "hunter2hunter2" + " in config/dev/env",
-		"api_key: " + "abcdef123456" + " in deploy/env.sh",
+		"password: " + "hunter2" + " in config/dev/env",
+		"token: " + "x",
+		"api_key: " + "abcdef123456",
+		"the token: parser lives in internal/lex/token.go",
 	} {
 		if s, _ := Screen([]string{l}); len(s) != 0 {
 			t.Errorf("colon credential %q was written, want dropped", l)
 		}
 	}
 	for _, l := range []string{
-		"the token: parser lives in internal/lex/token.go",
-		"token: see the auth docs (docs/auth.md)",
+		"token: ",
+		"the token is read from the environment (internal/agent/env.go)",
 	} {
 		if s, r := Screen([]string{l}); len(s) != 1 {
 			t.Errorf("prose %q was dropped (%v), want kept", l, r)

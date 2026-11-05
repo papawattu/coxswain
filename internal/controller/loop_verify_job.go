@@ -1007,11 +1007,12 @@ func tamperCheckScript(baseCommit, verifyCommit string, globs []string) string {
 	diffHash := fmt.Sprintf(`
 # D79(b): the agent's whole diff base..verified, hashed. N verify failures
 # with the same diffhash are a stall even when the failing output varies.
-if ! AGENTDIFF=$(git diff --no-ext-diff --no-color --binary %s %s); then
+if ! AGENTDIFF=$(git -c core.quotePath=false diff --no-ext-diff --no-color --binary %s %s); then
   echo "tamper: git diff failed; refusing to report clean"
   exit %d
 fi
-echo "diffhash: $(printf '%%s' "$AGENTDIFF" | sha256sum | cut -c1-64)"
+printf '%%s' "$AGENTDIFF" | sha256sum | cut -c1-64 > .diffhash
+echo "diffhash: $(cat .diffhash)"
 `, shellQuote(baseCommit), shellQuote(verifyCommit), tamperGitErrorExit)
 	if len(globs) == 0 {
 		return "set -e\ncd " + verifyScratchPath + "\n" + diffHash + "echo \"tamper: clean (no protected paths)\"\nexit 0\n"
@@ -1026,7 +1027,7 @@ cd %s
 # Diff baseCommit..verifiedCommit over the protected globs, one pathspec per
 # argument. A non-empty result (any protected path changed) => exit 1
 # (tampered). Empty => exit 0 (clean). A git failure => exit 2 (fail closed).
-if ! CHANGED=$(git diff --name-only %s %s -- %s); then
+if ! CHANGED=$(git -c core.quotePath=false diff --name-only %s %s -- %s); then
   echo "tamper: git diff failed; refusing to report clean"
   exit %d
 fi

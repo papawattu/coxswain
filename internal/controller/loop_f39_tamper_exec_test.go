@@ -308,3 +308,69 @@ func TestTamperScriptNoGlobsPrintsDiffHash(t *testing.T) {
 		t.Errorf("a git failure must not report clean:\n%s", out)
 	}
 }
+
+// D79(b) part 2 step 5: the hash must not depend on locale. The same diff in a
+// UTF-8 locale and in the POSIX locale must print the same diffhash.
+func TestTamperScriptDiffHashIsLocaleStable(t *testing.T) {
+	globs := tamper.ExpandPreset(tamper.PresetGo, nil, false)
+	hashOf := func(out string) string {
+		for l := range strings.SplitSeq(out, "\n") {
+			if h, ok := strings.CutPrefix(l, "diffhash: "); ok {
+				return h
+			}
+		}
+		return ""
+	}
+	envFor := func(t *testing.T, extra string) []string {
+		t.Helper()
+		env := append(os.Environ(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null")
+		if extra != "" {
+			env = append(env, extra)
+		}
+		return env
+	}
+	runWith := func(t *testing.T, dir, base, verified string, globs []string, env []string) (int, string) {
+		t.Helper()
+		script := strings.ReplaceAll(tamperCheckScript(base, verified, globs), "cd "+verifyScratchPath, "cd "+dir)
+		cmd := exec.Command("sh", "-c", script)
+		var out bytes.Buffer
+		cmd.Stdout, cmd.Stderr = &out, &out
+		cmd.Env = env
+		err := cmd.Run()
+		if err == nil {
+			return 0, out.String()
+		}
+		if ee, ok := err.(*exec.ExitError); ok {
+			return ee.ExitCode(), out.String()
+		}
+		t.Fatalf("run: %v", err)
+		return -1, ""
+	}
+
+	d, b, v := f39Repo(t, f39Edit("pkg/x.go", "package pkg\n// work A\n"))
+	cu, ou := runWith(t, d, b, v, globs, envFor(t, ""))
+	if cu != 0 {
+		t.Fatalf("UTF-8 run must exit 0: %d\n%s", cu, ou)
+	}
+	hu := hashOf(ou)
+	if len(hu) != 64 {
+		t.Fatalf("no 64-hex diffhash in the UTF-8 run:\n%s", ou)
+	}
+
+	// The POSIX locale only if the container has one; otherwise skip it and
+	// the UTF-8 vs UTF-8 comparison is degenerate but the script still ran.
+	// Use LC_ALL=C: always present, and git's path-quoting decision depends on
+	// the locale category, so C vs C.UTF-8 (if that is the default) still
+	// exercises the setting.
+	cp, op := runWith(t, d, b, v, globs, envFor(t, "LC_ALL=C"))
+	if cp != 0 {
+		t.Fatalf("C-locale run must exit 0: %d\n%s", cp, op)
+	}
+	hp := hashOf(op)
+	if len(hp) != 64 {
+		t.Fatalf("no 64-hex diffhash in the C-locale run:\n%s", op)
+	}
+	if hu != hp {
+		t.Errorf("the same diff gave different hashes across locales: %s vs %s", hu, hp)
+	}
+}

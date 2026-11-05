@@ -62,18 +62,6 @@ import (
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
 )
 
-// d84bConditionByType returns the first Loop condition with the given type
-// (nil when absent).
-func d84bConditionByType(loop *coxv1alpha1.Loop, condType string) *metav1.Condition {
-	for i := range loop.Status.Conditions {
-		c := loop.Status.Conditions[i]
-		if c.Type == condType {
-			return &c
-		}
-}
-	return nil
-}
-
 // d84bTrueCondition returns the first Loop condition with the given type and
 // status True (nil when absent) — the assertion target for "no terminal
 // condition remains".
@@ -91,7 +79,7 @@ func d84bTrueCondition(loop *coxv1alpha1.Loop, condType string) *metav1.Conditio
 // verify at iter-0 (the B1 idiom, checkpoint recorded and the sandbox pod
 // present), makes the iter-0 snapshot ReadyToUse, sets
 // spec.restoreFrom=iter-0, and returns everything the rollback specs need.
-func d84bSetupRollback(ctx context.Context) (ns, name string, r *LoopReconciler, snapName string) {
+func d84bSetupRollback(ctx context.Context) (ns, name string, r *LoopReconciler) {
 	ns = "d84b-" + nowSuffix()
 	Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
 	name = "d84b-loop"
@@ -107,14 +95,14 @@ func d84bSetupRollback(ctx context.Context) (ns, name string, r *LoopReconciler,
 	b2EnsureSandbox(ns, name)
 	b2EnsureSandboxPod(ns, name)
 	b1DriveToSucceeded(ctx, r, ns, name)
-	snapName = checkpointName(&coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}}, 0)
+	snapName := checkpointName(&coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}}, 0)
 	b2MakeSnapshotReady(ctx, ns, snapName)
 
 	l := &coxv1alpha1.Loop{}
 	Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, l)).To(Succeed())
 	l.Spec.RestoreFrom = "iter-0"
 	Expect(k8sClient.Update(ctx, l)).To(Succeed())
-	return ns, name, r, snapName
+	return ns, name, r
 }
 
 // d84bSetTerminalCondition appends a terminal True condition of the given type
@@ -153,9 +141,9 @@ func d84bGetLoop(ctx context.Context, ns, name string) *coxv1alpha1.Loop {
 // shape the B2 ready-rollback spec asserts at its final step). The manual
 // cluster writes just need a live context (context.Background()).
 func d84bCompleteRollback(r *LoopReconciler, ns, name string) *coxv1alpha1.Loop {
-	b2Reconcile(r, ns, name) // step 1: stop the sandbox
+	b2Reconcile(r, ns, name)                           // step 1: stop the sandbox
 	b2DeleteSandboxPod(context.Background(), ns, name) // the agent-sandbox controller removes the pod
-	b2Reconcile(r, ns, name) // step 2: delete the PVC
+	b2Reconcile(r, ns, name)                           // step 2: delete the PVC
 	b2RemovePVCProtectionFinalizer(context.Background(), ns, name)
 	return b2Reconcile(r, ns, name) // step 3: recreate the PVC from the snapshot
 }
@@ -182,7 +170,7 @@ var _ = Describe("D84b: a completed rollback re-verifies at the restored iterati
 	})
 
 	It("(a) a Loop at iteration 3 in Implementing is rolled back to iter-0: the operator sets status.iteration = 0 and phase = Verifying (desiredPhase too) — the restored tree is re-verified from the restored position", func() {
-		ns, name, r, _ := d84bSetupRollback(ctx)
+		ns, name, r := d84bSetupRollback(ctx)
 		defer func() {
 			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
 		}()
@@ -211,7 +199,7 @@ var _ = Describe("D84b: a completed rollback re-verifies at the restored iterati
 	})
 
 	It("(b) a FAILED Loop is rolled back to iter-0: the phase is Verifying and the terminal Failed condition is cleared", func() {
-		ns, name, r, _ := d84bSetupRollback(ctx)
+		ns, name, r := d84bSetupRollback(ctx)
 		defer func() {
 			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
 		}()
@@ -239,7 +227,7 @@ var _ = Describe("D84b: a completed rollback re-verifies at the restored iterati
 	})
 
 	It("(c) a SUCCEEDED Loop is rolled back to iter-0: the phase is Verifying and the terminal Succeeded condition is cleared", func() {
-		ns, name, r, _ := d84bSetupRollback(ctx)
+		ns, name, r := d84bSetupRollback(ctx)
 		defer func() {
 			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
 		}()
@@ -268,7 +256,7 @@ var _ = Describe("D84b: a completed rollback re-verifies at the restored iterati
 	})
 
 	It("(d) a Loop at the maxIterations ceiling is rolled back to iter-0: it is NOT Failed — the position resets (iteration 0, phase Verifying)", func() {
-		ns, name, r, _ := d84bSetupRollback(ctx)
+		ns, name, r := d84bSetupRollback(ctx)
 		defer func() {
 			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
 		}()
@@ -301,7 +289,7 @@ var _ = Describe("D84b: a completed rollback re-verifies at the restored iterati
 	})
 
 	It("(e) in-progress: while the rollback has NOT completed yet (the sandbox is still stopping), the phase and iteration are UNCHANGED (no decision while in progress, AGENTS I49)", func() {
-		ns, name, r, _ := d84bSetupRollback(ctx)
+		ns, name, r := d84bSetupRollback(ctx)
 		defer func() {
 			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
 		}()
@@ -333,5 +321,27 @@ var _ = Describe("D84b: a completed rollback re-verifies at the restored iterati
 		Expect(l1.Status.Iteration).To(Equal(3), "the iteration must NOT change before the restore completes")
 		Expect(l1.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseImplementing), "the phase must NOT change before the restore completes")
 		Expect(l1.Status.DesiredPhase).To(Equal(coxv1alpha1.LoopPhaseImplementing), "the desiredPhase must NOT change before the restore completes")
+	})
+
+	It("(f) a LOST-PVC restore (not a rollback) leaves the phase and iteration alone — the D106 reset is rollback-only", func() {
+		fns := "d84bf-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: fns}})).To(Succeed())
+		DeferCleanup(func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: fns}})
+		})
+		b1CreateVSC()
+		const name = "d84b-lostpvc"
+		d84aLostPVC(fns, name, false, func(l *coxv1alpha1.Loop) {
+			l.Status.Phase = coxv1alpha1.LoopPhaseImplementing
+			l.Status.DesiredPhase = coxv1alpha1.LoopPhaseImplementing
+			l.Status.Iteration = 3
+		})
+		after := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: fns}, after)).To(Succeed())
+		c := b2RestoreCondition(after)
+		Expect(c).NotTo(BeNil(), "the lost-PVC restore must complete")
+		Expect(c.Reason).To(Equal(coxv1alpha1.RestoreReasonRestored))
+		Expect(after.Status.Iteration).To(Equal(3), "a lost-PVC restore must not reset the iteration (D106 is rollback-only)")
+		Expect(after.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseImplementing), "a lost-PVC restore must not move the phase")
 	})
 })

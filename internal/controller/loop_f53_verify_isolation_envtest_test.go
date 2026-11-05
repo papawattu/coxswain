@@ -173,6 +173,33 @@ var _ = Describe("F53: the verify Job isolates the checks and is time-bounded", 
 		}
 	})
 
+	It("D79(b): the tamper init writes its termination message to its own writable /tmp", func() {
+		spec := f53JobSpec("echo c0")
+		var found bool
+		for _, ct := range spec.Template.Spec.InitContainers {
+			if ct.Name != verifyTamperInit {
+				continue
+			}
+			found = true
+			Expect(ct.TerminationMessagePath).To(Equal(verifyTerminationLogPath))
+			var mounted bool
+			for _, m := range ct.VolumeMounts {
+				if m.Name == verifyTamperTmpVolName && m.MountPath == agentTmpMount {
+					mounted = true
+				}
+			}
+			Expect(mounted).To(BeTrue(), "the tamper init must mount %s at %s", verifyTamperTmpVolName, agentTmpMount)
+		}
+		Expect(found).To(BeTrue(), "the verify Job must have the tamper init")
+		var declared bool
+		for _, v := range spec.Template.Spec.Volumes {
+			if v.Name == verifyTamperTmpVolName && v.EmptyDir != nil {
+				declared = true
+			}
+		}
+		Expect(declared).To(BeTrue(), "the pod must declare the %s emptyDir", verifyTamperTmpVolName)
+	})
+
 	It("carries activeDeadlineSeconds so a hung check cannot hold Verifying for ever (D12/D17)", func() {
 		spec := f53JobSpec("sleep 100000")
 		Expect(spec.ActiveDeadlineSeconds).NotTo(BeNil(),

@@ -127,6 +127,13 @@ const (
 	// to its own scratch and runs the generated test there). Bounded like the
 	// per-check scratch.
 	verifyCanaryTmpVolName = "check-tmp-canary"
+	// verifyTamperTmpVolName is the tamper init's own writable /tmp scratch
+	// (D79(b)): the tamper init writes its termination message (the agent
+	// diff's hash) there, because the operator reads verify output only from
+	// termination messages and the init's checkout is read-only. The canary
+	// uses the same pattern (verifyCanaryTmpVolName). Bounded like the
+	// per-check scratch.
+	verifyTamperTmpVolName = "tamper-tmp"
 	// verifyArtifactMaxBytes is the I47 size cap for a file ADDED in
 	// baseCommit..verifiedCommit (1 MiB — the same cap the runner's
 	// commitWorkspace refuses against on the agent side).
@@ -1004,8 +1011,19 @@ const (
 // bare "git diff" with no pathspec would flag every change, so the script
 // reports clean without running it.
 func tamperCheckScript(baseCommit, verifyCommit string, globs []string) string {
+	diffHash := fmt.Sprintf(`
+# D79(b): the agent's whole diff base..verified, hashed. N verify failures
+# with the same diffhash are a stall even when the failing output varies.
+if ! AGENTDIFF=$(git -c core.quotePath=false diff --no-ext-diff --no-color --binary %s %s); then
+  echo "tamper: git diff failed; refusing to report clean"
+  exit %d
+fi
+DIFFHASH=$(printf '%%s' "$AGENTDIFF" | sha256sum | cut -c1-64)
+echo "diffhash: $DIFFHASH"
+if [ -n "${TERMINATION_MESSAGE_PATH:-}" ]; then echo "diffhash: $DIFFHASH" > "$TERMINATION_MESSAGE_PATH"; fi
+`, shellQuote(baseCommit), shellQuote(verifyCommit), tamperGitErrorExit)
 	if len(globs) == 0 {
-		return "set -e\necho \"tamper: clean (no protected paths)\"\nexit 0\n"
+		return "set -e\ncd " + verifyScratchPath + "\n" + diffHash + "echo \"tamper: clean (no protected paths)\"\nexit 0\n"
 	}
 	quoted := make([]string, len(globs))
 	for i, g := range globs {
@@ -1017,7 +1035,7 @@ cd %s
 # Diff baseCommit..verifiedCommit over the protected globs, one pathspec per
 # argument. A non-empty result (any protected path changed) => exit 1
 # (tampered). Empty => exit 0 (clean). A git failure => exit 2 (fail closed).
-if ! CHANGED=$(git diff --name-only %s %s -- %s); then
+if ! CHANGED=$(git -c core.quotePath=false diff --name-only %s %s -- %s); then
   echo "tamper: git diff failed; refusing to report clean"
   exit %d
 fi
@@ -1026,9 +1044,10 @@ if [ -n "$CHANGED" ]; then
   echo "$CHANGED"
   exit 1
 fi
+%s
 echo "tamper: clean"
 exit 0
-`, verifyScratchPath, shellQuote(baseCommit), shellQuote(verifyCommit), strings.Join(quoted, " "), tamperGitErrorExit)
+`, verifyScratchPath, shellQuote(baseCommit), shellQuote(verifyCommit), strings.Join(quoted, " "), tamperGitErrorExit, diffHash)
 }
 
 // verifyNotDescendantExit is the import-agent script's exit status when the
@@ -1229,9 +1248,15 @@ func (r *LoopReconciler) buildVerifyJobSpec(loop *coxv1alpha1.Loop) batchv1.JobS
 		Image:           baseImage,
 		Command:         []string{verifySh, "-c", tamperScript},
 		SecurityContext: trustedContainerSecurityContext(),
-		Env:             verifyGitSafeEnv(),
+		Env:             append(verifyGitSafeEnv(), corev1.EnvVar{Name: "TERMINATION_MESSAGE_PATH", Value: verifyTerminationLogPath}),
 		Resources:       verifyTrustedResources(),
-		VolumeMounts:    []corev1.VolumeMount{{Name: verifyVol, MountPath: verifyScratchPath}},
+		// D79(b): the tamper init's termination message carries the agent
+		// diff's hash — the operator's only read path. It needs a writable
+		// /tmp for the message file (its checkout is read-only), hence the
+		// dedicated tamper-tmp emptyDir (same pattern as the canary).
+		TerminationMessagePath: verifyTerminationLogPath,
+		VolumeMounts: []corev1.VolumeMount{{Name: verifyVol, MountPath: verifyScratchPath},
+			{Name: verifyTamperTmpVolName, MountPath: agentTmpMount}},
 	}
 
 	// The F60 (D17.1) canary init: the negative control for in-process
@@ -1404,6 +1429,9 @@ func (r *LoopReconciler) buildVerifyJobSpec(loop *coxv1alpha1.Loop) batchv1.JobS
 	// git credential (only when present).
 	volumes := []corev1.Volume{
 		{Name: verifyVol, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
+		// D79(b): the tamper init's own writable /tmp scratch (its
+		// termination-message file lands there; its checkout is read-only).
+		{Name: verifyTamperTmpVolName, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: newLimit(verifyCheckTmpSizeLimit)}}},
 		{Name: verifyAgentVol, VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
 			ClaimName: workspacePVCName(loop.Name), ReadOnly: true,
 		}}},

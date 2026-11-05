@@ -20,6 +20,7 @@ package controller
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -485,4 +486,85 @@ func itoa(i int) string {
 		b[pos] = '-'
 	}
 	return string(b[pos:])
+}
+
+// D79(b): the no-real-diff rule fires on N consecutive equal diffHashes even
+// when the output hash varies; an empty diffHash never fires.
+func TestNoRealDiffDecision(t *testing.T) {
+	e := func(job, out, diff string) coxv1alpha1.StallEntry {
+		return coxv1alpha1.StallEntry{JobName: job, Hash: out, NormalisationVersion: "v1", DiffHash: diff}
+	}
+	cases := []struct {
+		name     string
+		history  []coxv1alpha1.StallEntry
+		newEntry coxv1alpha1.StallEntry
+		wantFire bool
+		wantRun  int
+	}{
+		{"three equal diffs, varying output, fires", []coxv1alpha1.StallEntry{e("j0", "a", "d"), e("j1", "b", "d")}, e("j2", "c", "d"), true, 3},
+		{"two of three does not fire", []coxv1alpha1.StallEntry{e("j1", "b", "d")}, e("j2", "c", "d"), false, 2},
+		{"a different diff resets", []coxv1alpha1.StallEntry{e("j0", "a", "d"), e("j1", "b", "x")}, e("j2", "c", "d"), false, 1},
+		{"empty diffHash never fires", []coxv1alpha1.StallEntry{e("j0", "a", ""), e("j1", "a", "")}, e("j2", "a", ""), false, 0},
+		{"an empty entry breaks the run", []coxv1alpha1.StallEntry{e("j0", "a", "d"), e("j1", "b", "")}, e("j2", "c", "d"), false, 1},
+		{"a re-read of the same Job does not fire", []coxv1alpha1.StallEntry{e("j0", "a", "d"), e("j1", "b", "d")}, e("j1", "b", "d"), false, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fired, run := noRealDiffDecision(tc.history, tc.newEntry, 3)
+			if fired != tc.wantFire || run != tc.wantRun {
+				t.Fatalf("fire=%v run=%d, want fire=%v run=%d", fired, run, tc.wantFire, tc.wantRun)
+			}
+		})
+	}
+}
+
+// D79(b): three failures with DIFFERENT output but the SAME agent diff fire
+// the stall (no-real-diff rule); the Stalled message names the rule. A
+// different diff on the third does not fire.
+func TestApplyStallGateNoRealDiff(t *testing.T) {
+	const diff = "d79bd79bd79bd79bd79bd79bd79bd79bd79bd79bd79bd79bd79bd79bd79bd79b"
+	podWith := func(dh string) *corev1.Pod {
+		term := func(msg string) corev1.ContainerState {
+			return corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 1, Message: msg, FinishedAt: metav1.Now()}}
+		}
+		return &corev1.Pod{Status: corev1.PodStatus{InitContainerStatuses: []corev1.ContainerStatus{
+			{Name: verifyTamperInit, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0, Message: "diffhash: " + dh, FinishedAt: metav1.Now()}}},
+			{Name: s5aCheck0, State: term("third output")},
+		}}}
+	}
+	r := &LoopReconciler{CNIProber: testCNIProber(), readCheckOutput: func(*corev1.Pod, string) (string, bool) { return "third output", true }}
+	mk := func() *coxv1alpha1.Loop {
+		n := int32(3)
+		l := &coxv1alpha1.Loop{}
+		l.Name, l.Namespace = "lp", p2eStallNS
+		l.Status.Phase = coxv1alpha1.LoopPhaseVerifying
+		l.Status.Iteration = 2
+		l.Spec.Loop.StallAfter = &n
+		l.Spec.Loop.StallAction = coxv1alpha1.StallActionFail
+		l.Status.StallHistory = []coxv1alpha1.StallEntry{
+			{JobName: p2eStallSeededJob0, Hash: "first", NormalisationVersion: "v1", DiffHash: diff},
+			{JobName: p2eStallSeededJob1, Hash: "second", NormalisationVersion: "v1", DiffHash: diff},
+		}
+		return l
+	}
+	loop := mk()
+	if !r.applyStallGate(context.Background(), loop, podWith(diff), s5aCheck0) {
+		t.Fatalf("three failures with the same agent diff must fire (varying output)")
+	}
+	if got := loop.Status.StallHistory[len(loop.Status.StallHistory)-1].DiffHash; got != diff {
+		t.Fatalf("the appended entry's diffHash = %q, want %q", got, diff)
+	}
+	var msg string
+	for _, c := range loop.Status.Conditions {
+		if c.Type == string(coxv1alpha1.StalledCondition) {
+			msg = c.Message
+		}
+	}
+	if !strings.Contains(msg, "no real diff") {
+		t.Fatalf("the Stalled message must name the no-real-diff rule: %q", msg)
+	}
+	other := mk()
+	if r.applyStallGate(context.Background(), other, podWith(strings.Repeat("e", 64)), s5aCheck0) {
+		t.Fatalf("a different agent diff on the third failure must not fire")
+	}
 }

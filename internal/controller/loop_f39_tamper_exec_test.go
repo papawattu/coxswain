@@ -168,3 +168,232 @@ func TestTamperScriptCustomGlob(t *testing.T) {
 		t.Fatalf("custom glob: exit=%d output=%q", code, out)
 	}
 }
+
+// D79(b): a clean tamper run prints "diffhash: <64 hex>". The same agent diff
+// gives the same hash in two repos; a different diff gives a different hash;
+// a tampered run prints none.
+func TestTamperScriptDiffHash(t *testing.T) {
+	globs := tamper.ExpandPreset(tamper.PresetGo, nil, false)
+	hashOf := func(out string) string {
+		for l := range strings.SplitSeq(out, "\n") {
+			if h, ok := strings.CutPrefix(l, "diffhash: "); ok {
+				return h
+			}
+		}
+		return ""
+	}
+	d1, b1, v1 := f39Repo(t, f39Edit("pkg/x.go", "package pkg\n// work A\n"))
+	c1, o1 := f39Run(t, d1, b1, v1, globs)
+	d2, b2, v2 := f39Repo(t, f39Edit("pkg/x.go", "package pkg\n// work A\n"))
+	c2, o2 := f39Run(t, d2, b2, v2, globs)
+	d3, b3, v3 := f39Repo(t, f39Edit("pkg/x.go", "package pkg\n// work B\n"))
+	c3, o3 := f39Run(t, d3, b3, v3, globs)
+	if c1 != 0 || c2 != 0 || c3 != 0 {
+		t.Fatalf("clean runs must exit 0: %d %d %d\n%s", c1, c2, c3, o1)
+	}
+	h1, h2, h3 := hashOf(o1), hashOf(o2), hashOf(o3)
+	if len(h1) != 64 {
+		t.Fatalf("no 64-hex diffhash line in %q", o1)
+	}
+	if h1 != h2 {
+		t.Errorf("the same agent diff gave different hashes: %s vs %s", h1, h2)
+	}
+	if h1 == h3 {
+		t.Errorf("a different agent diff gave the same hash %s", h1)
+	}
+	if _, err := os.Stat(filepath.Join(d1, ".diffhash")); err == nil {
+		t.Errorf("the script left a .diffhash file in the checkout")
+	}
+	dn, bn, vn := f39Repo(t, f39Edit("pkg/x.go", "package pkg\n// work A\n"))
+	if _, on := f39Run(t, dn, bn, vn, nil); hashOf(on) != h1 {
+		t.Errorf("the no-globs path must print the same diffhash: %q", on)
+	}
+	dt, bt, vt := f39Repo(t, f39Edit("pkg/x_test.go", "package pkg\n// doctored\n"))
+	if ct, ot := f39Run(t, dt, bt, vt, globs); ct != 1 || hashOf(ot) != "" {
+		t.Errorf("a tampered run must exit 1 with no diffhash: exit=%d %q", ct, ot)
+	}
+}
+
+// D79(b) part 2 step 2: the printed hash is the SHA-256 of the agent diff's
+// CONTENT, byte for byte as git prints it. Two runs of the same git diff are
+// identical, so an independent recomputation (no shell in between) must
+// match; a script that hashed anything else would disagree.
+func TestTamperScriptDiffHashIsContentOnly(t *testing.T) {
+	globs := tamper.ExpandPreset(tamper.PresetGo, nil, false)
+	hashOf := func(out string) string {
+		for l := range strings.SplitSeq(out, "\n") {
+			if h, ok := strings.CutPrefix(l, "diffhash: "); ok {
+				return h
+			}
+		}
+		return ""
+	}
+	d1, b1, v1 := f39Repo(t, f39Edit("pkg/x.go", "package pkg\n// work A\n"))
+	c1, o1 := f39Run(t, d1, b1, v1, globs)
+	if c1 != 0 {
+		t.Fatalf("clean run must exit 0: %d\n%s", c1, o1)
+	}
+	h1 := hashOf(o1)
+	if len(h1) != 64 {
+		t.Fatalf("no 64-hex diffhash line in %q", o1)
+	}
+	ref := "git diff --no-ext-diff --no-color --binary '" + b1 + "' '" + v1 + "' > diff.raw\n"
+	ref += "AGENTDIFF=$(cat diff.raw)\nprintf '%s' \"$AGENTDIFF\" | sha256sum | cut -c1-64\n"
+	var sb bytes.Buffer
+	cmd := exec.Command("sh", "-c", ref)
+	cmd.Dir = d1
+	cmd.Env = append(os.Environ(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null")
+	cmd.Stdout = &sb
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("recomputing the diffhash like the script does: %v\n%s", err, sb.String())
+	}
+	got := strings.TrimSpace(sb.String())
+	if len(got) != 64 { // the reference prints the bare hash, no prefix
+		t.Fatalf("no 64-hex hash from the reference recomputation:\n%s", sb.String())
+	}
+	if h1 != got {
+		t.Errorf("the script's hash %s is not the sha256 of the diff's content as the script computes it %s", h1, got)
+	}
+}
+
+// D79(b) part 2 step 4: with nothing protected the script still cd's into the
+// scratch, hashes the diff, and reports clean — and it refuses to report
+// clean when the diff cannot be computed.
+func TestTamperScriptNoGlobsPrintsDiffHash(t *testing.T) {
+	dir, base, verified := f39Repo(t, f39Edit("pkg/x.go", "package pkg\n// work A\n"))
+	code, out := f39Run(t, dir, base, verified, nil)
+	if code != 0 || !strings.Contains(out, "tamper: clean (no protected paths)") {
+		t.Fatalf("no-globs clean: exit=%d output=%q", code, out)
+	}
+	hash := ""
+	for l := range strings.SplitSeq(out, "\n") {
+		if h, ok := strings.CutPrefix(l, "diffhash: "); ok {
+			hash = h
+		}
+	}
+	if len(hash) != 64 {
+		t.Fatalf("no-globs clean run printed no 64-hex diffhash:\n%s", out)
+	}
+
+	// git failure on the no-globs path: a commit that does not exist must make
+	// the hash step fail, refuse clean, and exit tamperGitErrorExit.
+	bad, vbad := func() (string, string) {
+		d := t.TempDir()
+		git := func(args ...string) string {
+			t.Helper()
+			cmd := exec.Command("git", args...)
+			cmd.Dir = d
+			cmd.Env = append(os.Environ(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null")
+			o, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("git %v: %v\n%s", args, err, o)
+			}
+			return strings.TrimSpace(string(o))
+		}
+		git("init", "-q")
+		git("config", "user.email", "t@example.com")
+		git("config", "user.name", "t")
+		if err := os.MkdirAll(filepath.Join(d, "pkg"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(d, "pkg/x.go"), []byte("package pkg\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		git("add", "-A")
+		git("commit", "-q", "-m", "base")
+		return "0123456789abcdef0123456789abcdef0123456789", git("rev-parse", "HEAD")
+	}()
+	code, out = f39Run(t, dir, bad, vbad, nil)
+	if code != int(tamperGitErrorExit) {
+		t.Errorf("no-globs git failure: exit=%d, want %d\n%s", code, int(tamperGitErrorExit), out)
+	}
+	if strings.Contains(out, "tamper: clean (no protected paths)") {
+		t.Errorf("a git failure must not report clean:\n%s", out)
+	}
+}
+
+// D79(b) part 2 step 5: the hash must not depend on locale. The same diff in a
+// UTF-8 locale and in the POSIX locale must print the same diffhash.
+func TestTamperScriptDiffHashIsLocaleStable(t *testing.T) {
+	globs := tamper.ExpandPreset(tamper.PresetGo, nil, false)
+	hashOf := func(out string) string {
+		for l := range strings.SplitSeq(out, "\n") {
+			if h, ok := strings.CutPrefix(l, "diffhash: "); ok {
+				return h
+			}
+		}
+		return ""
+	}
+	envFor := func(t *testing.T, extra string) []string {
+		t.Helper()
+		env := append(os.Environ(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null")
+		if extra != "" {
+			env = append(env, extra)
+		}
+		return env
+	}
+	runWith := func(t *testing.T, dir, base, verified string, globs []string, env []string) (int, string) {
+		t.Helper()
+		script := strings.ReplaceAll(tamperCheckScript(base, verified, globs), "cd "+verifyScratchPath, "cd "+dir)
+		cmd := exec.Command("sh", "-c", script)
+		var out bytes.Buffer
+		cmd.Stdout, cmd.Stderr = &out, &out
+		cmd.Env = env
+		err := cmd.Run()
+		if err == nil {
+			return 0, out.String()
+		}
+		if ee, ok := err.(*exec.ExitError); ok {
+			return ee.ExitCode(), out.String()
+		}
+		t.Fatalf("run: %v", err)
+		return -1, ""
+	}
+
+	d, b, v := f39Repo(t, f39Edit("pkg/x.go", "package pkg\n// work A\n"))
+	cu, ou := runWith(t, d, b, v, globs, envFor(t, ""))
+	if cu != 0 {
+		t.Fatalf("UTF-8 run must exit 0: %d\n%s", cu, ou)
+	}
+	hu := hashOf(ou)
+	if len(hu) != 64 {
+		t.Fatalf("no 64-hex diffhash in the UTF-8 run:\n%s", ou)
+	}
+
+	// The POSIX locale only if the container has one; otherwise skip it and
+	// the UTF-8 vs UTF-8 comparison is degenerate but the script still ran.
+	// Use LC_ALL=C: always present, and git's path-quoting decision depends on
+	// the locale category, so C vs C.UTF-8 (if that is the default) still
+	// exercises the setting.
+	cp, op := runWith(t, d, b, v, globs, envFor(t, "LC_ALL=C"))
+	if cp != 0 {
+		t.Fatalf("C-locale run must exit 0: %d\n%s", cp, op)
+	}
+	hp := hashOf(op)
+	if len(hp) != 64 {
+		t.Fatalf("no 64-hex diffhash in the C-locale run:\n%s", op)
+	}
+	if hu != hp {
+		t.Errorf("the same diff gave different hashes across locales: %s vs %s", hu, hp)
+	}
+}
+
+// D79(b): with TERMINATION_MESSAGE_PATH set (the pod's env), the clean run
+// writes the diffhash line to that file — the operator's only read path.
+func TestTamperScriptWritesDiffHashTermination(t *testing.T) {
+	dir, base, verified := f39Repo(t, f39Edit("pkg/x.go", "package pkg\n// work\n"))
+	term := filepath.Join(t.TempDir(), "termination.log")
+	script := strings.ReplaceAll(tamperCheckScript(base, verified, tamper.ExpandPreset(tamper.PresetGo, nil, false)), "cd "+verifyScratchPath, "cd "+dir)
+	cmd := exec.Command("sh", "-c", script)
+	cmd.Env = append(os.Environ(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null", "TERMINATION_MESSAGE_PATH="+term)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("run: %v\n%s", err, out)
+	}
+	b, err := os.ReadFile(term)
+	if err != nil {
+		t.Fatalf("no termination file: %v", err)
+	}
+	if !strings.HasPrefix(string(b), "diffhash: ") || len(strings.TrimSpace(strings.TrimPrefix(string(b), "diffhash: "))) != 64 {
+		t.Fatalf("termination file = %q, want one diffhash line", b)
+	}
+}

@@ -54,6 +54,14 @@ _(none yet)_
 
 **On upgrade:** no action. A Loop already at `AwaitingApproval` stops accumulating on the first reconcile after the upgrade.
 
+### D79(b) part 2: stall on N failures with no real diff — #403
+
+**What was wrong:** the stall detector hashed only the check output, which the agent influences, so varying the failure text dodged it; `maxIterations` was the only bound.
+
+**What changed:** the verify Job's tamper init now prints `diffhash: <64 hex>` on every clean run — the SHA-256 of the agent's whole diff `baseCommit..verifiedCommit` — and writes it to its termination message (`/tmp/termination.log`, on its own `tamper-tmp` emptyDir). The operator records it as `status.stallHistory[].diffHash`. The stall gate now fires on either rule, with the same `stallAfter` (N, default 3) and the same `stallAction`: N consecutive identical failing outputs (the old rule), or N consecutive failures with the same agent diff, even when the failing output differs (D79(b), "no real diff"). The Stalled condition and the StallDetected Event name the rule: "identical verify failures" or "verify failures with no real diff (the same agent diff)".
+
+**On upgrade:** a verify Job created before the upgrade reports no diffhash, so the new rule starts counting from the first post-upgrade verify. `status.stallHistory[].diffHash` is new and optional.
+
 ### D84a (F74): a lost workspace PVC with no usable checkpoint fails the Loop — #399
 
 **What was wrong:** When the workspace PVC was lost and no usable checkpoint

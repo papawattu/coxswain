@@ -1375,6 +1375,13 @@ type StallEntry struct {
 	// hash is the SHA-256 hex of the normalised failing output (P2e).
 	Hash string `json:"hash"`
 
+	// diffHash is the SHA-256 hex of the agent's diff baseCommit..verifiedCommit
+	// EXCLUDING the protected paths (D79(b)): N consecutive failures with the
+	// same diffHash are a stall even when the failing output varies. Empty
+	// when the verify Job did not report one (an older Job, no tamper step).
+	// +optional
+	DiffHash string `json:"diffHash,omitempty"`
+
 	// normalisationVersion is the version of the normalisation the hash was
 	// computed with (the P2e constant). A change resets the consecutive run
 	// (a v1 and a v2 hash of the same output must not be conflated).

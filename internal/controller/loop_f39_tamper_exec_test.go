@@ -201,6 +201,9 @@ func TestTamperScriptDiffHash(t *testing.T) {
 	if h1 == h3 {
 		t.Errorf("a different agent diff gave the same hash %s", h1)
 	}
+	if _, err := os.Stat(filepath.Join(d1, ".diffhash")); err == nil {
+		t.Errorf("the script left a .diffhash file in the checkout")
+	}
 	dn, bn, vn := f39Repo(t, f39Edit("pkg/x.go", "package pkg\n// work A\n"))
 	if _, on := f39Run(t, dn, bn, vn, nil); hashOf(on) != h1 {
 		t.Errorf("the no-globs path must print the same diffhash: %q", on)
@@ -372,5 +375,25 @@ func TestTamperScriptDiffHashIsLocaleStable(t *testing.T) {
 	}
 	if hu != hp {
 		t.Errorf("the same diff gave different hashes across locales: %s vs %s", hu, hp)
+	}
+}
+
+// D79(b): with TERMINATION_MESSAGE_PATH set (the pod's env), the clean run
+// writes the diffhash line to that file — the operator's only read path.
+func TestTamperScriptWritesDiffHashTermination(t *testing.T) {
+	dir, base, verified := f39Repo(t, f39Edit("pkg/x.go", "package pkg\n// work\n"))
+	term := filepath.Join(t.TempDir(), "termination.log")
+	script := strings.ReplaceAll(tamperCheckScript(base, verified, tamper.ExpandPreset(tamper.PresetGo, nil, false)), "cd "+verifyScratchPath, "cd "+dir)
+	cmd := exec.Command("sh", "-c", script)
+	cmd.Env = append(os.Environ(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null", "TERMINATION_MESSAGE_PATH="+term)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("run: %v\n%s", err, out)
+	}
+	b, err := os.ReadFile(term)
+	if err != nil {
+		t.Fatalf("no termination file: %v", err)
+	}
+	if !strings.HasPrefix(string(b), "diffhash: ") || len(strings.TrimSpace(strings.TrimPrefix(string(b), "diffhash: "))) != 64 {
+		t.Fatalf("termination file = %q, want one diffhash line", b)
 	}
 }

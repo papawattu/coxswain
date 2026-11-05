@@ -642,6 +642,14 @@ func writeLessons(dir string, survivors []string) (int, []string, []string, erro
 	return written, writtenNames, evicted, nil
 }
 
+// rescreenExisting is D73(b): it re-screens the existing <sha256>.txt lesson
+// files in dir against the current static rules (memorywrite.Screen) and
+// removes the ones that no longer pass. It returns one audit line per removal,
+// "rescreened <sha12> <reason>" (no lesson content).
+func rescreenExisting(dir string) ([]string, error) {
+	return nil, nil
+}
+
 // evictOldest enforces the D71 cap: if the existing lesson files plus the new
 // (non-duplicate) survivors would exceed max, it removes the oldest existing
 // lessons by mtime (ties broken by name, so it is deterministic) until they

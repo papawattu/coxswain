@@ -1157,6 +1157,7 @@ func (r *LoopReconciler) b2ApplyRestoreStep(ctx context.Context, loop *coxv1alph
 			// Dropping it here also stops a delivery queued before the rollback:
 			// the restore step runs before ensureDeliverAndSettle in this pass.
 			pinCleared := clearVerifyPinAtRestore(loop)
+			resetAfterRollback(loop, target.iteration)
 			// F48g: a completed restore ends the sandbox-failure episode (the
 			// rollback's PVC is gone and is recreated from the snapshot), so the
 			// count the pre-rollback run accumulated does not carry into the
@@ -1449,4 +1450,17 @@ func (r *LoopReconciler) removeForkRetentionLabel(ctx context.Context, fork *cox
 		r.warnForkRetention(fork, "ForkRetentionLabelRemoveFailed",
 			"removing the fork-retention label from snapshot "+snapName+" failed ("+err.Error()+"); the label persists and the source's GC skips the snapshot (a known B2 limitation)")
 	}
+}
+
+// resetAfterRollback is D84(a)/D106 (F77, owner 2026-11-05): a completed
+// rollback to checkpoint iter-N re-verifies the restored tree at iteration N.
+// The phase and iteration used to survive the rollback, so a terminal Loop
+// restored its tree and nothing ran, and a Loop at maxIterations failed at
+// once. The terminal Failed/Succeeded conditions describe discarded work.
+func resetAfterRollback(loop *coxv1alpha1.Loop, iteration int) {
+	loop.Status.Iteration = iteration
+	loop.Status.Phase = coxv1alpha1.LoopPhaseVerifying
+	loop.Status.DesiredPhase = coxv1alpha1.LoopPhaseVerifying
+	clearCondition(loop, string(coxv1alpha1.LoopPhaseFailed))
+	clearCondition(loop, string(coxv1alpha1.LoopPhaseSucceeded))
 }

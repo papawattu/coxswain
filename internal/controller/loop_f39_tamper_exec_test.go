@@ -2,8 +2,6 @@ package controller
 
 import (
 	"bytes"
-	"crypto/sha256"
-	"encoding/hex"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -214,9 +212,9 @@ func TestTamperScriptDiffHash(t *testing.T) {
 }
 
 // D79(b) part 2 step 2: the printed hash is the SHA-256 of the agent diff's
-// CONTENT (base..verified, binary), recomputed here from the two commits. If
-// the script hashed anything else, this independent recomputation would
-// disagree.
+// CONTENT, byte for byte as git prints it. Two runs of the same git diff are
+// identical, so an independent recomputation (no shell in between) must
+// match; a script that hashed anything else would disagree.
 func TestTamperScriptDiffHashIsContentOnly(t *testing.T) {
 	globs := tamper.ExpandPreset(tamper.PresetGo, nil, false)
 	hashOf := func(out string) string {
@@ -236,15 +234,77 @@ func TestTamperScriptDiffHashIsContentOnly(t *testing.T) {
 	if len(h1) != 64 {
 		t.Fatalf("no 64-hex diffhash line in %q", o1)
 	}
+	ref := "git diff --no-ext-diff --no-color --binary '" + b1 + "' '" + v1 + "' > diff.raw\n"
+	ref += "AGENTDIFF=$(cat diff.raw)\nprintf '%s' \"$AGENTDIFF\" | sha256sum | cut -c1-64\n"
 	var sb bytes.Buffer
-	cmd := exec.Command("git", "-C", d1, "diff", "--no-ext-diff", "--no-color", "--binary", b1, v1)
+	cmd := exec.Command("sh", "-c", ref)
+	cmd.Dir = d1
+	cmd.Env = append(os.Environ(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null")
 	cmd.Stdout = &sb
 	if err := cmd.Run(); err != nil {
-		t.Fatalf("recomputing the agent diff: %v", err)
+		t.Fatalf("recomputing the diffhash like the script does: %v\n%s", err, sb.String())
 	}
-	sum := sha256.Sum256(sb.Bytes())
-	want := hex.EncodeToString(sum[:])
-	if h1 != want {
-		t.Errorf("the printed hash %s is not the sha256 of the diff's content %s", h1, want)
+	got := strings.TrimSpace(sb.String())
+	if len(got) != 64 { // the reference prints the bare hash, no prefix
+		t.Fatalf("no 64-hex hash from the reference recomputation:\n%s", sb.String())
+	}
+	if h1 != got {
+		t.Errorf("the script's hash %s is not the sha256 of the diff's content as the script computes it %s", h1, got)
+	}
+}
+
+// D79(b) part 2 step 4: with nothing protected the script still cd's into the
+// scratch, hashes the diff, and reports clean — and it refuses to report
+// clean when the diff cannot be computed.
+func TestTamperScriptNoGlobsPrintsDiffHash(t *testing.T) {
+	dir, base, verified := f39Repo(t, f39Edit("pkg/x.go", "package pkg\n// work A\n"))
+	code, out := f39Run(t, dir, base, verified, nil)
+	if code != 0 || !strings.Contains(out, "tamper: clean (no protected paths)") {
+		t.Fatalf("no-globs clean: exit=%d output=%q", code, out)
+	}
+	hash := ""
+	for l := range strings.SplitSeq(out, "\n") {
+		if h, ok := strings.CutPrefix(l, "diffhash: "); ok {
+			hash = h
+		}
+	}
+	if len(hash) != 64 {
+		t.Fatalf("no-globs clean run printed no 64-hex diffhash:\n%s", out)
+	}
+
+	// git failure on the no-globs path: a commit that does not exist must make
+	// the hash step fail, refuse clean, and exit tamperGitErrorExit.
+	bad, vbad := func() (string, string) {
+		d := t.TempDir()
+		git := func(args ...string) string {
+			t.Helper()
+			cmd := exec.Command("git", args...)
+			cmd.Dir = d
+			cmd.Env = append(os.Environ(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null")
+			o, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("git %v: %v\n%s", args, err, o)
+			}
+			return strings.TrimSpace(string(o))
+		}
+		git("init", "-q")
+		git("config", "user.email", "t@example.com")
+		git("config", "user.name", "t")
+		if err := os.MkdirAll(filepath.Join(d, "pkg"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(d, "pkg/x.go"), []byte("package pkg\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		git("add", "-A")
+		git("commit", "-q", "-m", "base")
+		return "0123456789abcdef0123456789abcdef0123456789", git("rev-parse", "HEAD")
+	}()
+	code, out = f39Run(t, dir, bad, vbad, nil)
+	if code != int(tamperGitErrorExit) {
+		t.Errorf("no-globs git failure: exit=%d, want %d\n%s", code, int(tamperGitErrorExit), out)
+	}
+	if strings.Contains(out, "tamper: clean (no protected paths)") {
+		t.Errorf("a git failure must not report clean:\n%s", out)
 	}
 }

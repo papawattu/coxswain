@@ -71,12 +71,22 @@ func testPatternSpec(t *testing.T, patternName, matchingSample, proseLesson stri
 		)
 	}
 
-	// The prose lesson survives (no rule trips).
-	survivors, reasons := Screen([]string{proseLesson})
-	if len(survivors) != 1 {
+	// The prose lesson survives the secrets scan. It carries no D68 file-path
+	// anchor, so Screen (which also runs the orthogonal no-path-or-error
+	// rule) drops it as no-path-or-error; testPatternSpec asserts the secrets
+	// outcome only — a "secret: ..." drop would be the pattern false
+	// positive, and any other reason means the pattern did not trip.
+	_, reasons = Screen([]string{proseLesson})
+	if len(reasons) != 1 {
 		t.Fatalf(
-			"pattern %s: prose lesson %q: survivors=%v, want it kept (reasons=%v)",
-			patternName, proseLesson, survivors, reasons,
+			"pattern %s: prose lesson %q: reasons=%v, want exactly one reason",
+			patternName, proseLesson, reasons,
+		)
+	}
+	if strings.HasPrefix(reasons[0], "secret:") {
+		t.Fatalf(
+			"pattern %s: prose lesson %q was dropped by secrets rule %q, want kept from the pattern scan",
+			patternName, proseLesson, reasons[0],
 		)
 	}
 }
@@ -442,6 +452,12 @@ func TestD68NoPathOrErrorDropped(t *testing.T) {
 	if len(survivors) != 1 {
 		t.Fatalf("D68: a lesson with a path was dropped: reasons=%v", reasons)
 	}
+	// D78(b): the kept lesson example in TestCredentialAssignmentColonForm
+	// ("the token is read from the environment") also names a file path.
+	survivors, reasons = Screen([]string{"the token is read from the environment (internal/agent/env.go)"})
+	if len(survivors) != 1 {
+		t.Fatalf("D68: a lesson with a path was dropped: reasons=%v", reasons)
+	}
 }
 
 // F18: the credential-assignment rule is case-insensitive and has no leading
@@ -462,23 +478,26 @@ func TestPatternSpecCredentialAssignmentCaseAndPrefix(t *testing.T) {
 		"the api key is read from the environment (internal/cfg/env.go)")
 }
 
-// The ":" form: a token-shaped value (8+ chars of [A-Za-z0-9+/=_.-]) is
-// dropped; prose after a colon is kept.
+// D78(b): any `credkey:` followed by a non-space value is dropped, whatever
+// its length. The owner accepted that prose such as "the token: parser lives
+// in …" will now be dropped too.
 func TestCredentialAssignmentColonForm(t *testing.T) {
 	testPatternSpec(t, "credential-assignment",
 		"the secret yaml has token: "+"abc123xyz"+" in deploy/secret.yaml",
-		"the token: parser lives in internal/lex/token.go")
+		"the token is read from the environment")
 	for _, l := range []string{
-		"password: " + "hunter2hunter2" + " in config/dev/env",
-		"api_key: " + "abcdef123456" + " in deploy/env.sh",
+		"password: " + "hunter2" + " in config/dev/env",
+		"token: " + "x",
+		"api_key: " + "abcdef123456",
+		"the token: parser lives in internal/lex/token.go",
 	} {
 		if s, _ := Screen([]string{l}); len(s) != 0 {
 			t.Errorf("colon credential %q was written, want dropped", l)
 		}
 	}
 	for _, l := range []string{
-		"the token: parser lives in internal/lex/token.go",
-		"token: see the auth docs (docs/auth.md)",
+		"token: ",
+		"the token is read from the environment (internal/agent/env.go)",
 	} {
 		if s, r := Screen([]string{l}); len(s) != 1 {
 			t.Errorf("prose %q was dropped (%v), want kept", l, r)

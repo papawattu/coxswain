@@ -126,11 +126,12 @@ var secretsPatterns = []struct {
 	// the old `\bpassword=` never matched db_password=. A keyword embedded in
 	// a longer name (bypassword=) therefore also matches: fail-safe.
 	// "=" takes any non-empty value. ":" (YAML / kubectl describe form) drops
-	// only when followed by a token-shaped value of 8+ chars
-	// ([A-Za-z0-9+/=_.-]), so "token: abc123xyz" is dropped but prose such as
-	// "the token: parser lives in internal/lex/token.go" stays eligible.
+	// any non-empty value after the colon, whatever its length — owner
+	// decision D78(b), so "password: hunter2" (7 chars) is dropped too. The
+	// accepted cost: prose such as "the token: parser lives in …" is dropped
+	// as well.
 	{"credential-assignment", regexp.MustCompile(
-		`(?i)(?:` + credKeys + `=\s*\S+|` + credKeys + `:\s*[A-Za-z0-9+/=_.-]{8,})`)},
+		`(?i)(?:` + credKeys + `=\s*\S+|` + credKeys + `:\s*\S+)`)},
 	// An HTTP Authorization header echoed into a lesson (Basic base64 is
 	// typically under 64 chars, so long-random-base64 misses it).
 	{"authorization-header", regexp.MustCompile(`(?i)\bauthorization:\s*\S+`)},

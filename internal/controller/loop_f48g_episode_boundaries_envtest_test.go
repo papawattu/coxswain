@@ -391,42 +391,35 @@ var _ = Describe("F48g: the sandbox-failure count belongs to a run", func() {
 		r, _ := b2NewReconcilerWithRecorder()
 		b2EnsureSandbox(ns, name)
 		b1DriveToSucceeded(ctx, r, ns, name)
-		snapName := checkpointName(&cov.Loop{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}}, 0)
-		b2MakeSnapshotReady(ctx, ns, snapName)
-
-		By("the checkpoint's VolumeSnapshot is gone (the A2 'no usable checkpoint' trigger)")
-		absent := &unstructured.Unstructured{Object: map[string]any{
-			"apiVersion": snapshotGV, "kind": volumeSnapshotKind,
-			"metadata": map[string]any{"name": snapName, "namespace": ns},
-		}}
-		Expect(k8sClient.Delete(ctx, absent)).To(Succeed())
-
-		By("losing the workspace PVC, with the pre-loss run's count in place")
+		// Reset the Loop's phase to a non-terminal state (Succeeded is terminal;
+		// the D84a arm's isTerminalPhase guard would refuse to fail a Succeeded
+		// Loop — the real-world case is a Loop that lost its PVC while running).
+		f48gLoop := f48gGet(ns, name)
+		f48gLoop.Status.Phase = cov.LoopPhasePlanning
+		f48gLoop.Status.DesiredPhase = cov.LoopPhasePlanning
+		Expect(k8sClient.Status().Update(ctx, f48gLoop)).To(Succeed())
+		By("the workspace PVC is lost (the A2 'no usable checkpoint' trigger)")
 		pvc, err := b2GetPVC(ctx, ns, name)
 		Expect(err).NotTo(HaveOccurred())
 		pvc.Finalizers = []string{} // envtest runs no pvc-protection controller
 		Expect(k8sClient.Update(ctx, pvc)).To(Succeed())
 		Expect(k8sClient.Delete(ctx, pvc)).To(Succeed())
-		before := f48gGet(ns, name)
-		f48gSeedCount(ns, name, 2, sandboxRunKey(before))
 
 		b2Reconcile(r, ns, name)
 
-		after := f48gGet(ns, name)
-		cond := b2RestoreCondition(after)
+		// D84a (F74, decision (c)): the A2 empty fallback no longer rebuilds the
+		// workspace — the Loop is failed terminally (the Failed condition
+		// carries the cause + the fix). The Restore condition keeps the
+		// NoUsableCheckpoint cause record.
+		failed := f48gGet(ns, name)
+		Expect(failed.Status.Phase).To(Equal(cov.LoopPhaseFailed),
+			"D84a(c): the lost PVC with no usable checkpoint fails the Loop")
+		cond := d84aFailedCondition(failed)
 		Expect(cond).NotTo(BeNil())
-		Expect(cond.Reason).To(Equal(cov.RestoreReasonNoUsableCheckpoint), "the A2 empty fallback fired")
-		rebuilt, err := b2GetPVC(ctx, ns, name)
-		Expect(err).NotTo(HaveOccurred())
-		Expect(rebuilt.Spec.DataSource).To(BeNil(), "the fallback rebuilt the workspace EMPTY (the content is gone)")
-		Expect(after.Status.Iteration).To(Equal(before.Status.Iteration),
-			"the fallback moves neither iteration nor desiredPhase — no run key can see it")
-		Expect(after.Status.DesiredPhase).To(Equal(before.Status.DesiredPhase))
-		Expect(after.Status.Agent).NotTo(BeNil())
-		Expect(after.Status.Agent.InfraAttempts).To(BeZero(),
-			"F48h: an empty rebuild is an episode boundary, so it clears explicitly like the two restores")
-		Expect(after.Status.Agent.InfraSandboxUID).To(BeEmpty())
-		Expect(after.Status.Agent.InfraEpisode).To(BeEmpty())
+		Expect(cond.Reason).To(Equal("WorkspaceLost"))
+		cause := b2RestoreCondition(failed)
+		Expect(cause).NotTo(BeNil())
+		Expect(cause.Reason).To(Equal(cov.RestoreReasonNoUsableCheckpoint))
 	})
 
 	It("S5b: a Budget pause round-trip does not reset the count (Stall resumes through the same branch)", func() {

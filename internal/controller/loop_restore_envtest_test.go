@@ -952,7 +952,7 @@ var _ = Describe("B2 workspace restore, rollback and fork (envtest)", func() {
 	// The sibling message: a LOST PVC with no CRD still takes the A2
 	// PVC-resume fallback (BestEffort carries on, D59), and its message names
 	// the missing CRD rather than claiming the checkpoint does not exist.
-	It("LOST PVC (no VolumeSnapshot CRD): the A2 fallback still runs and names the missing CRD", func() {
+	It("LOST PVC (no VolumeSnapshot CRD): the Loop fails terminally and the missing CRD is named (D84a: the A2 empty fallback is gone)", func() {
 		ns := "b2-lostpvc-nocrd-" + nowSuffix()
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
 		defer func() {
@@ -971,6 +971,16 @@ var _ = Describe("B2 workspace restore, rollback and fork (envtest)", func() {
 		// (the reactive target's last trusted entry).
 		b1DriveToSucceeded(ctx, r, ns, name)
 
+		// Reset the Loop's phase to a non-terminal state (Succeeded is terminal;
+		// the D84a arm's isTerminalPhase guard would refuse to fail a Succeeded
+		// Loop — the real-world case is a Loop that lost its PVC while running,
+		// not after it succeeded).
+		nocdLoop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, nocdLoop)).To(Succeed())
+		nocdLoop.Status.Phase = coxv1alpha1.LoopPhasePlanning
+		nocdLoop.Status.DesiredPhase = coxv1alpha1.LoopPhasePlanning
+		Expect(k8sClient.Status().Update(ctx, nocdLoop)).To(Succeed())
+
 		// LOSE the PVC, and make the cluster one without the VolumeSnapshot
 		// CRD (the seam the B1 no-CRD specs use). The recorded entry is still
 		// the reactive target; the operator cannot read the snapshot at all.
@@ -982,20 +992,32 @@ var _ = Describe("B2 workspace restore, rollback and fork (envtest)", func() {
 
 		b2Reconcile(r, ns, name)
 
-		By("recreating the workspace PVC EMPTY (the A2 fallback — D59 BestEffort carries on)")
-		fallback, err := b2GetPVC(ctx, ns, name)
-		Expect(err).NotTo(HaveOccurred(), "the operator must recreate the LOST PVC (the A2 fallback)")
-		Expect(fallback.Spec.DataSource).To(BeNil(), "the A2 fallback recreates the PVC EMPTY")
-
-		By("naming the missing CRD in the NoUsableCheckpoint message, not a snapshot cause it never checked")
+		// D84a (F74, decision (c)): the A2 empty fallback is gone — the Loop
+		// is failed terminally (WorkspaceLost), and the Restore condition
+		// keeps the NoUsableCheckpoint cause record naming the missing CRD.
+		By("failing the Loop terminally (no empty PVC; the F93a terminal pattern)")
 		gotLoop := &coxv1alpha1.Loop{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, gotLoop)).To(Succeed())
-		cond := b2RestoreCondition(gotLoop)
-		Expect(cond).NotTo(BeNil(), "the A2 fallback is VISIBLE (I90)")
-		Expect(cond.Status).To(Equal(metav1.ConditionFalse))
-		Expect(cond.Reason).To(Equal(coxv1alpha1.RestoreReasonNoUsableCheckpoint))
+		Expect(gotLoop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseFailed),
+			"D84a(c): a lost PVC with no readable checkpoint (CRD absent) fails the Loop")
+		cond := d84aFailedCondition(gotLoop)
+		Expect(cond).NotTo(BeNil())
+		Expect(cond.Reason).To(Equal("WorkspaceLost"))
 		Expect(cond.Message).To(ContainSubstring("VolumeSnapshot CRD"))
-		Expect(cond.Message).NotTo(ContainSubstring("GC'd"))
+
+		By("keeping the Restore condition False reason NoUsableCheckpoint, naming the missing CRD, not a snapshot it never checked")
+		cause := b2RestoreCondition(gotLoop)
+		Expect(cause).NotTo(BeNil(), "the cause record is the Restore condition (persisted at the point of decision)")
+		Expect(cause.Status).To(Equal(metav1.ConditionFalse))
+		Expect(cause.Reason).To(Equal(coxv1alpha1.RestoreReasonNoUsableCheckpoint))
+		Expect(cause.Message).To(ContainSubstring("VolumeSnapshot CRD"))
+		Expect(cause.Message).NotTo(ContainSubstring("GC'd"))
+
+		By("NOT creating an empty PVC for the failed Loop")
+		pvc, gerr := b2GetPVC(ctx, ns, name)
+		Expect(gerr).To(HaveOccurred())
+		Expect(apierrors.IsNotFound(gerr)).To(BeTrue(),
+			"D84a(c): the fallback does not seed the failed Loop with an empty workspace (the F36 fork-reject precedent)")
 	})
 
 	It("ROLLBACK (not-ReadyToUse): a NOT-READY checkpoint (status.readyToUse != true) is DEFERRED (the Restore condition is False reason RestoreSourceNotReady; a WorkspaceRestoreUnavailable Event; no PVC is touched — the in-progress state, no decision, I49)", func() {

@@ -269,8 +269,20 @@ var _ = Describe("P6a: ClusterAgentPolicy (D81(b))", func() {
 			Files:   []string{p6aClusterFiles},
 		})), "status.policy.effectiveHash must include the ClusterAgentPolicy's allows (P6a acceptance)")
 		// PolicyValid=True: a resolvable cluster policy is a valid policy.
-		Expect(conditionTruePresent(&got, policyValidType)).To(BeTrue(),
+		// R46 I208: the True message is kind-neutral — it must not name
+		// "AgentPolicies" alone (since P6a a cluster-only ref can reach this
+		// path, so a namespaced-only message names the wrong kind).
+		var policyValidCond *metav1.Condition
+		for i := range got.Status.Conditions {
+			if got.Status.Conditions[i].Type == policyValidType {
+				policyValidCond = &got.Status.Conditions[i]
+			}
+		}
+		Expect(policyValidCond).NotTo(BeNil(), "the Loop must have a PolicyValid condition")
+		Expect(policyValidCond.Status).To(Equal(metav1.ConditionTrue),
 			"the Loop must be PolicyValid (the cluster policy resolved cleanly)")
+		Expect(policyValidCond.Message).To(Equal("all referenced policies (AgentPolicy / ClusterAgentPolicy) are valid"),
+			"the PolicyValid=True message must be kind-neutral (R46 I208)")
 
 		// Review 5736305575 finding 4: the rendered per-Loop KubeArmorPolicy
 		// (coxswain-<loop>) includes the cluster policy's exec allow (the
@@ -337,6 +349,19 @@ var _ = Describe("P6a: ClusterAgentPolicy (D81(b))", func() {
 		// The hash is NOT the namespaced-only or the cluster-only hash.
 		Expect(got.Status.Policy.EffectiveHash).ToNot(Equal(p6aUnionHash(wantNS)))
 		Expect(got.Status.Policy.EffectiveHash).ToNot(Equal(p6aUnionHash(wantCluster)))
+
+		// R46 I208: the PolicyValid=True message is the same kind-neutral one
+		// (this Loop references BOTH kinds — a namespaced-only message would
+		// be wrong for the cluster ref even when both are present).
+		var policyValidCond *metav1.Condition
+		for i := range got.Status.Conditions {
+			if got.Status.Conditions[i].Type == policyValidType {
+				policyValidCond = &got.Status.Conditions[i]
+			}
+		}
+		Expect(policyValidCond).NotTo(BeNil(), "the Loop must have a PolicyValid condition")
+		Expect(policyValidCond.Message).To(Equal("all referenced policies (AgentPolicy / ClusterAgentPolicy) are valid"),
+			"the PolicyValid=True message must be kind-neutral (R46 I208)")
 
 		// The rendered per-Loop KubeArmorPolicy: the union's exec allows are
 		// ENFORCED (not only hashed) — all three distinct paths are present

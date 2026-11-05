@@ -28,7 +28,21 @@ _(none yet)_
 
 ## Security fixes
 
-_(none yet)_
+### D78(b): a credential key followed by ':' and any value is dropped from lessons — #401
+
+**What was wrong:** the credential-assignment rule only dropped a credential key (`password|passwd|secret|token|api_key`) when followed by `:` and an 8+ character token-shaped value, so short values such as `password: hunter2` were written to memory.
+
+**What changed:** a credential key followed by `:` and any non-space value is now dropped, whatever its length. The accepted cost is that prose such as `the token: parser lives in …` is dropped too.
+
+**On upgrade:** existing lessons are re-screened against the current rules on the first memory write after the upgrade and any that fail are removed (see D73(b)); a short colon credential stored before the upgrade is removed at that point.
+
+### D73(b): the memory writer re-screens existing lessons on every write — #401
+
+**What was wrong:** lessons that failed the current static rules (for example D78(b)'s credential rule or D68's path-or-error rule) could stay on the memory PVC forever: a lesson was only screened when it was proposed.
+
+**What changed:** on every memory write, the writer re-screens the existing `<sha256>.txt` lessons against the CURRENT static rules (all of them, including D68's path-or-error rule) and removes those that fail. Each removal is one audit line in the write summary — `rescreened <sha12> <reason>`, with no lesson content. A re-screen error is non-fatal (logged; the new lessons are still written).
+
+**On upgrade:** the first write after the upgrade removes stored lessons that fail the current rules (e.g. a lesson with no file path or error signature, or a short colon credential). Each removal is listed in that Loop's memory-write summary.
 
 ## Other changes
 

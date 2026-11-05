@@ -144,7 +144,9 @@ Alphabetical; each entry links to where the docs define the term.
 - **Lesson** — A short note the agent proposes (in `result.json`'s
   `lessons[]`) that survives static rules (≤500 chars, references a file
   path or error signature, no secrets, dedup) and the curator's judgment,
-  then gets written to the memory PVC. Dropped lessons show up as
+  then gets written to the memory PVC. Existing lessons are re-screened
+  against the current rules on every write and removed if they fail (D73).
+  Dropped lessons show up as
   `curator-drop` or `static-drop` in `coxswain_memory_lessons_total`.
   See: [ADR-0002,
   Context](adr/0002-llm-curation-rule-gated.md),

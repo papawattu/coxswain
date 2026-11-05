@@ -515,11 +515,10 @@ A sandbox volume the kubelet cannot mount (a `gitCredentialSecret` that does not
 exist, say) now ends at `Failed:SandboxFailed`, with one attempt per recreate up
 to the bound rather than an unbounded recreate loop. That failure is terminal and
 there is no retry command: create or fix the Secret, then **delete and re-apply
-the Loop**. The condition itself stays until the Loop is deleted and
-re-applied. (Since D84b, a completed rollback resets the phase to `Verifying`
-and re-verifies the restored tree — but it does not clear a terminal
-`Failed` condition, so a rollback is still not a retry command here: create
-or fix the Secret, then delete and re-apply the Loop.)
+the Loop**. (Since D84b, a completed rollback (`spec.restoreFrom`) also
+clears the terminal `Failed` condition and re-verifies the restored tree at
+its iteration, but it does not fix the cause: create or fix the Secret
+first. A dedicated retry for `SandboxFailed` is planned in P6d.)
 
 ## Stricter `ref`, `acceptanceChecks` and delivery-branch validation (F68)
 

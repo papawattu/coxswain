@@ -2,6 +2,8 @@ package controller
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -208,5 +210,41 @@ func TestTamperScriptDiffHash(t *testing.T) {
 	dt, bt, vt := f39Repo(t, f39Edit("pkg/x_test.go", "package pkg\n// doctored\n"))
 	if ct, ot := f39Run(t, dt, bt, vt, globs); ct != 1 || hashOf(ot) != "" {
 		t.Errorf("a tampered run must exit 1 with no diffhash: exit=%d %q", ct, ot)
+	}
+}
+
+// D79(b) part 2 step 2: the printed hash is the SHA-256 of the agent diff's
+// CONTENT (base..verified, binary), recomputed here from the two commits. If
+// the script hashed anything else, this independent recomputation would
+// disagree.
+func TestTamperScriptDiffHashIsContentOnly(t *testing.T) {
+	globs := tamper.ExpandPreset(tamper.PresetGo, nil, false)
+	hashOf := func(out string) string {
+		for l := range strings.SplitSeq(out, "\n") {
+			if h, ok := strings.CutPrefix(l, "diffhash: "); ok {
+				return h
+			}
+		}
+		return ""
+	}
+	d1, b1, v1 := f39Repo(t, f39Edit("pkg/x.go", "package pkg\n// work A\n"))
+	c1, o1 := f39Run(t, d1, b1, v1, globs)
+	if c1 != 0 {
+		t.Fatalf("clean run must exit 0: %d\n%s", c1, o1)
+	}
+	h1 := hashOf(o1)
+	if len(h1) != 64 {
+		t.Fatalf("no 64-hex diffhash line in %q", o1)
+	}
+	var sb bytes.Buffer
+	cmd := exec.Command("git", "-C", d1, "diff", "--no-ext-diff", "--no-color", "--binary", b1, v1)
+	cmd.Stdout = &sb
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("recomputing the agent diff: %v", err)
+	}
+	sum := sha256.Sum256(sb.Bytes())
+	want := hex.EncodeToString(sum[:])
+	if h1 != want {
+		t.Errorf("the printed hash %s is not the sha256 of the diff's content %s", h1, want)
 	}
 }

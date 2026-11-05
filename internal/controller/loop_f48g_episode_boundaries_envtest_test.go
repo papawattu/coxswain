@@ -398,6 +398,14 @@ var _ = Describe("F48g: the sandbox-failure count belongs to a run", func() {
 		f48gLoop.Status.Phase = cov.LoopPhasePlanning
 		f48gLoop.Status.DesiredPhase = cov.LoopPhasePlanning
 		Expect(k8sClient.Status().Update(ctx, f48gLoop)).To(Succeed())
+		// D84a (F74): delete the checkpoint snapshot so the D84a arm is
+		// entered (a lost PVC with a USABLE checkpoint restores, not fails).
+		snapName := checkpointName(&cov.Loop{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}}, 0)
+		absent := &unstructured.Unstructured{Object: map[string]any{
+			"apiVersion": snapshotGV, "kind": volumeSnapshotKind,
+			"metadata": map[string]any{"name": snapName, "namespace": ns},
+		}}
+		Expect(k8sClient.Delete(ctx, absent)).To(Succeed())
 		By("the workspace PVC is lost (the A2 'no usable checkpoint' trigger)")
 		pvc, err := b2GetPVC(ctx, ns, name)
 		Expect(err).NotTo(HaveOccurred())

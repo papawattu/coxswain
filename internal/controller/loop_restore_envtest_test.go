@@ -444,6 +444,12 @@ var _ = Describe("B2 workspace restore, rollback and fork (envtest)", func() {
 		loop := &coxv1alpha1.Loop{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
 		loop.Status.Checkpoints = mk(loop.Status.Checkpoints[0])
+		// D84a (F74): reset the Loop's phase to a non-terminal state (Succeeded
+		// is terminal; the D84a arm's isTerminalPhase guard would refuse to
+		// fail a Succeeded Loop — the real-world case is a Loop that lost its
+		// PVC while running).
+		loop.Status.Phase = coxv1alpha1.LoopPhasePlanning
+		loop.Status.DesiredPhase = coxv1alpha1.LoopPhasePlanning
 		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
 		pvc, err := b2GetPVC(ctx, ns, name)
 		Expect(err).NotTo(HaveOccurred())
@@ -472,7 +478,7 @@ var _ = Describe("B2 workspace restore, rollback and fork (envtest)", func() {
 		Expect(cond.Reason).To(Equal(coxv1alpha1.RestoreReasonRestored), "a forged iteration must not divert the readiness gate")
 	})
 
-	It("F47 RESTORE: a status list with NO trusted entry takes the visible NoUsableCheckpoint fallback (condition + Event), not a silent empty workspace", func() {
+	It("F47 RESTORE: a status list with NO trusted entry fails the Loop terminally (D84a: the F74 decision — the Loop is failed with a WorkspaceLost condition; the Restore condition keeps NoUsableCheckpoint as the cause record; a Warning Event is emitted — I90: the failure is VISIBLE)", func() {
 		const name = "f47-alluntrusted"
 		r, rec, ns, _ := f47Lost(name, func(coxv1alpha1.CheckpointStatus) []coxv1alpha1.CheckpointStatus {
 			return []coxv1alpha1.CheckpointStatus{{Iteration: 3, Name: "checkpoint-victim-iter-3", At: metav1.Now()}}
@@ -481,13 +487,17 @@ var _ = Describe("B2 workspace restore, rollback and fork (envtest)", func() {
 		loop := &coxv1alpha1.Loop{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
 		cond := b2RestoreCondition(loop)
-		Expect(cond).NotTo(BeNil(), "the fallback must be surfaced (I90), not silent")
+		Expect(cond).NotTo(BeNil(), "the failure must be surfaced (I90), not silent")
 		Expect(cond.Reason).To(Equal(coxv1alpha1.RestoreReasonNoUsableCheckpoint))
 		Expect(cond.Message).To(ContainSubstring("none of the status.checkpoints entries"))
 		b2ExpectEvent(rec, coxv1alpha1.RestoreReasonNoUsableCheckpoint)
-		pvc, err := b2GetPVC(ctx, ns, name)
-		Expect(err).NotTo(HaveOccurred(), "the A2 fallback still recreates the PVC (empty)")
-		Expect(pvc.Spec.DataSource).To(BeNil())
+		// D84a (F74): the Loop is failed terminally (the A2 fallback no longer
+		// recreates the PVC empty).
+		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseFailed),
+			"D84a: a lost PVC with no trusted checkpoint fails the Loop")
+		failedCond := d84aFailedCondition(loop)
+		Expect(failedCond).NotTo(BeNil(), "the terminal failure is recorded as a Failed condition")
+		Expect(failedCond.Reason).To(Equal("WorkspaceLost"))
 	})
 
 	It("RESTORE (reactive, not-ready): a LOST workspace PVC whose latest checkpoint is NOT ReadyToUse is DEFERRED (the Restore condition is False reason RestoreSourceNotReady; the PVC is NOT recreated from the checkpoint — the in-progress state, no decision, I49)", func() {
@@ -539,7 +549,7 @@ var _ = Describe("B2 workspace restore, rollback and fork (envtest)", func() {
 		b2ExpectEvent(rec, coxv1alpha1.RestoreReasonSourceNotReady)
 	})
 
-	It("RESTORE (A2 fallback): a LOST workspace PVC with NO usable checkpoint (the latest checkpoint's VolumeSnapshot is ABSENT) falls back to the A2 PVC-resume (the PVC is recreated EMPTY; the Restore condition is False reason NoUsableCheckpoint; a WorkspaceRestoreUnavailable Event is emitted — I90: the fallback is VISIBLE)", func() {
+	It("RESTORE (A2 fallback): a LOST workspace PVC with NO usable checkpoint (the latest checkpoint's VolumeSnapshot is ABSENT) fails the Loop terminally (D84a: the F74 decision — the Loop is failed with a WorkspaceLost condition; the Restore condition keeps NoUsableCheckpoint as the cause record; a Warning Event is emitted — I90: the failure is VISIBLE)", func() {
 		ns := "b2-fallback-" + nowSuffix()
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
 		defer func() {
@@ -567,6 +577,16 @@ var _ = Describe("B2 workspace restore, rollback and fork (envtest)", func() {
 		}
 		Expect(k8sClient.Delete(ctx, absentSnap)).To(Succeed())
 
+		// D84a (F74): reset the Loop's phase to a non-terminal state (Succeeded
+		// is terminal; the D84a arm's isTerminalPhase guard would refuse to fail
+		// a Succeeded Loop — the real-world case is a Loop that lost its PVC
+		// while running).
+		loop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop)).To(Succeed())
+		loop.Status.Phase = coxv1alpha1.LoopPhasePlanning
+		loop.Status.DesiredPhase = coxv1alpha1.LoopPhasePlanning
+		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
+
 		// LOSE the PVC (the finalizer must be removed first — the A2 idiom).
 		pvc, err := b2GetPVC(ctx, ns, name)
 		Expect(err).NotTo(HaveOccurred(), "the workspace PVC must exist after the bootstrap")
@@ -575,25 +595,35 @@ var _ = Describe("B2 workspace restore, rollback and fork (envtest)", func() {
 		Expect(k8sClient.Delete(ctx, pvc)).To(Succeed())
 
 		// Reconcile: the operator detects the LOST PVC + the ABSENT
-		// checkpoint and falls back to the A2 PVC-resume (recreate the PVC
-		// EMPTY). The decision is persisted at the point of decision (I90).
+		// checkpoint and FAILS the Loop terminally (D84a: the F74 decision —
+		// the A2 fallback no longer recreates the PVC empty).
 		b2Reconcile(r, ns, name)
 
-		By("recreating the workspace PVC EMPTY (the A2 fallback — the PVC has NO dataSource)")
-		fallback, err := b2GetPVC(ctx, ns, name)
-		Expect(err).NotTo(HaveOccurred(), "the operator must recreate the LOST PVC (the A2 fallback)")
-		Expect(fallback.Spec.DataSource).To(BeNil(), "the A2 fallback recreates the PVC EMPTY (no dataSource — the content is lost, the Loop continues from the untouched base)")
+		By("failing the Loop terminally (D84a: the F74 decision)")
+		failedLoop := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, failedLoop)).To(Succeed())
+		Expect(failedLoop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseFailed))
+		failedCond := d84aFailedCondition(failedLoop)
+		Expect(failedCond).NotTo(BeNil(), "the terminal failure is recorded as a Failed condition")
+		Expect(failedCond.Reason).To(Equal("WorkspaceLost"))
 
-		By("setting the Restore condition False reason NoUsableCheckpoint (the I90 fallback is VISIBLE, persisted at the point of decision)")
-		fallbackLoop := &coxv1alpha1.Loop{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, fallbackLoop)).To(Succeed())
-		cond := b2RestoreCondition(fallbackLoop)
-		Expect(cond).NotTo(BeNil(), "the operator must set the Restore condition (the I90 fallback is VISIBLE)")
-		Expect(cond.Status).To(Equal(metav1.ConditionFalse))
-		Expect(cond.Reason).To(Equal(coxv1alpha1.RestoreReasonNoUsableCheckpoint))
+		By("keeping the Restore condition False reason NoUsableCheckpoint as the cause record")
+		cause := b2RestoreCondition(failedLoop)
+		Expect(cause).NotTo(BeNil(), "the cause record is the Restore condition")
+		Expect(cause.Status).To(Equal(metav1.ConditionFalse))
+		Expect(cause.Reason).To(Equal(coxv1alpha1.RestoreReasonNoUsableCheckpoint))
 
 		By("emitting a NoUsableCheckpoint Event")
 		b2ExpectEvent(rec, coxv1alpha1.RestoreReasonNoUsableCheckpoint)
+
+		By("NOT recreating the workspace PVC (D84a: no empty PVC for a failed Loop)")
+		pvcAfter, err := b2GetPVC(ctx, ns, name)
+		if err == nil {
+			// The PVC may be in Terminating state (the delete is async); assert
+			// it is NOT a fresh empty PVC (no dataSource, bound to a PV).
+			Expect(pvcAfter.Spec.DataSource).NotTo(BeNil(),
+				"D84a: the A2 fallback no longer recreates the PVC empty")
+		}
 	})
 
 	It("ROLLBACK (ready, level-based): a ready checkpoint (spec.restoreFrom: iter-N) is restored through the level-based sequence — the sandbox is STOPPED first (StoppingSandbox), then the PVC is DELETED (DeletingPVC), then the PVC is RECREATED from the snapshot (Restored) — one reconcile per step, the in-progress states are VISIBLE", func() {

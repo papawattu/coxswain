@@ -71,22 +71,12 @@ func testPatternSpec(t *testing.T, patternName, matchingSample, proseLesson stri
 		)
 	}
 
-	// The prose lesson survives the secrets scan. It carries no D68 file-path
-	// anchor, so Screen (which also runs the orthogonal no-path-or-error
-	// rule) drops it as no-path-or-error; testPatternSpec asserts the secrets
-	// outcome only — a "secret: ..." drop would be the pattern false
-	// positive, and any other reason means the pattern did not trip.
-	_, reasons = Screen([]string{proseLesson})
-	if len(reasons) != 1 {
+	// The prose lesson survives (no rule trips).
+	survivors, reasons2 := Screen([]string{proseLesson})
+	if len(survivors) != 1 {
 		t.Fatalf(
-			"pattern %s: prose lesson %q: reasons=%v, want exactly one reason",
-			patternName, proseLesson, reasons,
-		)
-	}
-	if strings.HasPrefix(reasons[0], "secret:") {
-		t.Fatalf(
-			"pattern %s: prose lesson %q was dropped by secrets rule %q, want kept from the pattern scan",
-			patternName, proseLesson, reasons[0],
+			"pattern %s: prose lesson %q: survivors=%v, want it kept (reasons=%v)",
+			patternName, proseLesson, survivors, reasons2,
 		)
 	}
 }
@@ -452,12 +442,6 @@ func TestD68NoPathOrErrorDropped(t *testing.T) {
 	if len(survivors) != 1 {
 		t.Fatalf("D68: a lesson with a path was dropped: reasons=%v", reasons)
 	}
-	// D78(b): the kept lesson example in TestCredentialAssignmentColonForm
-	// ("the token is read from the environment") also names a file path.
-	survivors, reasons = Screen([]string{"the token is read from the environment (internal/agent/env.go)"})
-	if len(survivors) != 1 {
-		t.Fatalf("D68: a lesson with a path was dropped: reasons=%v", reasons)
-	}
 }
 
 // F18: the credential-assignment rule is case-insensitive and has no leading
@@ -484,7 +468,7 @@ func TestPatternSpecCredentialAssignmentCaseAndPrefix(t *testing.T) {
 func TestCredentialAssignmentColonForm(t *testing.T) {
 	testPatternSpec(t, "credential-assignment",
 		"the secret yaml has token: "+"abc123xyz"+" in deploy/secret.yaml",
-		"the token is read from the environment")
+		"the token is read from the environment (internal/agent/env.go)")
 	for _, l := range []string{
 		"password: " + "hunter2" + " in config/dev/env",
 		"token: " + "x",

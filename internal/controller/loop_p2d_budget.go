@@ -163,6 +163,7 @@ func (r *LoopReconciler) applyBudget(ctx context.Context, loop *coxv1alpha1.Loop
 	// terminal Loops re-reconciled on any trigger (I96) would keep growing
 	// activeSeconds without bound. Stopping the clock in terminal phases is
 	// the same treatment as Paused.
+	// D79(b): AwaitingApproval adds nothing but keeps the stamp fresh.
 	var added int64
 	var stamp *metav1.Time
 	// P5f: a Loop held for delivery (Verifying+Delivering) already passed
@@ -170,7 +171,10 @@ func (r *LoopReconciler) applyBudget(ctx context.Context, loop *coxv1alpha1.Loop
 	// decision may fail it (it would lose the delivery result).
 	if !loopPaused(loop) && !isTerminalPhase(loop.Status.Phase) && !loopHoldingForDelivery(loop) {
 		b := loop.Status.Budget
-		if b != nil && b.LastActiveStamp != nil {
+		// D79(b): a Loop waiting at AwaitingApproval does not use up its wall
+		// clock. Nothing is added, but the stamp below is still refreshed, so
+		// the wait is never counted after the approval either.
+		if b != nil && b.LastActiveStamp != nil && loop.Status.Phase != coxv1alpha1.LoopPhaseAwaitingApproval {
 			added = max(0, int64(now.Sub(b.LastActiveStamp.Time).Seconds()))
 		}
 		// Set/refresh the stamp on every non-paused, non-terminal reconcile.

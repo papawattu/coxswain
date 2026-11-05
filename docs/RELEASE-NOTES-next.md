@@ -46,6 +46,14 @@ _(none yet)_
 
 ## Other changes
 
+### D79(b) part 1: the wall clock pauses while a Loop waits at AwaitingApproval — #402
+
+**What was wrong:** a Manual-mode Loop waiting for `cox approve` at `AwaitingApproval` kept using up its `spec.budget.maxWallClock`, so a slow approver could exhaust the budget before any work ran.
+
+**What changed:** `applyBudget` adds no active time while the phase is `AwaitingApproval`, and keeps `status.budget.lastActiveStamp` fresh so the wait is not counted after the approval either (the same stop-the-clock treatment as Paused). Owner decision D79(b). The no-real-diff stall rule (D79(b) part 2) follows in its own PR.
+
+**On upgrade:** no action. A Loop already at `AwaitingApproval` stops accumulating on the first reconcile after the upgrade.
+
 ### D84a (F74): a lost workspace PVC with no usable checkpoint fails the Loop — #399
 
 **What was wrong:** When the workspace PVC was lost and no usable checkpoint

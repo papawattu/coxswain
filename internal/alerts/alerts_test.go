@@ -64,6 +64,9 @@ func TestParseLineKubeArmor(t *testing.T) {
 	if !al.Time.Equal(wantTime) {
 		t.Errorf("time = %s, want the line's own UpdatedTime %s", al.Time, wantTime)
 	}
+	if !strings.HasPrefix(al.Detail, "operation=Process") {
+		t.Errorf("detail = %q, want it to start with the operation (P6b-2: suggest tells exec from file by it)", al.Detail)
+	}
 	if !strings.Contains(al.Detail, "policy=coxswain-agent") {
 		t.Errorf("detail = %q, want the policy name for correlation", al.Detail)
 	}

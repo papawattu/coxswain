@@ -895,8 +895,36 @@ spec:
     - /usr/local/go/bin/go
 ```
 
-`cox policy suggest` — turning the recorded audit stream into a candidate
-policy — comes in a follow-up slice (P6b-2).
+**Getting a starting policy.** Run the Loop in learn mode (every policy it
+references `auditOnly: true`) for a while, then build a candidate from what
+the agent actually used:
+
+```bash
+kubectl logs -n coxswain-system deploy/coxswain-controller-manager \
+  | kubectl cox policy suggest <loop> -f -
+```
+
+The command reads the operator's Q4 audit lines (pipe them on stdin, or pass
+a file with `-f <file>`; lines that are not audit records, and other Loops'
+records, are skipped). `--name` defaults to `<loop>-suggested`; the namespace
+is the CLI's `--namespace`. It prints a candidate `AgentPolicy`. Review it,
+apply it as a **new** policy still in learn mode to confirm it covers what
+the agent needs, then drop `auditOnly` to enforce.
+
+What the candidate holds is only the allows the agent **used** —
+deduplicated and sorted — and it never contains a deny:
+
+- KubeArmor process records with an absolute path become `exec`;
+- KubeArmor file records become `files`;
+- egress-proxy connects (`host:port`) become `network`;
+- KubeArmor network records are skipped, because the egress proxy's record
+carries the `host:port` an `AgentPolicy` needs.
+
+The candidate has no `auditOnly`: it is meant to enforce once reviewed. A
+header comment on the candidate lists the platform minimum the operator adds
+itself (the model-proxy and egress-proxy Service FQDNs, DNS, the agent
+entrypoint), which is **not** written as allows (D109). Audit records carry
+KubeArmor's operation first in `detail` (`operation=Process|File|Network`).
 
 ### What the sandbox cannot reach
 

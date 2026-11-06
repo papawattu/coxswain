@@ -1217,6 +1217,15 @@ spec:
                   canonical effective allows, so the decision audit shows what the agent was
                   allowed to do (D32); it is set by the operator, never the agent. +optional
                 properties:
+                  auditOnlyIgnored:
+                    description: |-
+                      auditOnlyIgnored names the auditOnly policies whose flag had no effect
+                      because an enforcing policy is also referenced (P6b, D108: the Loop
+                      enforces the union of the allows). Empty when learn mode applies or no
+                      policy is auditOnly.
+                    items:
+                      type: string
+                    type: array
                   blockedCount:
                     description: |-
                       blockedCount is the number of actions the engine has blocked for this Loop

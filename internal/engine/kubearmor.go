@@ -30,6 +30,20 @@ const (
 // I42f proxy policies.
 const kaptActionValue = "Block"
 
+// kaptAuditActionValue is the P6b learn-mode posture: KubeArmor records and
+// never blocks. Used only for the pod-level agent policy, and only when every
+// policy the Loop references is auditOnly (D108).
+const kaptAuditActionValue = "Audit"
+
+// kaptAction is the pod-level agent policy's spec.action: Audit in learn mode,
+// Block otherwise (never Audit by default).
+func kaptAction(ep policy.EnginePolicy) string {
+	if ep.AuditOnly {
+		return kaptAuditActionValue
+	}
+	return kaptActionValue
+}
+
 // KubeArmorPolicy spec-level keys. The policy is emitted as a fully-shaped
 // unstructured object (the API server's structural validation requires the
 // real shape), and the three emitters (the C6b agent policy and the I42f
@@ -143,7 +157,7 @@ func emitKubeArmorPolicy(loopName, namespace string, ep policy.EnginePolicy) *un
 		// Default-deny posture: KubeArmor's spec.action defaults to Audit (log
 		// only, nothing blocked). Set it to Block so disallows are enforced; the
 		// per-rule action: Allow is the carve-out.
-		kaptActionKey: kaptActionValue,
+		kaptActionKey: kaptAction(ep),
 		KaptSelectorKey: map[string]any{
 			KaptMatchLabelsKey: map[string]any{"coxswain.io/loop": loopName},
 		},

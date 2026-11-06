@@ -98,6 +98,9 @@ type ContainerPolicy struct {
 type EnginePolicy struct {
 	// Containers is the per-container policy for the sandbox pod.
 	Containers []ContainerPolicy `json:"containers"`
+	// AuditOnly renders the pod-level agent policy with spec.action Audit
+	// (P6b learn mode). False = Block (default-deny); never defaulted true.
+	AuditOnly bool `json:"auditOnly,omitempty"`
 }
 
 // EffectivePolicy is a Loop's effective allows: the union of the allows across
@@ -117,6 +120,14 @@ type EffectivePolicy struct {
 	// as the other allows). The enforcer emits one KubeArmorPolicy per tool
 	// and adds the tool proxy Service FQDNs to the agent's DNS allowlist.
 	Tools []v1alpha1.ToolSpec
+	// AuditOnly is P6b learn mode (D108): true only when the Loop references at
+	// least one policy and EVERY referenced policy is auditOnly
+	// (CombineAuditOnly). The agent's KubeArmorPolicy then renders with
+	// spec.action Audit (record, never block).
+	AuditOnly bool
+	// AuditOnlyIgnored names the auditOnly policies whose flag had no effect
+	// because an enforcing policy is also referenced (D108).
+	AuditOnlyIgnored []string
 }
 
 // Translate turns a Loop's effective allows into the engine policy (C6a). It is
@@ -156,6 +167,7 @@ func Translate(p EffectivePolicy, proxyFQDN, egressProxyFQDN string) EnginePolic
 	proxyAllows := []Allow{{Type: AllowNetwork, Match: modelEndpoint}}
 
 	return EnginePolicy{
+		AuditOnly: p.AuditOnly,
 		Containers: []ContainerPolicy{
 			{Container: ContainerAgent, Default: Deny, Allows: agentAllows},
 			{Container: ContainerProxy, Default: Deny, Allows: proxyAllows},
@@ -241,4 +253,28 @@ func ProxyComponentSelector() labels.Selector {
 	r, _ := labels.NewRequirement(ComponentLabelKey, selection.In,
 		[]string{ComponentProxyLabel, ComponentEgressProxyLabel, ComponentToolProxyLabel})
 	return labels.NewSelector().Add(*r)
+}
+
+// CombineAuditOnly is D108 (P6b learn mode): a Loop is audit-only only when it
+// references at least one policy and EVERY referenced policy is auditOnly. When
+// an enforcing policy is also referenced, the auditOnly flags have no effect;
+// ignored returns the names of the auditOnly policies that were ignored, in
+// order. names is parallel to auditOnly (the Loop's spec.policyRefs order).
+func CombineAuditOnly(names []string, auditOnly []bool) (bool, []string) {
+	if len(auditOnly) == 0 {
+		return false, nil
+	}
+	all := true
+	var flagged []string
+	for i, a := range auditOnly {
+		if a {
+			flagged = append(flagged, names[i])
+		} else {
+			all = false
+		}
+	}
+	if all {
+		return true, nil
+	}
+	return false, flagged
 }

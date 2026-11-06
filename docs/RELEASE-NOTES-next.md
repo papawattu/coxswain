@@ -24,7 +24,31 @@ again.
 
 ## New features
 
-_(none yet)_
+### P6b: learn mode — auditOnly policies — #405
+
+**What it is:** `spec.auditOnly: true` on an `AgentPolicy` or a
+`ClusterAgentPolicy` (the same spec) is learn mode; the field is never
+defaulted. Learn mode applies only when **every** policy the Loop references
+is `auditOnly`: the Loop's pod-level KubeArmorPolicy for the agent renders
+with `spec.action: Audit` (KubeArmor records, never blocks), the model and
+egress proxies' policies stay `Block`, the Loop shows `PolicyEnforced=False`
+with reason `AuditOnly`, and the D30 gate is unchanged — a learn-mode Loop
+still needs a working engine (KubeArmor installed and the node enforcing),
+otherwise the usual hold applies (e.g. `NodeNotEnforcing`). If an enforcing
+policy is also referenced, the Loop enforces the union of every policy's
+allows (`spec.action: Block`); the `auditOnly` flags have no effect,
+`status.policy.auditOnlyIgnored` lists the ignored policies, and one
+`AuditOnlyIgnored` Warning Event fires each time that list changes.
+
+**How to use it:** set `auditOnly: true` on every policy a Loop references
+(via `spec.policyRefs`), watch the recorded activity (the KubeArmor audit
+stream) while the Loop runs, then remove `auditOnly` — or reference an
+enforcing policy — to turn the learning into enforcement. `cox policy
+suggest` (turning the recorded audit stream into a candidate policy) comes in
+a follow-up slice (P6b-2).
+
+**On upgrade:** no change for existing policies. The field is new and unset
+means enforcing, as before.
 
 ## Security fixes
 

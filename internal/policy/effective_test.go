@@ -18,6 +18,7 @@
 package policy
 
 import (
+	"slices"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -164,5 +165,42 @@ func TestTranslateEgressProxyFQDNInAgentDNSAllowlist(t *testing.T) {
 	noAllows := Translate(EffectivePolicy{}, "l1-proxy.ns.svc", "")
 	if n := agentAllows(noAllows)["l1-egress-proxy.ns.svc"]; n != 0 {
 		t.Errorf("with no network allows the egress proxy FQDN must not appear in the agent allows, got %d", n)
+	}
+}
+
+// P6b/D108: learn mode only when every ref is auditOnly; a mixed Loop
+// enforces and names the ignored auditOnly policies.
+func TestCombineAuditOnly(t *testing.T) {
+	cases := []struct {
+		name        string
+		names       []string
+		audit       []bool
+		wantAudit   bool
+		wantIgnored []string
+	}{
+		{"no refs: not audit", nil, nil, false, nil},
+		{"one enforcing", []string{"a"}, []bool{false}, false, nil},
+		{"one auditOnly: audit", []string{"a"}, []bool{true}, true, nil},
+		{"all auditOnly: audit", []string{"a", "b"}, []bool{true, true}, true, nil},
+		{"mixed: enforce, b ignored", []string{"a", "b"}, []bool{false, true}, false, []string{"b"}},
+		{"mixed, order kept", []string{"x", "y", "z"}, []bool{true, false, true}, false, []string{"x", "z"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a, ig := CombineAuditOnly(tc.names, tc.audit)
+			if a != tc.wantAudit || !slices.Equal(ig, tc.wantIgnored) {
+				t.Fatalf("got (%v, %v), want (%v, %v)", a, ig, tc.wantAudit, tc.wantIgnored)
+			}
+		})
+	}
+}
+
+// P6b: Translate carries AuditOnly to the engine policy; unset stays false.
+func TestTranslateCarriesAuditOnly(t *testing.T) {
+	if Translate(EffectivePolicy{AuditOnly: true}, "p.ns.svc", "").AuditOnly != true {
+		t.Fatal("AuditOnly must reach the EnginePolicy")
+	}
+	if Translate(EffectivePolicy{}, "p.ns.svc", "").AuditOnly {
+		t.Fatal("AuditOnly must never default to true")
 	}
 }

@@ -194,3 +194,13 @@ func TestCombineAuditOnly(t *testing.T) {
 		})
 	}
 }
+
+// P6b: Translate carries AuditOnly to the engine policy; unset stays false.
+func TestTranslateCarriesAuditOnly(t *testing.T) {
+	if Translate(EffectivePolicy{AuditOnly: true}, "p.ns.svc", "").AuditOnly != true {
+		t.Fatal("AuditOnly must reach the EnginePolicy")
+	}
+	if Translate(EffectivePolicy{}, "p.ns.svc", "").AuditOnly {
+		t.Fatal("AuditOnly must never default to true")
+	}
+}

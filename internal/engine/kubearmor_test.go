@@ -90,6 +90,17 @@ func TestEmitKubeArmorPolicyTopLevelActionIsBlock(t *testing.T) {
 	}
 }
 
+// P6b: learn mode renders the agent policy with spec.action Audit.
+func TestEmitKubeArmorPolicyAuditOnlyIsAudit(t *testing.T) {
+	obj := EmitKubeArmorPolicy("l1", "ns", policy.Translate(policy.EffectivePolicy{
+		Exec: []string{"go"}, AuditOnly: true,
+	}, "l1-proxy.ns.svc", ""))
+	spec := obj.Object["spec"].(map[string]any)
+	if spec["action"] != kaptAuditActionValue {
+		t.Fatalf("an auditOnly Loop must render spec.action Audit, got %v", spec["action"])
+	}
+}
+
 func TestEmitKubeArmorPolicyExecUsesProcessMatchPaths(t *testing.T) {
 	obj := EmitKubeArmorPolicy("loop-x", "ns-x", epForTest())
 	spec := obj.Object["spec"].(map[string]any)

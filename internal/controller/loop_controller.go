@@ -1749,6 +1749,16 @@ func (r *LoopReconciler) effectivePolicy(ctx context.Context, loop *coxv1alpha1.
 		union.Files = append(union.Files, pol.Files...)
 		union.Tools = append(union.Tools, pol.Tools...)
 	}
+	// P6b/D108: learn mode only when every referenced policy is auditOnly.
+	flags := make([]bool, len(res.specs))
+	for i := range res.specs {
+		flags[i] = res.specs[i].AuditOnly
+	}
+	names := loop.Spec.PolicyRefs
+	if len(names) > len(flags) {
+		names = names[:len(flags)]
+	}
+	union.AuditOnly, union.AuditOnlyIgnored = policy.CombineAuditOnly(names, flags)
 	union.Tools = dedupToolsBySpec(union.Tools)
 	return union, nil
 }

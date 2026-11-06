@@ -16,6 +16,7 @@ see `docs/QUICKSTART.md`.
 - [Uninstall](#uninstall)
 - [What the sandbox can and cannot reach](#what-the-sandbox-can-and-cannot-reach)
   - [ClusterAgentPolicy (P6a)](#clusteragentpolicy-p6a)
+  - [Learn mode: auditOnly policies (P6b)](#learn-mode-auditonly-policies-p6b)
   - [How the network probe measures enforcement (D103)](#how-the-network-probe-measures-enforcement-d103)
 - [Reading the egress proxy log](#reading-the-egress-proxy-log)
 - [Pinning Loops to a node pool (C2)](#pinning-loops-to-a-node-pool-c2)
@@ -558,6 +559,7 @@ field is the most useful diagnostic:
   per-target table: run `make verify-cni`.
 - `PolicyEnforced=False` → the KubeArmor policy gate is not enforced. Check
   that KubeArmor is installed and the BPF-LSM hooks are active.
+- `PolicyEnforced=False` reason `AuditOnly` → learn mode (P6b): every policy the Loop references has `spec.auditOnly: true`, so KubeArmor records the agent's activity but blocks nothing. Remove `auditOnly` (or reference an enforcing policy) to enforce.
 
 ### 2. Read the verify Job log
 
@@ -860,6 +862,41 @@ the namespaced policy wins.
 it **watches** the kind: an edit to a `ClusterAgentPolicy` re-reconciles every
 Loop in every namespace that names it, including a narrowing edit (the
 watch's map, `clusterAgentPolicyToLoopRequests`, lists all namespaces).
+
+### Learn mode: auditOnly policies (P6b)
+
+`spec.auditOnly: true` on an `AgentPolicy` or a `ClusterAgentPolicy` (the
+same spec) is learn mode. The field is never defaulted: an unset or `false`
+policy enforces, as before.
+
+Learn mode applies only when **every** policy the Loop references is
+`auditOnly`. Then the Loop's pod-level KubeArmorPolicy for the agent renders
+with `spec.action: Audit` — KubeArmor records the agent's activity but never
+blocks. The model and egress proxies' policies stay `Block`. The Loop shows
+`PolicyEnforced=False` with reason `AuditOnly`. The D30 gate is unchanged: a
+learn-mode Loop still needs a working engine (KubeArmor installed and the node
+enforcing), otherwise the usual hold applies (e.g. `NodeNotEnforcing`).
+
+**Mixed Loops (D108).** If an enforcing policy is also referenced, the Loop
+enforces the union of every policy's allows (`spec.action: Block`); the
+`auditOnly` flags have no effect, `status.policy.auditOnlyIgnored` lists the
+ignored policies, and one `AuditOnlyIgnored` Warning Event fires each time
+that list changes.
+
+```yaml
+apiVersion: coxswain.wattu.com/v1alpha1
+kind: AgentPolicy
+metadata:
+  name: learn-go
+  namespace: default
+spec:
+  auditOnly: true
+  exec:
+    - /usr/local/go/bin/go
+```
+
+`cox policy suggest` — turning the recorded audit stream into a candidate
+policy — comes in a follow-up slice (P6b-2).
 
 ### What the sandbox cannot reach
 

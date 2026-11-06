@@ -257,12 +257,20 @@ func parseKubeArmor(raw map[string]json.RawMessage) (Alert, bool) {
 		Source:    SourceKubeArmor,
 	}
 	al.Target = firstNonEmpty(str(raw, "Resource"), str(raw, "Source"), str(raw, "Operation"))
+	// P6b-2: the operation (Process/File/Network) is kept first in the detail,
+	// so `cox policy suggest` can tell an exec path from a file path (the
+	// record's action carries KubeArmor's Action, e.g. Block or Audit).
+	var parts []string
+	if op := str(raw, "Operation"); op != "" {
+		parts = append(parts, "operation="+op)
+	}
 	if policy := str(raw, "PolicyName"); policy != "" {
-		al.Detail = "policy=" + policy
+		parts = append(parts, "policy="+policy)
 	}
 	if data := str(raw, "Data"); data != "" {
-		al.Detail = strings.TrimPrefix(al.Detail+", data="+data, ", ")
+		parts = append(parts, "data="+data)
 	}
+	al.Detail = strings.Join(parts, ", ")
 	return al, true
 }
 

@@ -43,12 +43,37 @@ allows (`spec.action: Block`); the `auditOnly` flags have no effect,
 **How to use it:** set `auditOnly: true` on every policy a Loop references
 (via `spec.policyRefs`), watch the recorded activity (the KubeArmor audit
 stream) while the Loop runs, then remove `auditOnly` — or reference an
-enforcing policy — to turn the learning into enforcement. `cox policy
-suggest` (turning the recorded audit stream into a candidate policy) comes in
-a follow-up slice (P6b-2).
+enforcing policy — to turn the learning into enforcement.
 
 **On upgrade:** no change for existing policies. The field is new and unset
 means enforcing, as before.
+
+### P6b-2: cox policy suggest — #406
+
+**What it is:** `kubectl cox policy suggest <loop> -f <file|->` reads the
+operator's Q4 audit lines (e.g. `kubectl logs -n coxswain-system
+deploy/coxswain-controller-manager | kubectl cox policy suggest <loop> -f -`)
+and prints a candidate `AgentPolicy` built from what the agent actually used
+in learn mode. `--name` defaults to `<loop>-suggested`; the namespace is the
+CLI's `--namespace`. Lines that are not audit records, and other Loops'
+records, are skipped.
+
+**How to use it:** run the Loop in learn mode, capture the audit lines, pipe
+them to `cox policy suggest`, review the printed candidate, apply it (still in
+learn mode to confirm), then drop `auditOnly` to enforce. The candidate holds
+only the allows the agent used — deduplicated and sorted — and never a deny:
+KubeArmor process records with an absolute path become `exec`, KubeArmor file
+records become `files`, egress-proxy connects (`host:port`) become `network`,
+and KubeArmor network records are skipped (the egress proxy's record carries
+the `host:port` an `AgentPolicy` needs). The candidate has no `auditOnly`; a
+header comment lists the platform minimum the operator adds itself (the
+model-proxy and egress-proxy Service FQDNs, DNS, the agent entrypoint), which
+is not written as allows (D109).
+
+**On upgrade:** the audit record `detail` for KubeArmor lines now starts with
+`operation=…` (`operation=Process|File|Network` first, before the rest of the
+detail). Any parser that matched the old `detail` text exactly must allow the
+new prefix.
 
 ## Security fixes
 

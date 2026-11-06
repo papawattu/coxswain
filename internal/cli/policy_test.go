@@ -1,0 +1,57 @@
+/*
+Copyright 2026 papawattu.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package cli
+
+import (
+	"bytes"
+	"strings"
+	"testing"
+)
+
+// P6b-2: the operator log mixes zap lines, non-JSON lines and audit records;
+// only this Loop's records shape the candidate.
+func TestSuggestPolicyFromOperatorLog(t *testing.T) {
+	in := strings.Join([]string{
+		`{"level":"info","ts":1,"msg":"Reconciling Loop","loop":"l1"}`,
+		`not json at all`,
+		`{"time":"2026-11-06T10:00:00Z","loop":"l1","namespace":"ns","iteration":"0","source":"kubearmor","action":"Audit","target":"/usr/bin/git","verdict":"allowed","detail":"operation=Process, policy=p"}`,
+		`{"time":"2026-11-06T10:00:01Z","loop":"l1","namespace":"ns","iteration":"0","source":"egress-proxy","action":"connect","target":"github.com:443","verdict":"blocked","detail":""}`,
+		`{"time":"2026-11-06T10:00:02Z","loop":"l2","namespace":"ns","iteration":"0","source":"kubearmor","action":"Audit","target":"/bin/sh","verdict":"allowed","detail":"operation=Process"}`,
+	}, "\n")
+	var out bytes.Buffer
+	if err := suggestPolicy(strings.NewReader(in), &out, "l1", "ns", "l1-suggested"); err != nil {
+		t.Fatalf("suggest: %v", err)
+	}
+	got := out.String()
+	for _, want := range []string{"name: l1-suggested", "namespace: ns", `- "/usr/bin/git"`, `- "github.com:443"`, "Platform minimum"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("output lacks %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "/bin/sh") {
+		t.Errorf("another Loop's activity leaked into the candidate:\n%s", got)
+	}
+}
+
+// P6b-2: the command is registered as `policy suggest`.
+func TestPolicySuggestRegistered(t *testing.T) {
+	root := NewRootCommand(Deps{})
+	cmd, _, err := root.Find([]string{"policy", "suggest"})
+	if err != nil || cmd == nil || cmd.Name() != "suggest" {
+		t.Fatalf("policy suggest not registered: %v", err)
+	}
+}

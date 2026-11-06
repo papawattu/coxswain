@@ -64,6 +64,15 @@ spec:
               only ever allows; a Loop's effective policy is the union of the allows across
               every AgentPolicy it references (spec.policyRefs[]).
             properties:
+              auditOnly:
+                description: |-
+                  auditOnly is learn mode (P6b, ADR-0007 D31): the engine RECORDS instead of
+                  blocking for a Loop whose referenced policies are ALL auditOnly
+                  (PolicyEnforced=False reason AuditOnly). Never defaulted. If any
+                  referenced policy is enforcing, the Loop enforces the union of the
+                  allows and this flag has no effect (D108); the ignored policies are
+                  recorded in status.
+                type: boolean
               exec:
                 description: |-
                   exec is the commands the agent may run, as ABSOLUTE binary paths (e.g.

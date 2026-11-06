@@ -242,3 +242,27 @@ func ProxyComponentSelector() labels.Selector {
 		[]string{ComponentProxyLabel, ComponentEgressProxyLabel, ComponentToolProxyLabel})
 	return labels.NewSelector().Add(*r)
 }
+
+// CombineAuditOnly is D108 (P6b learn mode): a Loop is audit-only only when it
+// references at least one policy and EVERY referenced policy is auditOnly. When
+// an enforcing policy is also referenced, the auditOnly flags have no effect;
+// ignored returns the names of the auditOnly policies that were ignored, in
+// order. names is parallel to auditOnly (the Loop's spec.policyRefs order).
+func CombineAuditOnly(names []string, auditOnly []bool) (bool, []string) {
+	if len(auditOnly) == 0 {
+		return false, nil
+	}
+	all := true
+	var flagged []string
+	for i, a := range auditOnly {
+		if a {
+			flagged = append(flagged, names[i])
+		} else {
+			all = false
+		}
+	}
+	if all {
+		return true, nil
+	}
+	return false, flagged
+}

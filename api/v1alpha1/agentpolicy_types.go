@@ -146,6 +146,15 @@ type AgentPolicySpec struct {
 	// +kubebuilder:validation:MaxItems=64
 	// +kubebuilder:validation:XValidation:rule="self.all(t, self.filter(o, o.name == t.name).size() == 1)",message="tool names must be unique within the tools list"
 	Tools []ToolSpec `json:"tools,omitempty"`
+
+	// auditOnly is learn mode (P6b, ADR-0007 D31): the engine RECORDS instead of
+	// blocking for a Loop whose referenced policies are ALL auditOnly
+	// (PolicyEnforced=False reason AuditOnly). Never defaulted. If any
+	// referenced policy is enforcing, the Loop enforces the union of the
+	// allows and this flag has no effect (D108); the ignored policies are
+	// recorded in status.
+	// +optional
+	AuditOnly bool `json:"auditOnly,omitempty"`
 }
 
 // ToolSpec is one credentialed external tool the agent may use through an

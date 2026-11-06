@@ -540,6 +540,13 @@ type PolicyStatus struct {
 	// (ADR-0007 Q5 / C8). It is derived by the operator from the engine's alert
 	// stream; a relay outage must surface as "unknown", not zero (I32). +optional
 	BlockedCount *int64 `json:"blockedCount,omitempty"`
+
+	// auditOnlyIgnored names the auditOnly policies whose flag had no effect
+	// because an enforcing policy is also referenced (P6b, D108: the Loop
+	// enforces the union of the allows). Empty when learn mode applies or no
+	// policy is auditOnly.
+	// +optional
+	AuditOnlyIgnored []string `json:"auditOnlyIgnored,omitempty"`
 }
 
 // LoopSettings holds the loop-level knobs.

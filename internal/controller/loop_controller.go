@@ -5959,6 +5959,28 @@ func priorPolicyEnforced(loop *coxv1alpha1.Loop) (metav1.ConditionStatus, string
 	return "", ""
 }
 
+// recordAuditOnlyIgnored is D108 (P6b): a Loop that references an enforcing
+// policy AND auditOnly policies enforces the union; the ignored auditOnly
+// names are recorded in status.policy, with one Warning Event each time the
+// set changes (not every pass).
+func (r *LoopReconciler) recordAuditOnlyIgnored(loop *coxv1alpha1.Loop, ignored []string) {
+	var prev []string
+	if loop.Status.Policy != nil {
+		prev = loop.Status.Policy.AuditOnlyIgnored
+	}
+	if slices.Equal(prev, ignored) {
+		return
+	}
+	if loop.Status.Policy == nil {
+		loop.Status.Policy = &coxv1alpha1.PolicyStatus{}
+	}
+	loop.Status.Policy.AuditOnlyIgnored = ignored
+	if len(ignored) > 0 && r.Recorder != nil {
+		r.Recorder.Eventf(loop, corev1.EventTypeWarning, "AuditOnlyIgnored",
+			"auditOnly has no effect: an enforcing policy is also referenced, so the Loop enforces the union of the allows (D108); ignored: %s", strings.Join(ignored, ", "))
+	}
+}
+
 // applyEffectivePolicyAndConditions (C6b+I41+D30) resolves the effective
 // policy, applies it through the Enforcer, records the hash, and sets the
 // PolicyTranslationLossy and PolicyEnforced conditions.
@@ -6015,8 +6037,15 @@ func (r *LoopReconciler) applyEffectivePolicyAndConditions(ctx context.Context, 
 	}
 	setPolicyTranslationLossy(loop, r.translationLossAllows(ctx, loop, effective))
 	if enf, rs := preApplyEnf, preApplyRs; enf {
-		setCondition(loop, string(PolicyEnforcedCondition), metav1.ConditionTrue, "Enforcing",
-			"the eBPF engine is enforcing the Loop's effective policy")
+		if effective.AuditOnly {
+			// P6b learn mode: the engine is working, but the agent policy is
+			// spec.action Audit — it records, it does not block.
+			setCondition(loop, string(PolicyEnforcedCondition), metav1.ConditionFalse, "AuditOnly",
+				"learn mode (P6b): every referenced policy is auditOnly, so the eBPF engine records the agent's activity but does not block it (spec.action Audit)")
+		} else {
+			setCondition(loop, string(PolicyEnforcedCondition), metav1.ConditionTrue, "Enforcing",
+				"the eBPF engine is enforcing the Loop's effective policy")
+		}
 	} else {
 		// I46: the condition describes what was OBSERVED, not the flag. The
 		// observed reason (the Enforcer's own, or EnforcementUnverified) is
@@ -6078,6 +6107,7 @@ func (r *LoopReconciler) applyEffectivePolicyAndConditions(ctx context.Context, 
 			}
 		}
 	}
+	r.recordAuditOnlyIgnored(loop, effective.AuditOnlyIgnored)
 	// D38: the NetworkEnforced condition (network layer, analogous to
 	// PolicyEnforced). The escape hatch is AllowUnenforcedNetwork (separate
 	// from AllowUnenforced — the two flags are independent). A condition

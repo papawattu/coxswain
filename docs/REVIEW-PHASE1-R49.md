@@ -104,7 +104,7 @@ evidence the owner asked for.
 
   **Problem:** the agent's DNS/network fence, and in learn mode the catch-all Audit, apply to the operator's own verify pod. In enforcing mode that may block verify-time network the policy author never meant to allow, or be relied on as a feature. It is not stated anywhere.
 
-  **Fix:** an owner decision. Either (a) select the sandbox only, with a `component=agent` label term, or (b) document that the verify pod is fenced by the agent's policy, on purpose.
+  **Fix:** an owner decision. Either (a) select the sandbox only, with a `component=agent` label term, or (b) document that the verify pod is fenced by the agent's policy, on purpose. **Decided: (a), D115** (owner, 11-07).
 
   **Acceptance:** the decision is recorded, plus a spec on the selector.
 
@@ -197,8 +197,9 @@ evidence the owner asked for.
 - **D114**, 11-07: P6c's VAP denies every `loops/status` write except the operator's ServiceAccount, cluster admins included (break-glass is to remove the binding).
 - **Lab:** the owner approved the kind-ref P6b/F62 proofs and the KubeArmor `LOGPATH`, visibility and namespace-annotation changes. The KubeArmor agent restart after I226(b) was approved too.
 
+- **D115** (I223), 11-07: the agent's KubeArmorPolicy selects the sandbox pod ONLY. Its selector gains the `app.kubernetes.io/component=agent` term, so the verify pod no longer inherits the agent's allows or learn-mode Audit. A small slice after P6c.
+
 **Open:**
-- **I223:** whether the verify pod should be fenced by the agent's policy.
 - **R47 I213:** waiting on the homelab side.
 
 ## What I did not verify

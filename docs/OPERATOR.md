@@ -888,12 +888,11 @@ allowlist is then empty, so it blocks every host and records each connect, and
 `cox policy suggest` turns those connects into network allows. Enforcing mode
 is unchanged: no catch-all rules, and no egress proxy without network allows.
 
-**Known gap (#407 kind-ref runs).** End to end, `cox policy suggest` does not
-yet get records from a real cluster: the operator's relay does not parse
-KubeArmor's stdout JSON (its keys are camelCase), and on kind-ref KubeArmor
-reported no events from the agent's sandbox pod (cause under investigation).
-A fix follows in its own PR. KubeArmor must also run with `logPath=stdout`
-for the relay to see any alert.
+**Known gap (#407 kind-ref runs).** KubeArmor must run with
+`logPath=stdout` (QUICKSTART Step 3) for the relay to see any alert, and
+#408 makes the relay parse those lines. On kind-ref, KubeArmor reported no
+events from the agent's sandbox pod in one run (cause under investigation),
+so `cox policy suggest` may still come back empty.
 
 **Mixed Loops (D108).** If an enforcing policy is also referenced, the Loop
 enforces the union of every policy's allows (`spec.action: Block`); the

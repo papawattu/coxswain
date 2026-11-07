@@ -91,12 +91,11 @@ connect, and `cox policy suggest` turns those connects into network allows.
 Enforcing mode is unchanged: no catch-all rules, and no egress proxy without
 network allows.
 
-**Known gap:** End to end, `cox policy suggest` does not
-yet get records from a real cluster: the operator's relay does not parse
-KubeArmor's stdout JSON (its keys are camelCase), and on kind-ref KubeArmor
-reported no events from the agent's sandbox pod (cause under investigation).
-A fix follows in its own PR. KubeArmor must also run with `logPath=stdout`
-for the relay to see any alert.
+**Known gap:** KubeArmor must run with
+`logPath=stdout` (QUICKSTART Step 3) for the relay to see any alert, and
+#408 makes the relay parse those lines. On kind-ref, KubeArmor reported no
+events from the agent's sandbox pod in one run (cause under investigation),
+so `cox policy suggest` may still come back empty.
 
 **On upgrade:** a learn-mode Loop now also gets an egress proxy pod; network
 for the agent in learn mode goes through it and is blocked unless allowed, as
@@ -121,6 +120,14 @@ before.
 **On upgrade:** the first write after the upgrade removes stored lessons that fail the current rules (e.g. a lesson with no file path or error signature, or a short colon credential). Each removal is listed in that Loop's memory-write summary.
 
 ## Other changes
+
+### F62: the relay parses the KubeArmor agent's stdout; KubeArmor needs logPath=stdout — #408
+
+**What was wrong:** the KubeArmor agent's stdout lines use camelCase keys, so the relay never decoded them and the blocked-action count and the audit lines were always empty; and the agent's default `logPath` is `none`, which writes alerts over gRPC only, so the relay's stream had no KubeArmor line at all.
+
+**What changed:** the relay parses both key styles, so the camelCase stdout lines are decoded.
+
+**On upgrade:** set `LOGPATH=stdout` with `kubectl -n kubearmor patch kubearmorconfig kubearmorconfig-default --type merge -p '{"spec":{"globalEnv":[{"name":"LOGPATH","value":"stdout"}]}}'` and check the agent log's `Final Configuration` line shows `LogPath:stdout`.
 
 ### D79(b) part 1: the wall clock pauses while a Loop waits at AwaitingApproval — #402
 

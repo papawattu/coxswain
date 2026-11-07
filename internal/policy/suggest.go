@@ -244,8 +244,8 @@ func RenderSuggestion(s Suggestion, name, namespace string) string {
 		key      string
 		vals     []string
 		overflow []string
-	}{{"exec", s.Exec, s.ExecOverflow}, {"files", s.Files, s.FilesOverflow}, {"network", s.Network, s.NetworkOverflow}} {
-		if len(sec.vals) == 0 && len(sec.overflow) == 0 {
+	}{{AllowExec, s.Exec, s.ExecOverflow}, {"files", s.Files, s.FilesOverflow}, {"network", s.Network, s.NetworkOverflow}} {
+		if len(sec.vals) == 0 && len(sec.overflow) == 0 && (sec.key != AllowExec || len(s.ExecRejected) == 0) {
 			continue
 		}
 		if len(sec.vals) > 0 {
@@ -260,7 +260,7 @@ func RenderSuggestion(s Suggestion, name, namespace string) string {
 				fmt.Fprintf(&b, "  #   %q\n", v)
 			}
 		}
-		if sec.key == "exec" && len(s.ExecRejected) > 0 {
+		if sec.key == AllowExec && len(s.ExecRejected) > 0 {
 			fmt.Fprintf(&b, "  # %d exec paths were observed but cannot be allowed (under a writable mount, or not canonical: R15):\n", len(s.ExecRejected))
 			for _, v := range s.ExecRejected {
 				fmt.Fprintf(&b, "  #   %q\n", v)

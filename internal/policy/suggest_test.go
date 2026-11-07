@@ -137,6 +137,70 @@ func TestSuggestFromRecordsCapsAt64(t *testing.T) {
 	}
 }
 
+// R15/D112: execAllowable is the Go copy of the AgentPolicy exec XValidation
+// rule; it must accept exactly the paths the CRD accepts.
+func TestExecAllowable(t *testing.T) {
+	cases := []struct {
+		path string
+		want bool
+	}{
+		{"/usr/bin/git", true},
+		{"/bin/sh", true},
+		{"/usr/local/go/bin/go", true},
+		{"/workspace", false},
+		{"/workspace/x", false},
+		{"/scratch", false},
+		{"/scratch/y", false},
+		{"/tmp", false},
+		{"/tmp/z", false},
+		{"/usr/./bin/x", false},
+		{"/a/../b", false},
+		{"/a/.", false},
+		{"/a/..", false},
+		{"relative", false},
+		{"/a b", false},
+		{"/a//b", false},
+	}
+	for _, tc := range cases {
+		if got := execAllowable(tc.path); got != tc.want {
+			t.Errorf("execAllowable(%q) = %v, want %v", tc.path, got, tc.want)
+		}
+	}
+}
+
+// R15/D112: a process binary under a writable mount (/workspace, /tmp) is
+// never an exec allow; it goes to ExecRejected, where the render shows it
+// cannot be allowed. A canonical binary still is.
+func TestSuggestFromRecordsRejectsWritableMountExec(t *testing.T) {
+	recs := []alerts.Record{
+		{Loop: "l1", Namespace: "ns", Source: alerts.SourceKubeArmor, Action: "Audit", Target: "/workspace/a/b.test -v", Verdict: "allowed", Detail: "operation=Process, pod=l1-sandbox"},
+		{Loop: "l1", Namespace: "ns", Source: alerts.SourceKubeArmor, Action: "Audit", Target: "/tmp/x", Verdict: "allowed", Detail: "operation=Process, pod=l1-sandbox"},
+		{Loop: "l1", Namespace: "ns", Source: alerts.SourceKubeArmor, Action: "Audit", Target: "/usr/bin/git status", Verdict: "allowed", Detail: "operation=Process, pod=l1-sandbox"},
+	}
+	s := SuggestFromRecords(recs, "l1", "ns")
+	if want := []string{"/usr/bin/git"}; !slices.Equal(s.Exec, want) {
+		t.Errorf("exec = %v, want %v", s.Exec, want)
+	}
+	if want := []string{"/tmp/x", "/workspace/a/b.test"}; !slices.Equal(s.ExecRejected, want) {
+		t.Errorf("execRejected = %v, want %v", s.ExecRejected, want)
+	}
+}
+
+// D112: when every observed exec path is rejected, the render still carries
+// the rejected-exec comment (the exec section must not be skipped just
+// because the allow list is empty).
+func TestRenderSuggestionRejectedOnlyExec(t *testing.T) {
+	recs := []alerts.Record{
+		{Loop: "l1", Namespace: "ns", Source: alerts.SourceKubeArmor, Action: "Audit", Target: "/tmp/x", Verdict: "allowed", Detail: "operation=Process, pod=l1-sandbox"},
+		{Loop: "l1", Namespace: "ns", Source: alerts.SourceKubeArmor, Action: "Audit", Target: "/workspace/a/b.test", Verdict: "allowed", Detail: "operation=Process, pod=l1-sandbox"},
+	}
+	s := SuggestFromRecords(recs, "l1", "ns")
+	out := RenderSuggestion(s, "l1-suggested", "ns")
+	if !strings.Contains(out, "cannot be allowed") {
+		t.Errorf("rendered candidate lacks the rejected-exec comment:\n%s", out)
+	}
+}
+
 // D109: the rendered candidate carries the platform-minimum header, the
 // observed allows, no auditOnly, and never a deny.
 func TestRenderSuggestion(t *testing.T) {

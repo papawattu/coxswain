@@ -117,6 +117,14 @@ before.
 
 ## Security fixes
 
+### P6c: only the operator writes Loop status (D85(a), D114) — #416
+
+**What was wrong:** D85 made the operator the sole writer of Loop status at the CLI level (approve/reject now annotate the Loop, not the status subresource), but the admission chain had no hard boundary: a user with the editor role's old grants, or a cluster admin, could still `kubectl patch` `loops/status` directly and move a Loop's phase or approval state by hand.
+
+**What changed:** a new cluster-scoped ValidatingAdmissionPolicy (`coxswain-deny-loop-status-writes`) plus binding denies every `loops/status` write except the operator's own ServiceAccount — including cluster admins. Approve or reject with `cox approve` / `cox reject` (which write a one-shot annotation on the Loop); the operator consumes the annotation and writes the status itself. Break-glass hand-edits are documented in `docs/OPERATOR.md` (delete the binding, edit, re-apply it).
+
+**On upgrade:** install.yaml and the chart ship the new VAP and binding; any tooling that patched Loop status directly is now denied.
+
 ### D78(b): a credential key followed by ':' and any value is dropped from lessons — #401
 
 **What was wrong:** the credential-assignment rule only dropped a credential key (`password|passwd|secret|token|api_key`) when followed by `:` and an 8+ character token-shaped value, so short values such as `password: hunter2` were written to memory.

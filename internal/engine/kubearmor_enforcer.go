@@ -108,7 +108,7 @@ func (e *KubeArmorEnforcer) Apply(ctx context.Context, loop *v1alpha1.Loop, p po
 		return ErrNoProxyFQDNs
 	}
 	egressFQDN := ""
-	if len(p.Network) > 0 {
+	if p.NeedsEgress() {
 		egressFQDN = e.EgressProxyFQDN(loop.Name, loop.Namespace)
 	}
 	// D41d: the agent reaches each tool proxy via its Service FQDN; the
@@ -140,7 +140,7 @@ func (e *KubeArmorEnforcer) Apply(ctx context.Context, loop *v1alpha1.Loop, p po
 	// expected, i.e. the effective policy has network allows). Cleaned up in
 	// the else branch when the allows go away (a stale policy would keep
 	// fencing a pod that no longer exists — drift the reconciler must own).
-	if len(p.Network) > 0 {
+	if p.NeedsEgress() {
 		egressObj := EmitEgressProxyKubeArmorPolicy(loop.Name, loop.Namespace, p.Network)
 		if err := e.createOrUpdateKapt(ctx, loop, egressObj); err != nil {
 			return err
@@ -513,7 +513,7 @@ func (e *KubeArmorEnforcer) BPFNodeAffinity() *corev1.Affinity {
 // for the given Loop and effective policy (A1, D52 fact 3).
 func (e *KubeArmorEnforcer) KaptSpecHash(loop *v1alpha1.Loop, p policy.EffectivePolicy) string {
 	egressFQDN := ""
-	if len(p.Network) > 0 {
+	if p.NeedsEgress() {
 		egressFQDN = e.EgressProxyFQDN(loop.Name, loop.Namespace)
 	}
 	toolFQDNs := make([]string, 0, len(p.Tools))

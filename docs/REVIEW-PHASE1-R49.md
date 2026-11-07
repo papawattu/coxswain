@@ -106,6 +106,15 @@ evidence the owner asked for.
 
   **Fix:** an owner decision. Either (a) select the sandbox only, with a `component=agent` label term, or (b) document that the verify pod is fenced by the agent's policy, on purpose. **Decided: (a), D115** (owner, 11-07).
 
+  **Correction (reviewer, 11-07 ~21:45Z; my error).** The **Where** above claims "the verify pod's records match the agent policy in runs 4-8". That was asserted without checking the `policy=` field, and it is wrong. Count of the Loop's audit lines whose detail carries `policy=coxswain-p6b-learn`, by pod (`grep … | grep -c 'policy=coxswain-p6b-learn'` on `.samples/p6b3-kind/run{8,9}/p6b3-operator.log`):
+
+  | Run | Verify pod: policy / no policy | Sandbox: policy / no policy |
+  |---|---|---|
+  | 8 | 0 / 11648 | 9083 / 53 |
+  | 9 (#414 head) | 0 / 11489 | 10528 / 50 |
+
+  Run 4's lines carry no `pod=`, so they cannot be split. The verify pod's lines are plain visibility events from the namespace annotation. In practice the agent policy did NOT fence the verify pod in runs 8-9, although its labels include `coxswain.io/loop` (cause unknown). D115 (#414) is therefore defensive: the selector now states the intent (the sandbox only), independent of how KubeArmor resolved the verify pod. Run 9 shows no observable change. This slip is added to I226 as (g).
+
   **Acceptance:** the decision is recorded, plus a spec on the selector.
 
 - [ ] **I224: AgentPolicy `files` entries have no path validation**
@@ -147,9 +156,11 @@ evidence the owner asked for.
   - **(e) A missed CRD clause:** the D112 brief missed the exec CRD clause that forbids writable-mount paths (`agentpolicy_types.go:66`), and run 7's candidate was rejected by the API server. Rule: dry-run any generated manifest against the real CRD.
   - **(f) Over-claiming docs:** #407's docs said learn mode "records every exec and file access" before any run showed it. Corrected in `53d6267` to a Known gap.
 
+  - **(g) A field not checked:** I223's evidence claim (the verify pod is policy-matched) was written without checking the `policy=` field; see the correction under I223. Rule: an evidence claim about which policy matched cites a count of the `policy=` field.
+
   **Fix:** the rules above (memory, and the reviewer's loop prompt).
 
-  **Acceptance:** none of (a)-(f) recurs in R50's window.
+  **Acceptance:** none of (a)-(g) recurs in R50's window.
 
 ## P3
 

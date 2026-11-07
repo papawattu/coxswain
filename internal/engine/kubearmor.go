@@ -160,7 +160,7 @@ func emitKubeArmorPolicy(loopName, namespace string, ep policy.EnginePolicy) *un
 		// per-rule action: Allow is the carve-out.
 		kaptActionKey: kaptAction(ep),
 		KaptSelectorKey: map[string]any{
-			KaptMatchLabelsKey: map[string]any{"coxswain.io/loop": loopName},
+			KaptMatchLabelsKey: map[string]any{"coxswain.io/loop": loopName, policy.ComponentLabelKey: policy.ComponentAgentLabel},
 		},
 	}
 	// exec allows -> process.matchPaths items ({path} ONLY), action Allow.

@@ -789,8 +789,11 @@ func TestRelayProxyLineBeforeEngineLineIsNotHealthy(t *testing.T) {
 	}}
 	relay := f62NewRelay(src)
 	disc := &fixedDiscoverer{peers: []Peer{
-		{Namespace: "kubearmor", Pod: "agent-node-1", Kind: PeerEngine, Source: SourceKubeArmor},
-		{Namespace: f62Sandbox, Pod: f62SandboxP, Kind: PeerWorkload},
+		// The engine and workload are discovered first (as on a real cluster):
+		// the engine attaches, the Loop settles on Unavailable/NoAlerts (the
+		// engine has no line yet). The proxy is NOT discovered yet.
+		{Namespace: "kubearmor", Pod: "agent-node-1", Kind: PeerEngine, Node: "node-a", Source: SourceKubeArmor},
+		{Namespace: f62Sandbox, Pod: f62SandboxP, Kind: PeerWorkload, Node: "node-a"},
 	}}
 	relay.Discoverer = disc
 	relay.Interval = 20 * time.Millisecond
@@ -804,22 +807,24 @@ func TestRelayProxyLineBeforeEngineLineIsNotHealthy(t *testing.T) {
 	holder := startTestRelay(t, relay)
 
 	// The engine attaches first (as on a real cluster): wait for its stream to
-	// be followed and for the Loop to settle on Unavailable/NoAlerts with no
-	// line — that is the state engineOK must reject the proxy's line in.
+	// be followed (followCount >= 2, since the engine is re-followed each pass)
+	// and for the Loop to settle on Unavailable/NoAlerts with no line.
 	waitFor(t, "the engine stream to attach", func() bool { return src.followCount() >= 2 })
 	waitFor(t, "the Loop to be Unavailable/NoAlerts once the engine has attached with no line", func() bool {
 		s, ok := holder.Snapshot(f62UID)
 		return ok && s.Health == HealthUnavailable && s.Reason == ReasonNoAlerts
 	})
+	// Now the proxy is discovered (it was not in the initial peer list).
+	// Its counted line must not publish a Healthy 1 because engineOK on
+	// node-a rejects it — the engine has no line yet.
 	disc.setPeers(
-		Peer{Namespace: "kubearmor", Pod: "agent-node-1", Kind: PeerEngine, Source: SourceKubeArmor},
-		Peer{Namespace: f62Sandbox, Pod: f62SandboxP, Kind: PeerWorkload},
-		Peer{Namespace: f62LoopNS, Pod: "l1-egress-proxy", Kind: PeerProxy, Source: SourceEgress},
+		Peer{Namespace: "kubearmor", Pod: "agent-node-1", Kind: PeerEngine, Node: "node-a", Source: SourceKubeArmor},
+		Peer{Namespace: f62Sandbox, Pod: f62SandboxP, Kind: PeerWorkload, Node: "node-a"},
+		Peer{Namespace: f62LoopNS, Pod: "l1-egress-proxy", Kind: PeerProxy, Node: "node-a", Source: SourceEgress},
 	)
-	waitFor(t, "the proxy line to be counted", func() bool {
-		s, ok := holder.Snapshot(f62UID)
-		return ok && s.Count == 1
-	})
+	// Wait for the proxy's Source.Follow to be called (followCount >= 3:
+	// engine + proxy + engine restart).
+	waitFor(t, "the proxy stream to attach", func() bool { return src.followCount() >= 3 })
 	time.Sleep(30 * time.Millisecond)
 	if s, _ := holder.Snapshot(f62UID); s.Health == HealthHealthy {
 		t.Fatalf("the Loop is Healthy on a proxy line that arrived before any engine line (E3/D111); a Healthy 1 would read as a complete count")

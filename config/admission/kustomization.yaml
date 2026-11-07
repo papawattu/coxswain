@@ -16,3 +16,9 @@
 namePrefix: coxswain-
 resources:
 - validating_admission_policy.yaml
+# [P6c / D85(a), D114] ValidatingAdmissionPolicy + binding: only the
+# coxswain operator's ServiceAccount writes loops/status (every other
+# writer — editor role, cluster admins — is denied; break-glass is a
+# binding removal, see the docs). Applied separately, like the I45
+# admission resources (standalone kustomization, coxswain- namePrefix).
+- loop_status_vap.yaml

@@ -47,6 +47,7 @@ import (
 	. "github.com/onsi/gomega"
 	admissionv1 "k8s.io/api/admissionregistration/v1"
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/rest"
@@ -201,16 +202,45 @@ var _ = Describe("P6c: only the coxswain operator writes Loop status (D85(a)/D11
 		// removing this makes the "denied" assertions below fail.)
 		applyP6cStatusVAP()
 
+		// RBAC is checked BEFORE admission; without this grant the request
+		// never reaches the VAP and the spec would test RBAC, not D114.
+		// envtest enforces authorization, and neither the impersonated
+		// editor user nor the operator SA has any role in a bare envtest
+		// cluster, so grant both subjects the loops/status write.
+		writerRole := &rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: "p6c-loop-status-writer"}}
+		writerRole.Rules = []rbacv1.PolicyRule{{
+			APIGroups: []string{"coxswain.wattu.com"},
+			Resources: []string{"loops", "loops/status"},
+			Verbs:     []string{"get", "list", "watch", "update", "patch"},
+		}}
+		Expect(k8sClient.Create(ctx, writerRole)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, writerRole) })
+		writerBinding := &rbacv1.ClusterRoleBinding{
+			ObjectMeta: metav1.ObjectMeta{Name: "p6c-loop-status-writer"},
+			RoleRef:    rbacv1.RoleRef{Kind: "ClusterRole", Name: "p6c-loop-status-writer"},
+			Subjects: []rbacv1.Subject{{
+				Kind: rbacv1.UserKind, Name: p6cEditorUser,
+			}, {
+				Kind: rbacv1.ServiceAccountKind, Name: "coxswain-controller-manager", Namespace: "coxswain-system",
+			}},
+		}
+		Expect(k8sClient.Create(ctx, writerBinding)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, writerBinding) })
+
 		editorCl = impersonatingClient(p6cEditorUser, []string{"system:authenticated"})
 		managerCl = impersonatingClient(p6cOperatorSA,
 			[]string{"system:serviceaccounts", "system:authenticated"})
 	})
 
-	// statusUpdate runs the given body through Status().Update (DryRun=All)
-	// with the given client and returns the admission error (nil when
-	// allowed). The dry run keeps the write from persisting while the full
-	// admission chain (including the VAP) still runs.
+	// statusUpdate fetches the current object (so the update carries a
+	// resourceVersion — an update without one is rejected at object
+	// validation, before RBAC and admission), applies the mutate, and runs
+	// Status().Update (DryRun=All) with the given client, returning the
+	// admission error (nil when allowed). The dry run keeps the write from
+	// persisting while the full admission chain (including the VAP) still
+	// runs.
 	statusUpdate := func(cl client.Client, r *coxv1alpha1.Loop, mutate func(*coxv1alpha1.Loop) *coxv1alpha1.Loop) error {
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(r), r)).To(Succeed())
 		dryRunAll := client.DryRunAll
 		return cl.Status().Update(ctx, mutate(r), &dryRunAll)
 	}
@@ -236,7 +266,7 @@ var _ = Describe("P6c: only the coxswain operator writes Loop status (D85(a)/D11
 			b.Status.Iteration = 1
 			return b
 		})
-		Expect(err).NotTo(BeNil())
+		Expect(err).To(HaveOccurred())
 		Expect(err.Error()).To(ContainSubstring("written only by the coxswain operator"),
 			"the denial message must be the VAP's, not a plain RBAC denial")
 	})

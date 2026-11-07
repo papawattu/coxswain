@@ -665,3 +665,50 @@ func TestRelayEngineAbsentIsUnavailable(t *testing.T) {
 		return ok && s.Health == HealthUnavailable && s.Reason == ReasonEngineUnavailable
 	})
 }
+
+// TestRelayEngineWithNoLineIsNoAlerts is owner D111: an engine stream that
+// attaches but never produces a decoded alert line (KubeArmor's default
+// logPath=none) must NOT publish a count of 0 — the Loop is Unavailable with
+// ReasonNoAlerts until a real line arrives.
+//
+// Mutation: treat attach as healthy → the Loop becomes Healthy.
+func TestRelayEngineWithNoLineIsNoAlerts(t *testing.T) {
+	src := &blockingSource{batch: []string{}}
+	holder := f62Fixture(t, src)
+
+	waitFor(t, "the engine stream to attach", func() bool { return src.followCount() >= 1 })
+	waitFor(t, "an unavailable stream with ReasonNoAlerts", func() bool {
+		s, ok := holder.Snapshot(f62UID)
+		return ok && s.Health == HealthUnavailable && s.Reason == ReasonNoAlerts
+	})
+	time.Sleep(30 * time.Millisecond)
+	if s, ok := holder.Snapshot(f62UID); ok && s.Health == HealthHealthy {
+		t.Fatalf("the Loop became Healthy with no decoded engine line; its zero count would be a false zero (D111)")
+	}
+	if s, _ := holder.Snapshot(f62UID); s.Health != HealthUnavailable || s.Reason != ReasonNoAlerts {
+		t.Errorf("health = %q reason = %q, want Unavailable/%q", s.Health, s.Reason, ReasonNoAlerts)
+	}
+}
+
+// TestRelayFirstEngineLineMakesItHealthy is owner D111's other half: the first
+// decoded engine line (an Allow is enough — it is still real engine output) is
+// what makes the Loop's count publishable, here with count 0.
+//
+// Mutation: never mark the node as having seen a line → the Loop stays
+// Unavailable.
+func TestRelayFirstEngineLineMakesItHealthy(t *testing.T) {
+	base := time.Date(2026, 10, 26, 10, 0, 0, 0, time.UTC)
+	src := &blockingSource{batch: []string{
+		kubeArmorBlock(base.Add(time.Second), "Allow", f62Sandbox, f62SandboxP, "api.example.com:443"),
+	}}
+	holder := f62Fixture(t, src)
+
+	waitFor(t, "a healthy count of 0 after the first engine line", func() bool {
+		s, ok := holder.Snapshot(f62UID)
+		return ok && s.Health == HealthHealthy && s.Count == 0
+	})
+	time.Sleep(20 * time.Millisecond)
+	if s, _ := holder.Snapshot(f62UID); s.Health != HealthHealthy {
+		t.Errorf("health = %q reason = %q, want Healthy after the first engine line", s.Health, s.Reason)
+	}
+}

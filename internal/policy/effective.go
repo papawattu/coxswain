@@ -278,3 +278,10 @@ func CombineAuditOnly(names []string, auditOnly []bool) (bool, []string) {
 	}
 	return false, flagged
 }
+
+// NeedsEgress reports whether the Loop needs its egress proxy: it has network
+// allows, or it is in learn mode (D110: the proxy still blocks non-allowed
+// hosts and records them, which is where `cox policy suggest` learns network).
+func (p EffectivePolicy) NeedsEgress() bool {
+	return len(p.Network) > 0 || p.AuditOnly
+}

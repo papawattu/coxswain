@@ -150,16 +150,9 @@ func (s *blockingSource) followCount() int {
 // guarantees the engine's engineHealthy state is set, not just that its first
 // stream happened to open.
 type perPodSource struct {
-	mu      sync.Mutex
-	lines   map[string][]string
-	follows int
-	byNS    map[string]int
-}
-
-func (s *perPodSource) followCount() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.follows
+	mu    sync.Mutex
+	lines map[string][]string
+	byNS  map[string]int
 }
 
 // followsByNS returns the number of Follow calls for a specific namespace.
@@ -171,10 +164,6 @@ func (s *perPodSource) followsByNS(ns string) int {
 
 func (s *perPodSource) Follow(ctx context.Context, namespace, pod, _ string, _ *time.Time) (io.ReadCloser, error) {
 	s.mu.Lock()
-	s.follows++
-	if namespace == "kubearmor" {
-		s.follows++
-	}
 	if s.byNS == nil {
 		s.byNS = map[string]int{}
 	}
@@ -821,7 +810,7 @@ func TestRelayProxyLineBeforeEngineLineIsNotHealthy(t *testing.T) {
 	// The engine attaches first (as on a real cluster): wait for its stream to
 	// be followed (followCount >= 2, since the engine is re-followed each pass)
 	// and for the Loop to settle on Unavailable/NoAlerts with no line.
-	waitFor(t, "the engine stream to attach", func() bool { return src.followCount() >= 2 })
+	waitFor(t, "the engine stream to attach", func() bool { return src.followsByNS("kubearmor") >= 1 })
 	waitFor(t, "the Loop to be Unavailable/NoAlerts once the engine has attached with no line", func() bool {
 		s, ok := holder.Snapshot(f62UID)
 		return ok && s.Health == HealthUnavailable && s.Reason == ReasonNoAlerts

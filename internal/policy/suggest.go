@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"maps"
 	"path"
+	"regexp"
 	"slices"
 	"strings"
 
@@ -47,6 +48,13 @@ type Suggestion struct {
 	ExecOverflow    []string
 	FilesOverflow   []string
 	NetworkOverflow []string
+	// ExecRejected holds the observed exec paths the CRD's exec XValidation
+	// would reject (under a writable mount, or not canonical — R15). They are
+	// never listed as allows and never counted toward the cap; they are
+	// rendered as a comment (D112, kind run 7: the candidate was rejected by
+	// `kubectl apply --dry-run=server` because observed go-build paths sit
+	// under /workspace).
+	ExecRejected []string
 }
 
 // suggestPodItem reports whether r names this Loop's agent pod as a whole
@@ -73,6 +81,7 @@ func suggestPodItem(r alerts.Record, loop string) bool {
 // entries are kept, the rest go to the Suggestion's Overflow fields.
 func SuggestFromRecords(records []alerts.Record, loop, namespace string) Suggestion {
 	exec, files, network := map[string]int{}, map[string]int{}, map[string]int{}
+	var execRejected map[string]bool
 	for _, r := range records {
 		if r.Loop != loop || r.Namespace != namespace || r.Target == "" {
 			continue
@@ -94,8 +103,16 @@ func SuggestFromRecords(records []alerts.Record, loop, namespace string) Suggest
 					continue
 				}
 				bin := fields[0]
-				if path.IsAbs(bin) {
+				if path.IsAbs(bin) && execAllowable(bin) {
 					exec[bin]++
+				} else if path.IsAbs(bin) {
+					// R15: a binary the agent can write cannot be allowed by
+					// path; paths the CRD's exec rule rejects go to
+					// ExecRejected, not the exec cap (D112 kind run 7).
+					if execRejected == nil {
+						execRejected = map[string]bool{}
+					}
+					execRejected[bin] = true
 				}
 			case strings.HasPrefix(r.Detail, "operation=File"):
 				files[r.Target]++
@@ -110,6 +127,11 @@ func SuggestFromRecords(records []alerts.Record, loop, namespace string) Suggest
 	execL, execO := capList(exec)
 	filesL, filesO := capList(fileEntries)
 	netL, netO := capList(network)
+	rejected := make([]string, 0, len(execRejected))
+	for p := range execRejected {
+		rejected = append(rejected, p)
+	}
+	slices.Sort(rejected)
 	return Suggestion{
 		Exec:            execL,
 		Files:           filesL,
@@ -117,7 +139,25 @@ func SuggestFromRecords(records []alerts.Record, loop, namespace string) Suggest
 		ExecOverflow:    execO,
 		FilesOverflow:   filesO,
 		NetworkOverflow: netO,
+		ExecRejected:    rejected,
 	}
+}
+
+// execAllowable is a Go copy of the AgentPolicy exec XValidation rule in
+// api/v1alpha1/agentpolicy_types.go:66. The two must change together: an
+// entry the CRD rejects must not be suggested, or the candidate fails
+// `kubectl apply --dry-run=server` (R15, D112 kind run 7).
+var execPathRe = regexp.MustCompile(`^(/[A-Za-z0-9._+-]+)+$`)
+
+func execAllowable(p string) bool {
+	return execPathRe.MatchString(p) &&
+		!strings.Contains(p, "/./") &&
+		!strings.Contains(p, "/../") &&
+		!strings.HasSuffix(p, "/.") &&
+		!strings.HasSuffix(p, "/..") &&
+		p != "/workspace" && !strings.HasPrefix(p, "/workspace/") &&
+		p != "/scratch" && !strings.HasPrefix(p, "/scratch/") &&
+		p != "/tmp" && !strings.HasPrefix(p, "/tmp/")
 }
 
 // collapseFileDirs turns a busy directory into one "dir/" entry: a directory
@@ -217,6 +257,12 @@ func RenderSuggestion(s Suggestion, name, namespace string) string {
 		if len(sec.overflow) > 0 {
 			fmt.Fprintf(&b, "  # %d more %s entries were observed but not listed (AgentPolicy allows at most 64):\n", len(sec.overflow), sec.key)
 			for _, v := range sec.overflow {
+				fmt.Fprintf(&b, "  #   %q\n", v)
+			}
+		}
+		if sec.key == "exec" && len(s.ExecRejected) > 0 {
+			fmt.Fprintf(&b, "  # %d exec paths were observed but cannot be allowed (under a writable mount, or not canonical: R15):\n", len(s.ExecRejected))
+			for _, v := range s.ExecRejected {
 				fmt.Fprintf(&b, "  #   %q\n", v)
 			}
 		}

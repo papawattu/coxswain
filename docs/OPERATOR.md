@@ -936,7 +936,9 @@ deduplicated and sorted — and it never contains a deny:
   in `detail`); init containers' records in that pod still count, while the
   verify pod and the proxies do not (D112);
 - KubeArmor process records become `exec`, keeping only the executable's
-  absolute path (the command's arguments are dropped);
+  absolute path (the command's arguments are dropped); a path under a
+  writable mount (/workspace, /scratch, /tmp) or not canonical is listed as
+  a comment instead, because the CRD rejects it (R15);
 - KubeArmor file records become `files`: a directory with more than 5
   distinct paths becomes one `dir/` entry (recursive, D113); otherwise
   the exact paths are kept;

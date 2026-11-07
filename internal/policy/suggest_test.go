@@ -1,7 +1,7 @@
 package policy
 
 import (
-	"regexp"
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -109,7 +109,7 @@ func TestSuggestFromRecordsCollapsesBusyDirs(t *testing.T) {
 func TestSuggestFromRecordsCapsAt64(t *testing.T) {
 	var recs []alerts.Record
 	for i := range 70 {
-		target := "/bin/ta" + string(rune('0'+i%60)) + string(rune('a'+i/60))
+		target := fmt.Sprintf("/bin/ta%02d", i)
 		// 6 paths get one observation, the other 64 get two.
 		obs := 2
 		if i < 6 {
@@ -128,7 +128,7 @@ func TestSuggestFromRecordsCapsAt64(t *testing.T) {
 	}
 	// The 6 single-observation paths are the overflow: they sort first by
 	// name, so the six smallest are exactly ta0..tf0.
-	if want := []string{"/bin/ta0a", "/bin/ta1a", "/bin/ta2a", "/bin/ta3a", "/bin/ta4a", "/bin/ta5a"}; !slices.Equal(s.ExecOverflow, want) {
+	if want := []string{"/bin/ta00", "/bin/ta01", "/bin/ta02", "/bin/ta03", "/bin/ta04", "/bin/ta05"}; !slices.Equal(s.ExecOverflow, want) {
 		t.Errorf("exec overflow = %v, want %v", s.ExecOverflow, want)
 	}
 	// Everything is sorted by name.
@@ -159,7 +159,7 @@ func TestRenderSuggestion(t *testing.T) {
 func TestRenderSuggestionOverflowComment(t *testing.T) {
 	recs := make([]alerts.Record, 0, 66)
 	for i := range 66 {
-		recs = append(recs, alerts.Record{Loop: "l1", Namespace: "ns", Source: alerts.SourceKubeArmor, Action: "Audit", Target: "/bin/ta" + string(rune('0'+i%10)) + string(rune('a'+i/10)), Verdict: "allowed", Detail: "operation=Process, pod=l1-sandbox"})
+		recs = append(recs, alerts.Record{Loop: "l1", Namespace: "ns", Source: alerts.SourceKubeArmor, Action: "Audit", Target: fmt.Sprintf("/bin/ta%02d", i), Verdict: "allowed", Detail: "operation=Process, pod=l1-sandbox"})
 	}
 	s := SuggestFromRecords(recs, "l1", "ns")
 	out := RenderSuggestion(s, "l1-suggested", "ns")
@@ -173,9 +173,10 @@ func TestRenderSuggestionOverflowComment(t *testing.T) {
 			t.Errorf("overflow entry %q not rendered as a comment line:\n%s", v, out)
 		}
 	}
-	// Every listed exec entry matches the AgentPolicy exec pattern
-	// (absolute paths only, one character class).
-	re := regexp.MustCompile(`^(/[A-Za-z0-9._+-]+)+$`)
+	// Every listed entry that is an exec path (an absolute path) satisfies
+	// execAllowable, the Go copy of the AgentPolicy exec XValidation rule
+	// (api/v1alpha1/agentpolicy_types.go:66) — a full command line and a
+	// path the CRD rejects are never listed.
 	listed := map[string]bool{}
 	for line := range strings.SplitSeq(out, "\n") {
 		trimmed := strings.TrimSpace(line)
@@ -191,8 +192,8 @@ func TestRenderSuggestionOverflowComment(t *testing.T) {
 			continue
 		}
 		listed[v] = true
-		if !re.MatchString(v) {
-			t.Errorf("listed exec entry %q does not match the AgentPolicy exec pattern", v)
+		if strings.HasPrefix(v, "/") && !execAllowable(v) {
+			t.Errorf("listed exec entry %q is rejected by the AgentPolicy exec rule", v)
 		}
 	}
 	if len(listed) != 64 {

@@ -157,6 +157,77 @@ func TestEmitKubeArmorPolicyExecUsesProcessMatchPaths(t *testing.T) {
 	}
 }
 
+// D113: a files allow ending in "/" renders as a file.matchDirectories item
+// ({dir, recursive: true}); any other entry stays an exact matchPaths item.
+func TestEmitKubeArmorPolicyFilesTrailingSlashIsRecursiveDir(t *testing.T) {
+	ep := policy.Translate(policy.EffectivePolicy{
+		Files: []string{"/etc/ssl/certs/", "/etc/hosts"},
+	}, "l1-proxy.ns.svc", "")
+	obj := EmitKubeArmorPolicy("loop-x", "ns-x", ep)
+	spec := obj.Object["spec"].(map[string]any)
+	file, ok := spec[KaptFileKey].(map[string]any)
+	if !ok {
+		t.Fatal("file block must exist for files allows")
+	}
+	if file[kaptActionKey] != kaptAllowAction {
+		t.Fatalf("file action must be Allow, got %v", file[kaptActionKey])
+	}
+	dirs, ok := file[KaptMatchDirsKey].([]any)
+	if !ok || len(dirs) != 1 {
+		t.Fatalf("file.matchDirectories must have exactly one item, got %v", file[KaptMatchDirsKey])
+	}
+	dm := dirs[0].(map[string]any)
+	if dm["dir"] != "/etc/ssl/certs/" || dm["recursive"] != true {
+		t.Fatalf("matchDirectories item must be {dir: /etc/ssl/certs/, recursive: true}, got %v", dm)
+	}
+	items, ok := file[KaptMatchPathsKey].([]any)
+	if !ok || len(items) != 1 {
+		t.Fatalf("file.matchPaths must have exactly one item, got %v", file[KaptMatchPathsKey])
+	}
+	if pm := items[0].(map[string]any); pm["path"] != "/etc/hosts" {
+		t.Fatalf("matchPaths item must be {path: /etc/hosts}, got %v", pm)
+	}
+
+	// With only a non-"/" entry there is NO matchDirectories key.
+	ep2 := policy.Translate(policy.EffectivePolicy{
+		Files: []string{"/etc/hosts"},
+	}, "l1-proxy.ns.svc", "")
+	spec2 := EmitKubeArmorPolicy("loop-x", "ns-x", ep2).Object["spec"].(map[string]any)
+	file2, ok := spec2[KaptFileKey].(map[string]any)
+	if !ok {
+		t.Fatal("file block must exist")
+	}
+	if _, has := file2[KaptMatchDirsKey]; has {
+		t.Fatalf("file.matchDirectories must be absent when no entry ends in /, got %v", file2[KaptMatchDirsKey])
+	}
+	if items2, ok := file2[KaptMatchPathsKey].([]any); !ok || len(items2) != 1 || items2[0].(map[string]any)["path"] != "/etc/hosts" {
+		t.Fatalf("file.matchPaths must be [{path: /etc/hosts}], got %v", file2[KaptMatchPathsKey])
+	}
+
+	// With ONLY a trailing-/ entry the file block is a pure directory match:
+	// matchDirectories present, and NO matchPaths key at all (mutation 4 on
+	// #410: an unconditional matchPaths emission survives the other cases but
+	// not this one).
+	ep3 := policy.Translate(policy.EffectivePolicy{
+		Files: []string{"/etc/ssl/certs/"},
+	}, "l1-proxy.ns.svc", "")
+	spec3 := EmitKubeArmorPolicy("loop-x", "ns-x", ep3).Object["spec"].(map[string]any)
+	file3, ok := spec3[KaptFileKey].(map[string]any)
+	if !ok {
+		t.Fatal("file block must exist for a directory-only files allow")
+	}
+	dirs3, ok := file3[KaptMatchDirsKey].([]any)
+	if !ok || len(dirs3) != 1 {
+		t.Fatalf("file.matchDirectories must have exactly one item, got %v", file3[KaptMatchDirsKey])
+	}
+	if dm3 := dirs3[0].(map[string]any); dm3["dir"] != "/etc/ssl/certs/" || dm3["recursive"] != true {
+		t.Fatalf("matchDirectories item must be {dir: /etc/ssl/certs/, recursive: true}, got %v", dm3)
+	}
+	if _, ok := file3[KaptMatchPathsKey]; ok {
+		t.Fatalf("file.matchPaths must be absent for a directory-only files allow, got %v", file3[KaptMatchPathsKey])
+	}
+}
+
 // P1 #2: network matchDNSQueries items are objects {domain}, matchProtocols
 // items are objects {protocol}. P2: a host:port allow carries the port (does
 // not widen to host:*).

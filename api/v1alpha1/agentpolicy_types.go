@@ -106,6 +106,7 @@ type AgentPolicySpec struct {
 
 	// files is the paths the agent may access (e.g. "/workspace"). The agent's
 	// own workspace is always accessible; a path here grants access elsewhere.
+	// An entry ending in "/" grants that directory recursively (KubeArmor matchDirectories); any other entry is an exact path (D113).
 	// +optional
 	Files []string `json:"files,omitempty"`
 

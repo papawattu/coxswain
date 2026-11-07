@@ -190,12 +190,29 @@ func emitKubeArmorPolicy(loopName, namespace string, ep policy.EnginePolicy) *un
 			KaptMatchProtoKey: toProtocolItems(protocols),
 		}
 	}
-	// file allows → file.matchPaths items ({path}).
+	// file allows → file.matchPaths items ({path}); an entry ending in "/"
+	// → file.matchDirectories item ({dir, recursive: true}) (D113).
 	if len(files) > 0 {
-		spec[KaptFileKey] = map[string]any{
-			kaptActionKey:     kaptAllowAction,
-			KaptMatchPathsKey: toPathItems(files),
+		var paths, dirs []string
+		for _, f := range files {
+			if strings.HasSuffix(f, "/") {
+				dirs = append(dirs, f)
+			} else {
+				paths = append(paths, f)
+			}
 		}
+		fileRule := map[string]any{kaptActionKey: kaptAllowAction}
+		if len(paths) > 0 {
+			fileRule[KaptMatchPathsKey] = toPathItems(paths)
+		}
+		if len(dirs) > 0 {
+			items := make([]any, 0, len(dirs))
+			for _, d := range dirs {
+				items = append(items, map[string]any{"dir": d, "recursive": true})
+			}
+			fileRule[KaptMatchDirsKey] = items
+		}
+		spec[KaptFileKey] = fileRule
 	}
 
 	// D110 (P6b-4): learn mode records every exec and file access. Under D46

@@ -105,7 +105,7 @@ func TestParseLineKubeArmorAgentStdout(t *testing.T) {
 		t.Fatalf("test data = %d lines, want 2", len(lines))
 	}
 	wantOps := []string{"Process", "File"}
-	wantTime, _ := time.Parse(time.RFC3339Nano, "2026-11-07T16:57:43Z")
+	wantTimes := []string{"2026-11-07T16:57:43.771521Z", "2026-11-07T16:57:43.759810Z"}
 	for i, line := range lines {
 		al, ok := ParseLine([]byte(line))
 		if !ok {
@@ -117,8 +117,9 @@ func TestParseLineKubeArmorAgentStdout(t *testing.T) {
 		if al.Namespace != "samples" || al.Pod != "p6b-learn-verify-1-zhk26" {
 			t.Errorf("line %d: workload = %s/%s, want samples/p6b-learn-verify-1-zhk26", i+1, al.Namespace, al.Pod)
 		}
-		if al.Time.UTC().Truncate(time.Second).Unix() != wantTime.Unix() {
-			t.Errorf("line %d: time = %s, want %s to the second", i+1, al.Time.Format(time.RFC3339), wantTime.Format(time.RFC3339))
+		wantTime, _ := time.Parse(time.RFC3339Nano, wantTimes[i])
+		if !al.Time.Equal(wantTime) {
+			t.Errorf("line %d: time = %s, want exactly %s", i+1, al.Time.Format(time.RFC3339Nano), wantTimes[i])
 		}
 		if al.Blocked {
 			t.Errorf("line %d: an audit-mode (Allowed) line must not read as blocked", i+1)
@@ -126,6 +127,30 @@ func TestParseLineKubeArmorAgentStdout(t *testing.T) {
 		if al.Source != SourceKubeArmor {
 			t.Errorf("line %d: source = %q, want %q", i+1, al.Source, SourceKubeArmor)
 		}
+	}
+}
+
+// TestParseLineKubeArmorAgentStdoutTimestampOnly covers F62 mutation D: the
+// agent-stdout lines carry both updatedTime (nanoseconds) and timestamp
+// (Unix seconds); with updatedTime gone, the relay must fall back to the
+// Unix-second clock rather than drop the line.
+func TestParseLineKubeArmorAgentStdoutTimestampOnly(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("testdata", "kubearmor-agent-stdout.jsonl"))
+	if err != nil {
+		t.Fatalf("reading the captured agent-stdout lines: %v", err)
+	}
+	line, _, _ := strings.Cut(strings.TrimSpace(string(data)), "\n")
+	const stamp = `"updatedTime":"2026-11-07T16:57:43.771521Z",`
+	out := strings.Replace(line, stamp, "", 1)
+	if out == line {
+		t.Fatalf("line 1 does not contain %s", stamp)
+	}
+	al, ok := ParseLine([]byte(out))
+	if !ok {
+		t.Fatalf("an agent-stdout line without updatedTime must still decode (timestamp fallback)")
+	}
+	if !al.Time.Equal(time.Unix(1794070663, 0)) {
+		t.Errorf("time = %s, want the Unix-seconds fallback %s", al.Time.Format(time.RFC3339Nano), time.Unix(1794070663, 0))
 	}
 }
 

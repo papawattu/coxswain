@@ -476,7 +476,7 @@ stay empty:
 kubectl -n kubearmor patch kubearmorconfig kubearmorconfig-default --type merge -p '{"spec":{"globalEnv":[{"name":"LOGPATH","value":"stdout"}]}}'
 
 # Verify: the agent log's "Final Configuration" line shows the applied value
-kubectl -n kubearmor logs -l kubearmor-app=kubearmor -c kubearmor | grep -o 'LogPath:[a-z]*' | sort -u
+kubectl -n kubearmor logs -l kubearmor-app=kubearmor -c kubearmor --tail=-1 | grep 'Final Configuration' | grep -o 'LogPath:[a-z]*' | sort -u
 # Expected: LogPath:stdout
 ```
 

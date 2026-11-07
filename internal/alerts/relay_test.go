@@ -143,14 +143,30 @@ func (s *blockingSource) followCount() int {
 // perPodSource is a test-only source keyed by pod: each pod's stream feeds its
 // own lines ("" = none) and then blocks until the ctx is done, like
 // blockingSource. It lets a spec where one peer has no line at all coexist
-// with a peer that has one.
+// with a peer that has one. follows counts Follow calls so a spec can wait
+// for a specific stream to attach. A zero-Node engine stream is re-followed on
+// every discovery pass (a sandbox's node may not be known yet), so an engine
+// attach is counted twice and the proxy spec waits on two counts: that
+// guarantees the engine's engineHealthy state is set, not just that its first
+// stream happened to open.
 type perPodSource struct {
-	mu    sync.Mutex
-	lines map[string][]string
+	mu      sync.Mutex
+	lines   map[string][]string
+	follows int
+}
+
+func (s *perPodSource) followCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.follows
 }
 
 func (s *perPodSource) Follow(ctx context.Context, namespace, pod, _ string, _ *time.Time) (io.ReadCloser, error) {
 	s.mu.Lock()
+	s.follows++
+	if namespace == "kubearmor" {
+		s.follows++
+	}
 	batch := append([]string{}, s.lines[namespace+"/"+pod]...)
 	s.mu.Unlock()
 	pr, pw := io.Pipe()
@@ -787,6 +803,10 @@ func TestRelayProxyLineBeforeEngineLineIsNotHealthy(t *testing.T) {
 	}
 	holder := startTestRelay(t, relay)
 
+	// The engine attaches first (as on a real cluster): wait for its stream to
+	// be followed and for the Loop to settle on Unavailable/NoAlerts with no
+	// line — that is the state engineOK must reject the proxy's line in.
+	waitFor(t, "the engine stream to attach", func() bool { return src.followCount() >= 2 })
 	waitFor(t, "the Loop to be Unavailable/NoAlerts once the engine has attached with no line", func() bool {
 		s, ok := holder.Snapshot(f62UID)
 		return ok && s.Health == HealthUnavailable && s.Reason == ReasonNoAlerts

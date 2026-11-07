@@ -140,6 +140,52 @@ func (s *blockingSource) followCount() int {
 	return s.follows
 }
 
+// perPodSource is a test-only source keyed by pod: each pod's stream feeds its
+// own lines ("" = none) and then blocks until the ctx is done, like
+// blockingSource. It lets a spec where one peer has no line at all coexist
+// with a peer that has one. A pod with a gate channel holds the FOLLOW ITSELF
+// back until the test closes the gate: Follow does not return (does not create
+// the pipe) while the gate is open, so the gate holds the relay's ATTACH for
+// that peer, not just its lines — the relay cannot even reach attachedNow —
+// and a spec can order when one peer's attach happens relative to the others.
+// Once the gate opens, the lines are written as normal.
+type perPodSource struct {
+	mu    sync.Mutex
+	lines map[string][]string
+	gate  map[string]chan struct{}
+}
+
+func (s *perPodSource) Follow(ctx context.Context, namespace, pod, _ string, _ *time.Time) (io.ReadCloser, error) {
+	s.mu.Lock()
+	batch := append([]string{}, s.lines[namespace+"/"+pod]...)
+	var g chan struct{}
+	if s.gate != nil {
+		g = s.gate[namespace+"/"+pod]
+	}
+	s.mu.Unlock()
+	if g != nil {
+		// Block the attach itself (before the pipe is created), not just the
+		// lines: until the gate opens the relay's Follow never returns, so its
+		// attachedNow for this peer cannot run.
+		select {
+		case <-g:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	pr, pw := io.Pipe()
+	go func() {
+		for _, line := range batch {
+			if _, err := pw.Write([]byte(line + "\n")); err != nil {
+				return
+			}
+		}
+		<-ctx.Done()
+		_ = pw.CloseWithError(ctx.Err())
+	}()
+	return pr, nil
+}
+
 // fakeAttributor maps pods to Loops and Loops to UIDs.
 type fakeAttributor struct {
 	pods   map[string][2]string // "ns/pod" -> {loopNS, loopName}
@@ -609,7 +655,9 @@ func TestRelayProxyStreamAloneIsNotHealthy(t *testing.T) {
 	relay := f62NewRelay(src)
 	relay.Discoverer = disc
 	relay.Attributor = &fakeAttributor{
-		pods: map[string][2]string{f62LoopNS + "/l1-egress-proxy": {f62LoopNS, f62LoopName}},
+		pods: map[string][2]string{
+			f62LoopNS + "/l1-egress-proxy": {f62LoopNS, f62LoopName},
+		},
 		uids: map[string]types.UID{f62LoopNS + "/" + f62LoopName: f62UID},
 	}
 	holder := startTestRelay(t, relay)
@@ -664,4 +712,165 @@ func TestRelayEngineAbsentIsUnavailable(t *testing.T) {
 		s, ok := holder.Snapshot(f62UID)
 		return ok && s.Health == HealthUnavailable && s.Reason == ReasonEngineUnavailable
 	})
+}
+
+// TestRelayEngineWithNoLineIsNoAlerts is owner D111: an engine stream that
+// attaches but never produces a decoded alert line (KubeArmor's default
+// logPath=none) must NOT publish a count of 0 — the Loop is Unavailable with
+// ReasonNoAlerts until a real line arrives.
+//
+// Mutation: treat attach as healthy → the Loop becomes Healthy.
+func TestRelayEngineWithNoLineIsNoAlerts(t *testing.T) {
+	src := &blockingSource{batch: []string{}}
+	holder := f62Fixture(t, src)
+
+	waitFor(t, "the engine stream to attach", func() bool { return src.followCount() >= 1 })
+	waitFor(t, "an unavailable stream with ReasonNoAlerts", func() bool {
+		s, ok := holder.Snapshot(f62UID)
+		return ok && s.Health == HealthUnavailable && s.Reason == ReasonNoAlerts
+	})
+	time.Sleep(30 * time.Millisecond)
+	if s, ok := holder.Snapshot(f62UID); ok && s.Health == HealthHealthy {
+		t.Fatalf("the Loop became Healthy with no decoded engine line; its zero count would be a false zero (D111)")
+	}
+	if s, _ := holder.Snapshot(f62UID); s.Health != HealthUnavailable || s.Reason != ReasonNoAlerts {
+		t.Errorf("health = %q reason = %q, want Unavailable/%q", s.Health, s.Reason, ReasonNoAlerts)
+	}
+}
+
+// TestRelayWorkloadAfterAttachWithNoLineIsNoAlerts is the same rule as
+// TestRelayEngineWithNoLineIsNoAlerts, from the other side: a sandbox pod that
+// the relay discovers AFTER its engine stream has already attached, while that
+// stream has produced no line, must be Unknown (ReasonNoAlerts) — never a
+// published 0 from the later discovery pass.
+//
+// Mutation: register a discovered workload before the engine's no-line state is
+// reflected (or start the engine follower after registering workloads so the
+// first discovery pass can publish Healthy from a pre-existing line-less
+// engine) → the Loop is Healthy or absent instead of Unavailable.
+func TestRelayWorkloadAfterAttachWithNoLineIsNoAlerts(t *testing.T) {
+	src := &blockingSource{batch: []string{}}
+	relay := f62NewRelay(src)
+	disc := &fixedDiscoverer{peers: []Peer{
+		{Namespace: "kubearmor", Pod: "agent-node-1", Kind: PeerEngine, Source: SourceKubeArmor},
+	}}
+	relay.Discoverer = disc
+	relay.Interval = 20 * time.Millisecond
+	holder := startTestRelay(t, relay)
+
+	waitFor(t, "the engine stream to attach", func() bool { return src.followCount() >= 1 })
+	disc.setPeers(
+		Peer{Namespace: "kubearmor", Pod: "agent-node-1", Kind: PeerEngine, Source: SourceKubeArmor},
+		Peer{Namespace: f62Sandbox, Pod: f62SandboxP, Kind: PeerWorkload},
+	)
+	waitFor(t, "an unavailable sandbox with ReasonNoAlerts", func() bool {
+		s, ok := holder.Snapshot(f62UID)
+		return ok && s.Health == HealthUnavailable && s.Reason == ReasonNoAlerts
+	})
+	time.Sleep(30 * time.Millisecond)
+	if s, ok := holder.Snapshot(f62UID); ok && s.Health == HealthHealthy {
+		t.Fatalf("the Loop became Healthy with a workload discovered after attach and no decoded engine line (D111)")
+	}
+}
+
+// TestRelayProxyLineBeforeEngineLineIsNotHealthy is E3's timing half: the
+// egress-proxy line can be counted BEFORE the engine stream has produced a
+// line (the engine's logPath may be empty), so the proxy's count must not
+// publish a Healthy 1 — the Loop stays not-Healthy until the engine has a real
+// line of its own. Discovery runs exactly once (relay.Interval = time.Hour),
+// so the re-degrade on a later discovery pass cannot mask the Healthy state
+// the mutated engineOK would set when the proxy attaches. The gate holds the
+// proxy's ATTACH (its Follow does not return until the gate opens), so the
+// proxy's line is only counted after the Loop has settled on
+// Unavailable/NoAlerts. That settle IS the mutation's tripwire: the only path
+// that publishes ReasonNoAlerts is the engine-side no-line decision, so a
+// relay that never settles on NoAlerts (a mutation that deletes it, or one
+// that makes the engine attach publish Healthy immediately) times out in the
+// wait below, before the gate opens, and the spec FAILs.
+//
+// Mutation (engineOK, as named in the review): replace the engine-side
+// no-line decision (the `if !sawLine` branch of attachedNow that publishes
+// NoAlerts) with a noteHealthy: with it the Loop goes Healthy on the engine
+// attach and never settles on NoAlerts, so the spec FAILs on the wait. The
+// literal one-line engineOK mutation is masked by a first-write race the spec
+// cannot remove: Holder.degrade refuses to overwrite a state that is already
+// Unavailable, so the engine's NoAlerts settles before the proxy's gated
+// attach completes, and the noteHealthy the mutated proxy attach would write
+// loses the race. (The reviewer's 20ms-periodic design has the same race in
+// addition to the periodic-pass re-degrade the gate closes.)
+func TestRelayProxyLineBeforeEngineLineIsNotHealthy(t *testing.T) {
+	proxyGate := make(chan struct{})
+	src := &perPodSource{
+		lines: map[string][]string{
+			// The engine (kubearmor/agent-node-1) has no lines at all.
+			f62LoopNS + "/l1-egress-proxy": {
+				`{"time":"2026-10-26T10:00:00Z","loop":"l1","namespace":"ns1","source":"egress-proxy",` +
+					`"action":"connect","target":"api:443","verdict":"blocked"}`,
+			},
+		},
+		gate: map[string]chan struct{}{
+			f62LoopNS + "/l1-egress-proxy": proxyGate,
+		},
+	}
+	relay := f62NewRelay(src)
+	// All three peers are discovered in a single pass.
+	disc := &fixedDiscoverer{peers: []Peer{
+		{Namespace: "kubearmor", Pod: "agent-node-1", Kind: PeerEngine, Node: "node-a", Source: SourceKubeArmor},
+		{Namespace: f62Sandbox, Pod: f62SandboxP, Kind: PeerWorkload, Node: "node-a"},
+		{Namespace: f62LoopNS, Pod: "l1-egress-proxy", Kind: PeerProxy, Node: "node-a", Source: SourceEgress},
+	}}
+	relay.Discoverer = disc
+	relay.Interval = time.Hour // discovery runs exactly once
+	relay.Attributor = &fakeAttributor{
+		pods: map[string][2]string{
+			f62Sandbox + "/" + f62SandboxP: {f62LoopNS, f62LoopName},
+			f62LoopNS + "/l1-egress-proxy": {f62LoopNS, f62LoopName},
+		},
+		uids: map[string]types.UID{f62LoopNS + "/" + f62LoopName: f62UID},
+	}
+	holder := startTestRelay(t, relay)
+
+	// The engine attaches with no line and the Loop settles on
+	// Unavailable/NoAlerts — the tripwire: the only thing that publishes
+	// ReasonNoAlerts is the engine-side no-line decision, so its absence
+	// (mutation) is a timeout here.
+	waitFor(t, "the Loop to be Unavailable/NoAlerts once the engine has attached with no line", func() bool {
+		s, ok := holder.Snapshot(f62UID)
+		return ok && s.Health == HealthUnavailable && s.Reason == ReasonNoAlerts
+	})
+	// Open the gate: the proxy's attach was held by it, so its line is
+	// counted now, while the engine still has no line, and engineOK must keep
+	// the Loop not-Healthy.
+	close(proxyGate)
+	waitFor(t, "the proxy's line to be counted", func() bool {
+		s, ok := holder.Snapshot(f62UID)
+		return ok && s.Count == 1
+	})
+	time.Sleep(30 * time.Millisecond)
+	if s, _ := holder.Snapshot(f62UID); s.Health == HealthHealthy {
+		t.Fatalf("the Loop is Healthy on a proxy line that arrived before any engine line (E3/D111); a Healthy 1 would read as a complete count")
+	}
+}
+
+// TestRelayFirstEngineLineMakesItHealthy is owner D111's other half: the first
+// decoded engine line (an Allow is enough — it is still real engine output) is
+// what makes the Loop's count publishable, here with count 0.
+//
+// Mutation: never mark the node as having seen a line → the Loop stays
+// Unavailable.
+func TestRelayFirstEngineLineMakesItHealthy(t *testing.T) {
+	base := time.Date(2026, 10, 26, 10, 0, 0, 0, time.UTC)
+	src := &blockingSource{batch: []string{
+		kubeArmorBlock(base.Add(time.Second), "Allow", f62Sandbox, f62SandboxP, "api.example.com:443"),
+	}}
+	holder := f62Fixture(t, src)
+
+	waitFor(t, "a healthy count of 0 after the first engine line", func() bool {
+		s, ok := holder.Snapshot(f62UID)
+		return ok && s.Health == HealthHealthy && s.Count == 0
+	})
+	time.Sleep(20 * time.Millisecond)
+	if s, _ := holder.Snapshot(f62UID); s.Health != HealthHealthy {
+		t.Errorf("health = %q reason = %q, want Healthy after the first engine line", s.Health, s.Reason)
+	}
 }

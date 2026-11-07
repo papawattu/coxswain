@@ -174,6 +174,28 @@ var _ = Describe("F62: the blocked-action count is relayed into status", func() 
 		Expect(cond.Message).To(ContainSubstring("UNKNOWN, not zero"))
 	})
 
+	It("writes UNKNOWN with AuditStreamNoAlerts and names logPath=stdout (D111)", func() {
+		ns := f62Ns("f62-noalerts")
+		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+
+		name := "f62noalerts"
+		audit := newF62Audit()
+		uid := f62NewLoop(ns, name)
+		r := f62Reconciler(audit)
+
+		audit.Set(uid, alerts.Snapshot{Health: alerts.HealthUnavailable, Reason: alerts.ReasonNoAlerts})
+		loop := s5aReconcile(r, ns, name)
+		if loop.Status.Policy != nil {
+			Expect(loop.Status.Policy.BlockedCount).To(BeNil(),
+				"no engine line yet means the count is unknown, not zero")
+		}
+		cond := f62Blocks(loop)
+		Expect(cond).NotTo(BeNil())
+		Expect(cond.Status).To(Equal(metav1.ConditionUnknown))
+		Expect(cond.Reason).To(Equal(alerts.ReasonNoAlerts))
+		Expect(cond.Message).To(ContainSubstring("logPath=stdout"))
+	})
+
 	It("writes nothing at all when the relay has no news for the Loop", func() {
 		ns := f62Ns("f62-nonews")
 		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()

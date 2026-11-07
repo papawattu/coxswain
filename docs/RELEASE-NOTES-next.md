@@ -143,6 +143,14 @@ before.
 
 **On upgrade:** set `LOGPATH=stdout` with `kubectl -n kubearmor patch kubearmorconfig kubearmorconfig-default --type merge -p '{"spec":{"globalEnv":[{"name":"LOGPATH","value":"stdout"}]}}'` and check the agent log's `Final Configuration` line shows `LogPath:stdout`.
 
+### F62b: no false zero before the first KubeArmor line (D111) — #409
+
+**What was wrong:** the relay called the engine stream healthy on attach, so with `logPath=none` every Loop showed `blockedCount: 0`.
+
+**What changed:** healthy only after one decoded engine line from that node; until then `PolicyBlocked=Unknown`, reason `AuditStreamNoAlerts`.
+
+**On upgrade:** a Loop on a node whose KubeArmor writes no stdout now shows Unknown instead of 0; set `logPath=stdout`.
+
 ### D79(b) part 1: the wall clock pauses while a Loop waits at AwaitingApproval — #402
 
 **What was wrong:** a Manual-mode Loop waiting for `cox approve` at `AwaitingApproval` kept using up its `spec.budget.maxWallClock`, so a slow approver could exhaust the budget before any work ran.

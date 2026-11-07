@@ -57,6 +57,9 @@ const (
 	// stream is not producing the audit format it expected, so it cannot be
 	// trusted either. One bad line is tolerated (see maxDecodeFailures).
 	ReasonUndecodable = "AuditStreamUndecodable"
+	// ReasonNoAlerts is an engine stream that is attached but has produced no
+	// decoded alert line yet (owner D111): the count is still UNKNOWN.
+	ReasonNoAlerts = "AuditStreamNoAlerts"
 )
 
 // Action values a parsed alert can carry. The engine's block verdict is the

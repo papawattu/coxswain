@@ -357,6 +357,10 @@ type Relay struct {
 	// engineFailed is "the engine stream could not be read on the node(s) we
 	// know": a sandbox pod on such a node is UNKNOWN, never 0 (I32).
 	engineFailedByNode map[string]bool
+	// engineLineByNode marks the nodes whose engine stream has produced at
+	// least one decoded alert line (owner D111): until then the stream is
+	// attached but the count is still UNKNOWN, never 0.
+	engineLineByNode map[string]bool
 	// workloads maps a sandbox pod's Loop UID to the node it runs on, so an
 	// engine pod's failure degrades only the Loops it serves (pi3 E6).
 	workloads map[types.UID]string
@@ -392,6 +396,9 @@ func (r *Relay) Start(ctx context.Context) error {
 	}
 	if r.engineFailedByNode == nil {
 		r.engineFailedByNode = map[string]bool{}
+	}
+	if r.engineLineByNode == nil {
+		r.engineLineByNode = map[string]bool{}
 	}
 	if r.workloads == nil {
 		r.workloads = map[types.UID]string{}
@@ -438,7 +445,12 @@ func (r *Relay) Start(ctx context.Context) error {
 				r.workloadSeen(ctx, peer, enginePeers > 0)
 				continue
 			}
-			r.startFollower(ctx, key, peer)
+		}
+		for _, peer := range peers {
+			if peer.Kind != PeerWorkload {
+				key := peer.Namespace + "/" + peer.Pod + "/" + peer.Container
+				r.startFollower(ctx, key, peer)
+			}
 		}
 		if err != nil {
 			// R1: a partial pass leaves every follower it did not see running.
@@ -566,6 +578,9 @@ func (r *Relay) follow(ctx context.Context, peer Peer) {
 			ts := al.Time
 			since = &ts
 			r.accept(ctx, peer, al)
+			if peer.Kind == PeerEngine {
+				r.markEngineLine(peer)
+			}
 		}
 		if err := scanner.Err(); err != nil && ctx.Err() == nil {
 			log.V(1).Info("alert relay: stream read ended", "error", err.Error())
@@ -693,6 +708,7 @@ func (r *Relay) attachedNow(ctx context.Context, peer Peer) {
 		// re-read is complete evidence — pi3 E6).
 		r.engineHealthy = true
 		delete(r.engineFailedByNode, peer.Node)
+		sawLine := r.engineLineByNode[peer.Node]
 		uids := make([]types.UID, 0, len(r.workloads))
 		for uid, node := range r.workloads {
 			if peer.Node == "" || node == "" || node == peer.Node {
@@ -701,7 +717,13 @@ func (r *Relay) attachedNow(ctx context.Context, peer Peer) {
 		}
 		r.mu.Unlock()
 		for _, uid := range uids {
-			r.Holder.noteHealthy(uid)
+			if sawLine {
+				r.Holder.noteHealthy(uid)
+			} else {
+				// The stream is attached but has not produced a line yet:
+				// the count is still UNKNOWN, never 0 (owner D111).
+				r.Holder.degrade(uid, HealthUnavailable, ReasonNoAlerts)
+			}
 		}
 		return
 	}
@@ -742,14 +764,47 @@ func (r *Relay) degraded(ctx context.Context, peer Peer, health Health, reason s
 	}
 }
 
-// engineOK reports whether an engine stream is attached for the given node.
+// engineOK reports whether an engine stream is attached AND has produced a
+// decoded alert line for the given node (owner D111). When node is empty, a
+// line seen on any node suffices.
 func (r *Relay) engineOK(node string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if !r.engineHealthy {
 		return false
 	}
-	return node == "" || !r.engineFailedByNode[node]
+	if node == "" {
+		for _, ok := range r.engineLineByNode {
+			if ok {
+				return true
+			}
+		}
+		return false
+	}
+	return r.engineLineByNode[node] && !r.engineFailedByNode[node]
+}
+
+// markEngineLine remembers the first decoded engine line for the node and
+// marks the Loops it serves healthy (owner D111: an attached engine stream
+// proves nothing until it has actually produced a line).
+func (r *Relay) markEngineLine(peer Peer) {
+	r.mu.Lock()
+	first := !r.engineLineByNode[peer.Node]
+	if first {
+		r.engineLineByNode[peer.Node] = true
+	}
+	uids := make([]types.UID, 0, len(r.workloads))
+	for uid, node := range r.workloads {
+		if peer.Node == "" || node == "" || node == peer.Node {
+			uids = append(uids, uid)
+		}
+	}
+	r.mu.Unlock()
+	if first {
+		for _, uid := range uids {
+			r.Holder.noteHealthy(uid)
+		}
+	}
 }
 
 // workloadSeen records a sandbox pod: with the engine stream attached on its
@@ -766,12 +821,25 @@ func (r *Relay) workloadSeen(ctx context.Context, peer Peer, engineDiscovered bo
 	r.workloads[uid] = peer.Node
 	engineHealthy := r.engineHealthy
 	failed := r.engineFailedByNode[peer.Node]
+	sawLine := r.engineLineByNode[peer.Node]
 	if peer.Node == "" {
 		failed = len(r.engineFailedByNode) > 0
+		for _, ok := range r.engineLineByNode {
+			if ok {
+				sawLine = true
+				break
+			}
+		}
 	}
 	r.mu.Unlock()
 	switch {
 	case engineHealthy && !failed:
+		if !sawLine {
+			// The stream attached but has produced no alert line yet: the
+			// count is still UNKNOWN, never 0 (owner D111).
+			r.Holder.degrade(uid, HealthUnavailable, ReasonNoAlerts)
+			return
+		}
 		if !peer.Created.IsZero() && peer.Created.Before(r.startedAt) {
 			// The sandbox existed before the relay did: its earlier life was
 			// not observed, so this is a gap, not a complete count (pi3 E8).

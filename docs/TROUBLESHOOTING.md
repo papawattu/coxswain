@@ -1388,8 +1388,9 @@ and check the agent log's `Final Configuration` line, which shows `LogPath:stdou
 
 **Lines arrive, but none from the Loop's sandbox (or none at all in learn mode).**
 KubeArmor writes a visibility event for every pod on the node, so with the
-agent logging to stdout the log can rotate so fast that the Loop's own sandbox
-events never reach the operator's stream. And with `defaultVisibility: none`,
+agent logging to stdout the log rotates every few seconds; on kind-ref the
+Loop's own sandbox events were then missing from the operator's stream (the
+cause is not proven). And with `defaultVisibility: none`,
 KubeArmor emits no alerts at all — not even the policy-matched Audit ones — so
 learn mode records nothing. Keep cluster-wide visibility off and turn it on
 only for the namespaces that run Loops: patch the KubeArmorConfig to

@@ -1387,6 +1387,17 @@ kubectl -n kubearmor patch kubearmorconfig kubearmorconfig-default --type merge 
 and check the agent log's `Final Configuration` line, which shows `LogPath:stdout`
 (the `Arguments` line shows only the command-line flag, which stays `none`).
 
+**Lines arrive, but none from the Loop's sandbox (or none at all in learn mode).**
+KubeArmor writes a visibility event for every pod on the node, so with the
+agent logging to stdout the log rotates every few seconds; on kind-ref the
+Loop's own sandbox events were then missing from the operator's stream (the
+cause is not proven). And with `defaultVisibility: none`,
+KubeArmor emits no alerts at all — not even the policy-matched Audit ones — so
+learn mode records nothing. Keep cluster-wide visibility off and turn it on
+only for the namespaces that run Loops: patch the KubeArmorConfig to
+defaultVisibility none and annotate each Loop namespace with
+`kubearmor-visibility=process,file,network` (QUICKSTART Step 3).
+
 The message also names how many alerts could not be attributed to **any** Loop:
 a sandbox pod without the operator's `coxswain.io/loop` label (hand-created, or
 an old pod) is a diagnostic, never a guessed attribution.

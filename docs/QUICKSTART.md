@@ -480,6 +480,23 @@ kubectl -n kubearmor logs -l kubearmor-app=kubearmor -c kubearmor --tail=-1 | gr
 # Expected: LogPath:stdout
 ```
 
+KubeArmor writes a visibility event for EVERY pod on the node — with the
+agent logging to stdout, the log rotated about every 20s on the kind-ref
+cluster, and the Loop's own sandbox events were missing from the operator's
+stream. With `defaultVisibility: none`, KubeArmor emits no alerts at all,
+not even the policy-matched Audit ones, so learn mode records nothing. The
+fix keeps cluster-wide visibility off and turns it on only for namespaces
+that run Loops:
+
+```bash
+# Keep cluster-wide visibility off, and turn it on only for namespaces that run Loops
+kubectl -n kubearmor patch kubearmorconfig kubearmorconfig-default --type merge -p '{"spec":{"defaultVisibility":"none"}}'
+kubectl annotate ns <loop-namespace> kubearmor-visibility=process,file,network --overwrite
+# Verify: the latest line for the namespace shows File/Process/Network true
+kubectl -n kubearmor logs -l kubearmor-app=kubearmor -c kubearmor --tail=-1 | grep -o 'Namespace <loop-namespace> visibility configured {[^}]*}' | tail -1
+# Expected: ... {File:true Process:true Network:true ...}
+```
+
 ### Step 4: Install agent-sandbox
 
 ```bash

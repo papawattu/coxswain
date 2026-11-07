@@ -143,9 +143,12 @@ func (s *blockingSource) followCount() int {
 // perPodSource is a test-only source keyed by pod: each pod's stream feeds its
 // own lines ("" = none) and then blocks until the ctx is done, like
 // blockingSource. It lets a spec where one peer has no line at all coexist
-// with a peer that has one. A pod with a gate channel holds its lines back
-// until the test closes the gate (or the ctx is done), so a spec can order
-// when one peer's lines reach the relay relative to the others.
+// with a peer that has one. A pod with a gate channel holds the FOLLOW ITSELF
+// back until the test closes the gate: Follow does not return (does not create
+// the pipe) while the gate is open, so the gate holds the relay's ATTACH for
+// that peer, not just its lines — the relay cannot even reach attachedNow —
+// and a spec can order when one peer's attach happens relative to the others.
+// Once the gate opens, the lines are written as normal.
 type perPodSource struct {
 	mu    sync.Mutex
 	lines map[string][]string
@@ -160,15 +163,18 @@ func (s *perPodSource) Follow(ctx context.Context, namespace, pod, _ string, _ *
 		g = s.gate[namespace+"/"+pod]
 	}
 	s.mu.Unlock()
+	if g != nil {
+		// Block the attach itself (before the pipe is created), not just the
+		// lines: until the gate opens the relay's Follow never returns, so its
+		// attachedNow for this peer cannot run.
+		select {
+		case <-g:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
 	pr, pw := io.Pipe()
 	go func() {
-		if g != nil {
-			select {
-			case <-g:
-			case <-ctx.Done():
-				return
-			}
-		}
 		for _, line := range batch {
 			if _, err := pw.Write([]byte(line + "\n")); err != nil {
 				return
@@ -773,8 +779,9 @@ func TestRelayWorkloadAfterAttachWithNoLineIsNoAlerts(t *testing.T) {
 // publish a Healthy 1 — the Loop stays not-Healthy until the engine has a real
 // line of its own. Discovery runs exactly once (relay.Interval = time.Hour),
 // so the re-degrade on a later discovery pass cannot mask the Healthy state
-// the mutated engineOK would set when the proxy attaches; the proxy's own
-// line is held back by a gate until after the Loop has settled on
+// the mutated engineOK would set when the proxy attaches. The gate holds the
+// proxy's ATTACH (its Follow does not return until the gate opens), so the
+// proxy's line is only counted after the Loop has settled on
 // Unavailable/NoAlerts. That settle IS the mutation's tripwire: the only path
 // that publishes ReasonNoAlerts is the engine-side no-line decision, so a
 // relay that never settles on NoAlerts (a mutation that deletes it, or one
@@ -831,8 +838,9 @@ func TestRelayProxyLineBeforeEngineLineIsNotHealthy(t *testing.T) {
 		s, ok := holder.Snapshot(f62UID)
 		return ok && s.Health == HealthUnavailable && s.Reason == ReasonNoAlerts
 	})
-	// Release the proxy's line: it is counted now, while the engine still has
-	// no line, so engineOK must keep the Loop not-Healthy.
+	// Open the gate: the proxy's attach was held by it, so its line is
+	// counted now, while the engine still has no line, and engineOK must keep
+	// the Loop not-Healthy.
 	close(proxyGate)
 	waitFor(t, "the proxy's line to be counted", func() bool {
 		s, ok := holder.Snapshot(f62UID)

@@ -879,13 +879,21 @@ enforcing), otherwise the usual hold applies (e.g. `NodeNotEnforcing`).
 
 **What learn mode records.** In learn mode the agent's KubeArmorPolicy carries
 catch-all **Audit** rules for process and file — every directory, recursive —
-so KubeArmor records every exec and file access. Without them (the agent
+so KubeArmor is asked to record every exec and file access. Without
+them (the agent
 policy is only a DNS/network fence, D46) Audit recorded nothing; a
 kind-ref run before the catch-all rules landed got 0 records. The egress
 proxy also runs in learn mode even when no policy has network allows: its
 allowlist is then empty, so it blocks every host and records each connect, and
 `cox policy suggest` turns those connects into network allows. Enforcing mode
 is unchanged: no catch-all rules, and no egress proxy without network allows.
+
+**Known gap (#407 kind-ref runs).** End to end, `cox policy suggest` does not
+yet get records from a real cluster: the operator's relay does not parse
+KubeArmor's stdout JSON (its keys are camelCase), and on kind-ref KubeArmor
+reported no events from the agent's sandbox pod (cause under investigation).
+A fix follows in its own PR. KubeArmor must also run with `logPath=stdout`
+for the relay to see any alert.
 
 **Mixed Loops (D108).** If an enforcing policy is also referenced, the Loop
 enforces the union of every policy's allows (`spec.action: Block`); the

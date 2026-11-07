@@ -3879,7 +3879,7 @@ func needsEgressProxy(ctx context.Context, r *LoopReconciler, loop *coxv1alpha1.
 // effectivePolicyNetwork returns the union of the network allows across the
 // Loop's referenced AgentPolicies (the egress proxy's allowlist, I42b). The
 // second return value (hasAllows) is false when there are no network allows
-// (the egress proxy is not needed). Errors are returned (never swallowed):
+// (the egress proxy is not needed). In learn mode (every referenced policy auditOnly) it is true even with no allows (D110). Errors are returned (never swallowed):
 // a missing or unreadable referenced policy makes the egress-proxy gate fail
 // closed (P3 review: a second copy of the union that swallowed Get errors
 // would create the egress proxy with a nil union if the ordering with
@@ -3889,7 +3889,9 @@ func (r *LoopReconciler) effectivePolicyNetwork(ctx context.Context, loop *coxv1
 	if err != nil {
 		return nil, false, err
 	}
-	return union.Network, len(union.Network) > 0, nil
+	// D110 (P6b-4): learn mode needs the egress proxy even with no network
+	// allows — it blocks every host and records the connects suggest learns.
+	return union.Network, union.NeedsEgress(), nil
 }
 
 // egressProxyImage returns the egress proxy pod image. It is the reconciler's

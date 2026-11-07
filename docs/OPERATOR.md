@@ -877,6 +877,24 @@ blocks. The model and egress proxies' policies stay `Block`. The Loop shows
 learn-mode Loop still needs a working engine (KubeArmor installed and the node
 enforcing), otherwise the usual hold applies (e.g. `NodeNotEnforcing`).
 
+**What learn mode records.** In learn mode the agent's KubeArmorPolicy carries
+catch-all **Audit** rules for process and file — every directory, recursive —
+so KubeArmor is asked to record every exec and file access. Without
+them (the agent
+policy is only a DNS/network fence, D46) Audit recorded nothing; a
+kind-ref run before the catch-all rules landed got 0 records. The egress
+proxy also runs in learn mode even when no policy has network allows: its
+allowlist is then empty, so it blocks every host and records each connect, and
+`cox policy suggest` turns those connects into network allows. Enforcing mode
+is unchanged: no catch-all rules, and no egress proxy without network allows.
+
+**Known gap (#407 kind-ref runs).** End to end, `cox policy suggest` does not
+yet get records from a real cluster: the operator's relay does not parse
+KubeArmor's stdout JSON (its keys are camelCase), and on kind-ref KubeArmor
+reported no events from the agent's sandbox pod (cause under investigation).
+A fix follows in its own PR. KubeArmor must also run with `logPath=stdout`
+for the relay to see any alert.
+
 **Mixed Loops (D108).** If an enforcing policy is also referenced, the Loop
 enforces the union of every policy's allows (`spec.action: Block`); the
 `auditOnly` flags have no effect, `status.policy.auditOnlyIgnored` lists the
@@ -908,8 +926,9 @@ The command reads the operator's Q4 audit lines (pipe them on stdin, or pass
 a file with `-f <file>`; lines that are not audit records, and other Loops'
 records, are skipped). `--name` defaults to `<loop>-suggested`; the namespace
 is the CLI's `--namespace`. It prints a candidate `AgentPolicy`. Review it,
-apply it as a **new** policy still in learn mode to confirm it covers what
-the agent needs, then drop `auditOnly` to enforce.
+apply it as a new policy with `auditOnly: true` added (the candidate is
+written without it) to confirm it covers what the agent needs, then drop
+`auditOnly` to enforce.
 
 What the candidate holds is only the allows the agent **used** —
 deduplicated and sorted — and it never contains a deny:

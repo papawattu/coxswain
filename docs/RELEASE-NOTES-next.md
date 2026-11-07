@@ -75,6 +75,33 @@ is not written as allows (D109).
 detail). Any parser that matched the old `detail` text exactly must allow the
 new prefix.
 
+### P6b-4: learn mode records exec, file and egress — #407
+
+**What was wrong:** a kind-ref run of a learn-mode Loop got 0 records. The
+agent's policy is a DNS/network fence (D46), so the learn-mode
+KubeArmorPolicy had no process/file rules, and `Audit` alone recorded
+nothing.
+
+**What changed:** in learn mode (every referenced policy `auditOnly`) the
+agent's KubeArmorPolicy carries catch-all **Audit** rules for process and
+file — every directory, recursive — so KubeArmor is asked to record every
+exec and file access. The egress proxy runs in learn mode even when no policy has network
+allows: its allowlist is then empty, so it blocks every host and records each
+connect, and `cox policy suggest` turns those connects into network allows.
+Enforcing mode is unchanged: no catch-all rules, and no egress proxy without
+network allows.
+
+**Known gap:** End to end, `cox policy suggest` does not
+yet get records from a real cluster: the operator's relay does not parse
+KubeArmor's stdout JSON (its keys are camelCase), and on kind-ref KubeArmor
+reported no events from the agent's sandbox pod (cause under investigation).
+A fix follows in its own PR. KubeArmor must also run with `logPath=stdout`
+for the relay to see any alert.
+
+**On upgrade:** a learn-mode Loop now also gets an egress proxy pod; network
+for the agent in learn mode goes through it and is blocked unless allowed, as
+before.
+
 ## Security fixes
 
 ### D78(b): a credential key followed by ':' and any value is dropped from lessons — #401

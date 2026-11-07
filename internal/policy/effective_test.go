@@ -204,3 +204,16 @@ func TestTranslateCarriesAuditOnly(t *testing.T) {
 		t.Fatal("AuditOnly must never default to true")
 	}
 }
+
+// D110: learn mode needs the egress proxy even with no network allows.
+func TestNeedsEgress(t *testing.T) {
+	if (EffectivePolicy{}).NeedsEgress() {
+		t.Fatal("no allows, enforcing: no egress proxy")
+	}
+	if !(EffectivePolicy{Network: []string{"a.example:443"}}).NeedsEgress() {
+		t.Fatal("network allows need the egress proxy")
+	}
+	if !(EffectivePolicy{AuditOnly: true}).NeedsEgress() {
+		t.Fatal("learn mode needs the egress proxy (D110)")
+	}
+}

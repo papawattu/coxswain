@@ -1373,6 +1373,7 @@ Three states, three different meanings:
   smaller one.
 - `AuditStreamUndecodable` — a run of lines it could not decode (the engine's
   alert format changed, or the stream is not the one it expected).
+- `AuditStreamNoAlerts` — the engine's log is readable but no KubeArmor alert line has arrived from that node yet (D111). Usually KubeArmor is running with `logPath=none`; see "No KubeArmor line ever arrives" below.
 
 **No KubeArmor line ever arrives.** The relay follows the KubeArmor agent
 pods' stdout, and the agent writes alerts there only with `logPath=stdout` —

@@ -155,6 +155,8 @@ func blockedUnknownMessage(snap alerts.Snapshot, reason string) string {
 		msg += "the audit stream re-attached and cannot prove it saw every alert in between (a rotation window)"
 	case alerts.ReasonUndecodable:
 		msg += "the audit stream stopped producing lines this operator can decode"
+	case alerts.ReasonNoAlerts:
+		msg += "no KubeArmor alert line has arrived from the engine on this Loop's node yet; KubeArmor must run with logPath=stdout (QUICKSTART Step 3)"
 	default:
 		msg += "the audit stream is unavailable (the engine or its pod log cannot be read)"
 	}

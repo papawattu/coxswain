@@ -67,9 +67,9 @@ func newI42bFakeLoop(name string, policyName string) *coxv1alpha1.Loop {
 	}
 }
 
-func newI42bFakeAgentPolicy(name, ns string, network []string) *coxv1alpha1.AgentPolicy {
+func newI42bFakeAgentPolicy(name string, network []string) *coxv1alpha1.AgentPolicy {
 	return &coxv1alpha1.AgentPolicy{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: i42bGateNS},
 		Spec:       coxv1alpha1.AgentPolicySpec{Network: network},
 	}
 }
@@ -87,7 +87,7 @@ func TestNeedsEgressProxyFailsClosed(t *testing.T) {
 	loop := newI42bFakeLoop(loopName, policyName)
 	// The AgentPolicy exists and HAS network allows, but the interceptor makes
 	// every Get on an AgentPolicy fail, simulating a transient API error.
-	ap := newI42bFakeAgentPolicy(policyName, i42bGateNS, []string{i42eExternalHost})
+	ap := newI42bFakeAgentPolicy(policyName, []string{i42eExternalHost})
 	errBoom := errors.New("transient api error")
 
 	fakeClient := fake.NewClientBuilder().
@@ -122,8 +122,8 @@ func TestNeedsEgressProxyHappyPath(t *testing.T) {
 	scheme := newI42bFakeScheme(t)
 	withLoop := newI42bFakeLoop(withName, polWith)
 	withoutLoop := newI42bFakeLoop(withoutName, polWithout)
-	apWith := newI42bFakeAgentPolicy(polWith, i42bGateNS, []string{i42eExternalHost})
-	apWithout := newI42bFakeAgentPolicy(polWithout, i42bGateNS, nil)
+	apWith := newI42bFakeAgentPolicy(polWith, []string{i42eExternalHost})
+	apWithout := newI42bFakeAgentPolicy(polWithout, nil)
 
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(scheme).
@@ -137,6 +137,36 @@ func TestNeedsEgressProxyHappyPath(t *testing.T) {
 	}
 	if got := needsEgressProxy(ctx, r, withoutLoop); got {
 		t.Errorf("needsEgressProxy = true for a policy with no network allows; want false")
+	}
+}
+
+// D110 (P6b-4): a learn-mode Loop (its only policy is auditOnly, no network
+// allows) needs the egress proxy, with an EMPTY allowlist; the same policy
+// enforcing (auditOnly false) does not.
+func TestNeedsEgressProxyLearnMode(t *testing.T) {
+	ctx := context.Background()
+	scheme := newI42bFakeScheme(t)
+	learnLoop := newI42bFakeLoop("gate-learn", "pol-learn")
+	enfLoop := newI42bFakeLoop("gate-enf", "pol-enf")
+	apLearn := newI42bFakeAgentPolicy("pol-learn", nil)
+	apLearn.Spec.AuditOnly = true
+	apEnf := newI42bFakeAgentPolicy("pol-enf", nil)
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(learnLoop, enfLoop, apLearn, apEnf).
+		Build()
+	r := &LoopReconciler{CNIProber: testCNIProber(), Client: fakeClient, Scheme: scheme}
+
+	if !needsEgressProxy(ctx, r, learnLoop) {
+		t.Errorf("needsEgressProxy = false for a learn-mode Loop; want true (D110)")
+	}
+	allows, has, err := r.effectivePolicyNetwork(ctx, learnLoop)
+	if err != nil || !has || len(allows) != 0 {
+		t.Errorf("learn mode: effectivePolicyNetwork = (%v, %v, %v); want (empty, true, nil)", allows, has, err)
+	}
+	if needsEgressProxy(ctx, r, enfLoop) {
+		t.Errorf("needsEgressProxy = true for an enforcing Loop with no network allows; want false (unchanged)")
 	}
 }
 

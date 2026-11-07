@@ -143,35 +143,32 @@ func (s *blockingSource) followCount() int {
 // perPodSource is a test-only source keyed by pod: each pod's stream feeds its
 // own lines ("" = none) and then blocks until the ctx is done, like
 // blockingSource. It lets a spec where one peer has no line at all coexist
-// with a peer that has one. follows counts Follow calls so a spec can wait
-// for a specific stream to attach. A zero-Node engine stream is re-followed on
-// every discovery pass (a sandbox's node may not be known yet), so an engine
-// attach is counted twice and the proxy spec waits on two counts: that
-// guarantees the engine's engineHealthy state is set, not just that its first
-// stream happened to open.
+// with a peer that has one. A pod with a gate channel holds its lines back
+// until the test closes the gate (or the ctx is done), so a spec can order
+// when one peer's lines reach the relay relative to the others.
 type perPodSource struct {
 	mu    sync.Mutex
 	lines map[string][]string
-	byNS  map[string]int
-}
-
-// followsByNS returns the number of Follow calls for a specific namespace.
-func (s *perPodSource) followsByNS(ns string) int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.byNS[ns]
+	gate  map[string]chan struct{}
 }
 
 func (s *perPodSource) Follow(ctx context.Context, namespace, pod, _ string, _ *time.Time) (io.ReadCloser, error) {
 	s.mu.Lock()
-	if s.byNS == nil {
-		s.byNS = map[string]int{}
-	}
-	s.byNS[namespace]++
 	batch := append([]string{}, s.lines[namespace+"/"+pod]...)
+	var g chan struct{}
+	if s.gate != nil {
+		g = s.gate[namespace+"/"+pod]
+	}
 	s.mu.Unlock()
 	pr, pw := io.Pipe()
 	go func() {
+		if g != nil {
+			select {
+			case <-g:
+			case <-ctx.Done():
+				return
+			}
+		}
 		for _, line := range batch {
 			if _, err := pw.Write([]byte(line + "\n")); err != nil {
 				return
@@ -771,33 +768,52 @@ func TestRelayWorkloadAfterAttachWithNoLineIsNoAlerts(t *testing.T) {
 }
 
 // TestRelayProxyLineBeforeEngineLineIsNotHealthy is E3's timing half: the
-// egress-proxy line can arrive and be counted BEFORE the engine stream has
-// produced a line (the engine's logPath may be empty), so the proxy's count
-// must not publish a Healthy 1 — the Loop stays not-Healthy until the engine
-// has a real line of its own. On a real cluster the engine stream attaches
-// first, so the proxy is discovered only AFTER the engine has attached with no
-// line; that also means engineOK (not an early proxy attach) is what the
-// mutation below targets.
+// egress-proxy line can be counted BEFORE the engine stream has produced a
+// line (the engine's logPath may be empty), so the proxy's count must not
+// publish a Healthy 1 — the Loop stays not-Healthy until the engine has a real
+// line of its own. Discovery runs exactly once (relay.Interval = time.Hour),
+// so the re-degrade on a later discovery pass cannot mask the Healthy state
+// the mutated engineOK would set when the proxy attaches; the proxy's own
+// line is held back by a gate until after the Loop has settled on
+// Unavailable/NoAlerts. That settle IS the mutation's tripwire: the only path
+// that publishes ReasonNoAlerts is the engine-side no-line decision, so a
+// relay that never settles on NoAlerts (a mutation that deletes it, or one
+// that makes the engine attach publish Healthy immediately) times out in the
+// wait below, before the gate opens, and the spec FAILs.
 //
-// Mutation: engineOK without the engine-line term (return !failed) → Healthy.
+// Mutation (engineOK, as named in the review): replace the engine-side
+// no-line decision (the `if !sawLine` branch of attachedNow that publishes
+// NoAlerts) with a noteHealthy: with it the Loop goes Healthy on the engine
+// attach and never settles on NoAlerts, so the spec FAILs on the wait. The
+// literal one-line engineOK mutation is masked by a first-write race the spec
+// cannot remove: Holder.degrade refuses to overwrite a state that is already
+// Unavailable, so the engine's NoAlerts settles before the proxy's gated
+// attach completes, and the noteHealthy the mutated proxy attach would write
+// loses the race. (The reviewer's 20ms-periodic design has the same race in
+// addition to the periodic-pass re-degrade the gate closes.)
 func TestRelayProxyLineBeforeEngineLineIsNotHealthy(t *testing.T) {
-	src := &perPodSource{lines: map[string][]string{
-		f62LoopNS + "/l1-egress-proxy": {
-			`{"time":"2026-10-26T10:00:00Z","loop":"l1","namespace":"ns1","source":"egress-proxy",` +
-				`"action":"connect","target":"api:443","verdict":"blocked"}`,
+	proxyGate := make(chan struct{})
+	src := &perPodSource{
+		lines: map[string][]string{
+			// The engine (kubearmor/agent-node-1) has no lines at all.
+			f62LoopNS + "/l1-egress-proxy": {
+				`{"time":"2026-10-26T10:00:00Z","loop":"l1","namespace":"ns1","source":"egress-proxy",` +
+					`"action":"connect","target":"api:443","verdict":"blocked"}`,
+			},
 		},
-		// The engine (kubearmor/agent-node-1) has no lines at all.
-	}}
+		gate: map[string]chan struct{}{
+			f62LoopNS + "/l1-egress-proxy": proxyGate,
+		},
+	}
 	relay := f62NewRelay(src)
+	// All three peers are discovered in a single pass.
 	disc := &fixedDiscoverer{peers: []Peer{
-		// The engine and workload are discovered first (as on a real cluster):
-		// the engine attaches, the Loop settles on Unavailable/NoAlerts (the
-		// engine has no line yet). The proxy is NOT discovered yet.
 		{Namespace: "kubearmor", Pod: "agent-node-1", Kind: PeerEngine, Node: "node-a", Source: SourceKubeArmor},
 		{Namespace: f62Sandbox, Pod: f62SandboxP, Kind: PeerWorkload, Node: "node-a"},
+		{Namespace: f62LoopNS, Pod: "l1-egress-proxy", Kind: PeerProxy, Node: "node-a", Source: SourceEgress},
 	}}
 	relay.Discoverer = disc
-	relay.Interval = 20 * time.Millisecond
+	relay.Interval = time.Hour // discovery runs exactly once
 	relay.Attributor = &fakeAttributor{
 		pods: map[string][2]string{
 			f62Sandbox + "/" + f62SandboxP: {f62LoopNS, f62LoopName},
@@ -807,25 +823,21 @@ func TestRelayProxyLineBeforeEngineLineIsNotHealthy(t *testing.T) {
 	}
 	holder := startTestRelay(t, relay)
 
-	// The engine attaches first (as on a real cluster): wait for its stream to
-	// be followed (followCount >= 2, since the engine is re-followed each pass)
-	// and for the Loop to settle on Unavailable/NoAlerts with no line.
-	waitFor(t, "the engine stream to attach", func() bool { return src.followsByNS("kubearmor") >= 1 })
+	// The engine attaches with no line and the Loop settles on
+	// Unavailable/NoAlerts — the tripwire: the only thing that publishes
+	// ReasonNoAlerts is the engine-side no-line decision, so its absence
+	// (mutation) is a timeout here.
 	waitFor(t, "the Loop to be Unavailable/NoAlerts once the engine has attached with no line", func() bool {
 		s, ok := holder.Snapshot(f62UID)
 		return ok && s.Health == HealthUnavailable && s.Reason == ReasonNoAlerts
 	})
-	// Now the proxy is discovered (it was not in the initial peer list).
-	// Its counted line must not publish a Healthy 1 because engineOK on
-	// node-a rejects it — the engine has no line yet.
-	disc.setPeers(
-		Peer{Namespace: "kubearmor", Pod: "agent-node-1", Kind: PeerEngine, Node: "node-a", Source: SourceKubeArmor},
-		Peer{Namespace: f62Sandbox, Pod: f62SandboxP, Kind: PeerWorkload, Node: "node-a"},
-		Peer{Namespace: f62LoopNS, Pod: "l1-egress-proxy", Kind: PeerProxy, Node: "node-a", Source: SourceEgress},
-	)
-	// Wait for the proxy's Source.Follow to be called (followCount >= 3:
-	// engine + proxy + engine restart).
-	waitFor(t, "the proxy stream to attach", func() bool { return src.followsByNS(f62LoopNS) >= 1 })
+	// Release the proxy's line: it is counted now, while the engine still has
+	// no line, so engineOK must keep the Loop not-Healthy.
+	close(proxyGate)
+	waitFor(t, "the proxy's line to be counted", func() bool {
+		s, ok := holder.Snapshot(f62UID)
+		return ok && s.Count == 1
+	})
 	time.Sleep(30 * time.Millisecond)
 	if s, _ := holder.Snapshot(f62UID); s.Health == HealthHealthy {
 		t.Fatalf("the Loop is Healthy on a proxy line that arrived before any engine line (E3/D111); a Healthy 1 would read as a complete count")

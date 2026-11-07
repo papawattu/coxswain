@@ -141,7 +141,7 @@ before.
 
 **What changed:** the relay parses both key styles, so the camelCase stdout lines are decoded.
 
-**On upgrade:** set `LOGPATH=stdout` with `kubectl -n kubearmor patch kubearmorconfig kubearmorconfig-default --type merge -p '{"spec":{"globalEnv":[{"name":"LOGPATH","value":"stdout"}]}}'` and check the agent log's `Final Configuration` line shows `LogPath:stdout`.
+**On upgrade:** set `LOGPATH=stdout` with `kubectl -n kubearmor patch kubearmorconfig kubearmorconfig-default --type merge -p '{"spec":{"globalEnv":[{"name":"LOGPATH","value":"stdout"}]}}'` and check the agent log's `Final Configuration` line shows `LogPath:stdout`. For learn mode, also set KubeArmor defaultVisibility none and annotate each Loop namespace kubearmor-visibility=process,file,network (QUICKSTART Step 3).
 
 ### D79(b) part 1: the wall clock pauses while a Loop waits at AwaitingApproval — #402
 

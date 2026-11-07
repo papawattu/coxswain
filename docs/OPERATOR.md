@@ -946,6 +946,9 @@ deduplicated and sorted — and it never contains a deny:
 - each list holds at most 64 entries (the AgentPolicy limit), the most-used
   first; the rest are printed as a comment under the list.
 
+An AgentPolicy `files` entry ending in "/" grants that directory recursively
+(KubeArmor matchDirectories); any other entry is an exact path (D113).
+
 The candidate has no `auditOnly`: it is meant to enforce once reviewed. A
 header comment on the candidate lists the platform minimum the operator adds
 itself (the model-proxy and egress-proxy Service FQDNs, DNS, the agent

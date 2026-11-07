@@ -69,6 +69,18 @@ func TestSuggestFromRecordsExecIsFirstField(t *testing.T) {
 	}
 }
 
+// D112: a whitespace-only process target has no fields; it is skipped
+// instead of panicking on an out-of-range index.
+func TestSuggestFromRecordsBlankProcessTarget(t *testing.T) {
+	recs := []alerts.Record{
+		{Loop: "l1", Namespace: "ns", Source: alerts.SourceKubeArmor, Action: "Audit", Target: " ", Verdict: "allowed", Detail: "operation=Process, pod=l1-sandbox"},
+	}
+	s := SuggestFromRecords(recs, "l1", "ns")
+	if len(s.Exec) != 0 {
+		t.Errorf("exec = %v, want none", s.Exec)
+	}
+}
+
 // D112: a directory with more than 5 distinct file targets collapses to one
 // dir + "/" entry; exactly 5 stay as exact paths.
 func TestSuggestFromRecordsCollapsesBusyDirs(t *testing.T) {

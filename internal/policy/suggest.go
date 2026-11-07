@@ -87,7 +87,13 @@ func SuggestFromRecords(records []alerts.Record, loop, namespace string) Suggest
 				// The target is the full command line ("/bin/sh -c echo hi");
 				// the binary path is its first field, and only absolute paths
 				// are valid AgentPolicy exec entries.
-				bin := strings.Fields(r.Target)[0]
+				// A whitespace-only target has no fields; skip it instead of
+				// indexing out of range.
+				fields := strings.Fields(r.Target)
+				if len(fields) == 0 {
+					continue
+				}
+				bin := fields[0]
 				if path.IsAbs(bin) {
 					exec[bin]++
 				}

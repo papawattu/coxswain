@@ -28,7 +28,7 @@ func TestSuggestPolicyFromOperatorLog(t *testing.T) {
 	in := strings.Join([]string{
 		`{"level":"info","ts":1,"msg":"Reconciling Loop","loop":"l1"}`,
 		`not json at all`,
-		`{"time":"2026-11-06T10:00:00Z","loop":"l1","namespace":"ns","iteration":"0","source":"kubearmor","action":"Audit","target":"/usr/bin/git","verdict":"allowed","detail":"operation=Process, policy=p"}`,
+		`{"time":"2026-11-06T10:00:00Z","loop":"l1","namespace":"ns","iteration":"0","source":"kubearmor","action":"Audit","target":"/usr/bin/git","verdict":"allowed","detail":"operation=Process, pod=l1-sandbox, policy=p"}`,
 		`{"time":"2026-11-06T10:00:01Z","loop":"l1","namespace":"ns","iteration":"0","source":"egress-proxy","action":"connect","target":"github.com:443","verdict":"blocked","detail":""}`,
 		`{"time":"2026-11-06T10:00:02Z","loop":"l2","namespace":"ns","iteration":"0","source":"kubearmor","action":"Audit","target":"/bin/sh","verdict":"allowed","detail":"operation=Process"}`,
 	}, "\n")

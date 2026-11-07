@@ -932,17 +932,31 @@ written without it) to confirm it covers what the agent needs, then drop
 What the candidate holds is only the allows the agent **used** —
 deduplicated and sorted — and it never contains a deny:
 
-- KubeArmor process records with an absolute path become `exec`;
-- KubeArmor file records become `files`;
+- only the agent sandbox pod's KubeArmor records count (`pod=<loop>-sandbox`
+  in `detail`); init containers' records in that pod still count, while the
+  verify pod and the proxies do not (D112);
+- KubeArmor process records become `exec`, keeping only the executable's
+  absolute path (the command's arguments are dropped); a path under a
+  writable mount (/workspace, /scratch, /tmp) or not canonical is listed as
+  a comment instead, because the CRD rejects it (R15);
+- KubeArmor file records become `files`: a directory with more than 5
+  distinct paths becomes one `dir/` entry (recursive, D113); otherwise
+  the exact paths are kept;
 - egress-proxy connects (`host:port`) become `network`;
 - KubeArmor network records are skipped, because the egress proxy's record
-carries the `host:port` an `AgentPolicy` needs.
+  carries the `host:port` an `AgentPolicy` needs;
+- each list holds at most 64 entries (the AgentPolicy limit), the most-used
+  first; the rest are printed as a comment under the list.
+
+An AgentPolicy `files` entry ending in "/" grants that directory recursively
+(KubeArmor matchDirectories); any other entry is an exact path (D113).
 
 The candidate has no `auditOnly`: it is meant to enforce once reviewed. A
 header comment on the candidate lists the platform minimum the operator adds
 itself (the model-proxy and egress-proxy Service FQDNs, DNS, the agent
 entrypoint), which is **not** written as allows (D109). Audit records carry
-KubeArmor's operation first in `detail` (`operation=Process|File|Network`).
+KubeArmor's operation first in `detail` (`operation=Process|File|Network`,
+then `pod=<pod>`).
 
 ### What the sandbox cannot reach
 

@@ -127,6 +127,10 @@ func TestParseLineKubeArmorAgentStdout(t *testing.T) {
 		if al.Source != SourceKubeArmor {
 			t.Errorf("line %d: source = %q, want %q", i+1, al.Source, SourceKubeArmor)
 		}
+		wantPrefix := "operation=" + wantOps[i] + ", pod=p6b-learn-verify-1-zhk26"
+		if !strings.HasPrefix(al.Detail, wantPrefix) {
+			t.Errorf("line %d: detail = %q, want prefix %q", i+1, al.Detail, wantPrefix)
+		}
 	}
 }
 

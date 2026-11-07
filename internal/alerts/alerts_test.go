@@ -17,6 +17,8 @@ package alerts
 import (
 	"bytes"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -85,6 +87,45 @@ func TestParseLineKubeArmorTimestampOnly(t *testing.T) {
 	}
 	if al.Time.Unix() != 1690000000 {
 		t.Errorf("time = %d, want 1690000000", al.Time.Unix())
+	}
+}
+
+// TestParseLineKubeArmorAgentStdout decodes REAL lines from the KubeArmor
+// agent's own stdout (captured on kind, .samples/p6b3-kind/run3/
+// p6b3-ka-stdout.jsonl). The agent writes camelCase keys (operation,
+// namespaceName, …), which the relay used to reject: F62's blockedCount
+// could never come off the agent log.
+func TestParseLineKubeArmorAgentStdout(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("testdata", "kubearmor-agent-stdout.jsonl"))
+	if err != nil {
+		t.Fatalf("reading the captured agent-stdout lines: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("test data = %d lines, want 2", len(lines))
+	}
+	wantOps := []string{"Process", "File"}
+	wantTime, _ := time.Parse(time.RFC3339Nano, "2026-11-07T16:57:43Z")
+	for i, line := range lines {
+		al, ok := ParseLine([]byte(line))
+		if !ok {
+			t.Fatalf("line %d: a real agent-stdout line must decode", i+1)
+		}
+		if al.Operation != wantOps[i] {
+			t.Errorf("line %d: operation = %q, want %q", i+1, al.Operation, wantOps[i])
+		}
+		if al.Namespace != "samples" || al.Pod != "p6b-learn-verify-1-zhk26" {
+			t.Errorf("line %d: workload = %s/%s, want samples/p6b-learn-verify-1-zhk26", i+1, al.Namespace, al.Pod)
+		}
+		if al.Time.UTC().Truncate(time.Second).Unix() != wantTime.Unix() {
+			t.Errorf("line %d: time = %s, want %s to the second", i+1, al.Time.Format(time.RFC3339), wantTime.Format(time.RFC3339))
+		}
+		if al.Blocked {
+			t.Errorf("line %d: an audit-mode (Allowed) line must not read as blocked", i+1)
+		}
+		if al.Source != SourceKubeArmor {
+			t.Errorf("line %d: source = %q, want %q", i+1, al.Source, SourceKubeArmor)
+		}
 	}
 }
 

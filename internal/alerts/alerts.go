@@ -193,14 +193,16 @@ func ClassifyLine(line []byte) (Alert, LineKind) {
 
 // looksLikeAudit reports whether a line is shaped like one of the audit
 // sources' records: a JSON object carrying a discriminator key (the engine's
-// `Operation`, the egress proxy's `verdict`, the tool proxy's `tool`). Anything
-// else is ordinary output and is skipped without touching the failure budget.
+// `Operation` / `operation`, the egress proxy's `verdict`, the tool proxy's
+// `tool`). Anything else is ordinary output and is skipped without touching
+// the failure budget.
 func looksLikeAudit(line []byte) bool {
 	trimmed := strings.TrimSpace(string(line))
 	if !strings.HasPrefix(trimmed, "{") {
 		return false
 	}
 	return strings.Contains(trimmed, `"Operation"`) ||
+		strings.Contains(trimmed, `"operation"`) ||
 		strings.Contains(trimmed, `"verdict"`) ||
 		strings.Contains(trimmed, `"tool"`)
 }
@@ -221,8 +223,9 @@ func ParseLine(line []byte) (Alert, bool) {
 		return Alert{}, false
 	}
 	switch {
-	// The KubeArmor alert JSON is PascalCase and always carries Operation.
-	case has(raw, "Operation"):
+	// The KubeArmor alert JSON always carries Operation: PascalCase in the
+	// KubeArmor alert format, camelCase in the agent's own stdout (F62).
+	case has(raw, "Operation"), has(raw, "operation"):
 		return parseKubeArmor(raw)
 	// The egress-proxy record (internal/egress.AuditRecord): a Q4 envelope
 	// without iteration, plus a verdict.
@@ -245,26 +248,26 @@ func parseKubeArmor(raw map[string]json.RawMessage) (Alert, bool) {
 	if !ok {
 		return Alert{}, false
 	}
-	action := str(raw, "Action")
+	action := str(raw, "Action", "action")
 	al := Alert{
 		Time:      ts,
 		Action:    action,
 		Blocked:   strings.EqualFold(action, ActionBlock),
-		Operation: str(raw, "Operation"),
-		Namespace: str(raw, "NamespaceName"),
-		Pod:       str(raw, "PodName"),
-		Container: str(raw, "ContainerName"),
+		Operation: str(raw, "Operation", "operation"),
+		Namespace: str(raw, "NamespaceName", "namespaceName"),
+		Pod:       str(raw, "PodName", "podName"),
+		Container: str(raw, "ContainerName", "containerName"),
 		Source:    SourceKubeArmor,
 	}
-	al.Target = firstNonEmpty(str(raw, "Resource"), str(raw, "Source"), str(raw, "Operation"))
+	al.Target = firstNonEmpty(str(raw, "Resource", "resource"), str(raw, "Source", "source"), str(raw, "Operation", "operation"))
 	// P6b-2: the operation (Process/File/Network) is kept first in the detail,
 	// so `cox policy suggest` can tell an exec path from a file path (the
 	// record's action carries KubeArmor's Action, e.g. Block or Audit).
 	var parts []string
-	if op := str(raw, "Operation"); op != "" {
+	if op := str(raw, "Operation", "operation"); op != "" {
 		parts = append(parts, "operation="+op)
 	}
-	if policy := str(raw, "PolicyName"); policy != "" {
+	if policy := str(raw, "PolicyName", "policyName"); policy != "" {
 		parts = append(parts, "policy="+policy)
 	}
 	if data := str(raw, "Data"); data != "" {
@@ -333,10 +336,10 @@ func toolProxyDetail(raw map[string]json.RawMessage, status int) string {
 // kubeArmorTime reads the alert's own clock: UpdatedTime (RFC3339Nano) when
 // present, else Timestamp (Unix seconds).
 func kubeArmorTime(raw map[string]json.RawMessage) (time.Time, bool) {
-	if ts, ok := parseTime(str(raw, "UpdatedTime")); ok {
+	if ts, ok := parseTime(str(raw, "UpdatedTime", "updatedTime")); ok {
 		return ts, true
 	}
-	if s := str(raw, "Timestamp"); s != "" {
+	if s := str(raw, "Timestamp", "timestamp"); s != "" {
 		if secs, err := strconv.ParseInt(s, 10, 64); err == nil {
 			return time.Unix(secs, 0).UTC(), true
 		}

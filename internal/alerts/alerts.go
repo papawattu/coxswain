@@ -267,6 +267,9 @@ func parseKubeArmor(raw map[string]json.RawMessage) (Alert, bool) {
 	if op := str(raw, "Operation", "operation"); op != "" {
 		parts = append(parts, "operation="+op)
 	}
+	if pod := str(raw, "PodName", "podName"); pod != "" {
+		parts = append(parts, "pod="+pod)
+	}
 	if policy := str(raw, "PolicyName", "policyName"); policy != "" {
 		parts = append(parts, "policy="+policy)
 	}

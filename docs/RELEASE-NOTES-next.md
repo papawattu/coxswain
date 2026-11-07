@@ -101,6 +101,20 @@ so `cox policy suggest` may still come back empty.
 for the agent in learn mode goes through it and is blocked unless allowed, as
 before.
 
+### D113: a files allow ending in / grants a directory recursively — #410
+
+**What changed:** an AgentPolicy `files` entry ending in `/` renders as KubeArmor `matchDirectories {dir, recursive: true}`; other entries stay exact paths. KubeArmor itself requires a directory to end in `/`.
+
+**On upgrade:** nothing; existing entries without a trailing `/` are unchanged.
+
+### D112: cox policy suggest condenses to the agent's paths and directories — #411
+
+**What was wrong:** a kind-ref learn-mode run printed 1242 exec and 6260 files entries. Each exec entry was a full command line, which the AgentPolicy CRD rejects (absolute paths only, at most 64 entries).
+
+**What changed:** `cox policy suggest` now counts only the agent sandbox pod's records (init containers still count), keeps only the executable's absolute path for `exec`, collapses directories with more than 5 distinct file paths into one recursive `dir/` entry, and caps each list at 64 most-used entries with the rest printed as a comment.
+
+**On upgrade:** a KubeArmor audit line's `detail` now has `pod=<pod>` after `operation=…`.
+
 ## Security fixes
 
 ### D78(b): a credential key followed by ':' and any value is dropped from lessons — #401

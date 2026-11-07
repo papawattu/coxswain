@@ -17,6 +17,8 @@ package alerts
 import (
 	"bytes"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -85,6 +87,70 @@ func TestParseLineKubeArmorTimestampOnly(t *testing.T) {
 	}
 	if al.Time.Unix() != 1690000000 {
 		t.Errorf("time = %d, want 1690000000", al.Time.Unix())
+	}
+}
+
+// TestParseLineKubeArmorAgentStdout decodes REAL lines from the KubeArmor
+// agent's own stdout (captured on kind, .samples/p6b3-kind/run3/
+// p6b3-ka-stdout.jsonl). The agent writes camelCase keys (operation,
+// namespaceName, …), which the relay used to reject: F62's blockedCount
+// could never come off the agent log.
+func TestParseLineKubeArmorAgentStdout(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("testdata", "kubearmor-agent-stdout.jsonl"))
+	if err != nil {
+		t.Fatalf("reading the captured agent-stdout lines: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("test data = %d lines, want 2", len(lines))
+	}
+	wantOps := []string{"Process", "File"}
+	wantTimes := []string{"2026-11-07T16:57:43.771521Z", "2026-11-07T16:57:43.759810Z"}
+	for i, line := range lines {
+		al, ok := ParseLine([]byte(line))
+		if !ok {
+			t.Fatalf("line %d: a real agent-stdout line must decode", i+1)
+		}
+		if al.Operation != wantOps[i] {
+			t.Errorf("line %d: operation = %q, want %q", i+1, al.Operation, wantOps[i])
+		}
+		if al.Namespace != "samples" || al.Pod != "p6b-learn-verify-1-zhk26" {
+			t.Errorf("line %d: workload = %s/%s, want samples/p6b-learn-verify-1-zhk26", i+1, al.Namespace, al.Pod)
+		}
+		wantTime, _ := time.Parse(time.RFC3339Nano, wantTimes[i])
+		if !al.Time.Equal(wantTime) {
+			t.Errorf("line %d: time = %s, want exactly %s", i+1, al.Time.Format(time.RFC3339Nano), wantTimes[i])
+		}
+		if al.Blocked {
+			t.Errorf("line %d: an audit-mode (Allowed) line must not read as blocked", i+1)
+		}
+		if al.Source != SourceKubeArmor {
+			t.Errorf("line %d: source = %q, want %q", i+1, al.Source, SourceKubeArmor)
+		}
+	}
+}
+
+// TestParseLineKubeArmorAgentStdoutTimestampOnly covers F62 mutation D: the
+// agent-stdout lines carry both updatedTime (nanoseconds) and timestamp
+// (Unix seconds); with updatedTime gone, the relay must fall back to the
+// Unix-second clock rather than drop the line.
+func TestParseLineKubeArmorAgentStdoutTimestampOnly(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("testdata", "kubearmor-agent-stdout.jsonl"))
+	if err != nil {
+		t.Fatalf("reading the captured agent-stdout lines: %v", err)
+	}
+	line, _, _ := strings.Cut(strings.TrimSpace(string(data)), "\n")
+	const stamp = `"updatedTime":"2026-11-07T16:57:43.771521Z",`
+	out := strings.Replace(line, stamp, "", 1)
+	if out == line {
+		t.Fatalf("line 1 does not contain %s", stamp)
+	}
+	al, ok := ParseLine([]byte(out))
+	if !ok {
+		t.Fatalf("an agent-stdout line without updatedTime must still decode (timestamp fallback)")
+	}
+	if !al.Time.Equal(time.Unix(1794070663, 0)) {
+		t.Errorf("time = %s, want the Unix-seconds fallback %s", al.Time.Format(time.RFC3339Nano), time.Unix(1794070663, 0))
 	}
 }
 

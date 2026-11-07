@@ -465,6 +465,21 @@ karmor probe
 # Expected: "Active LSM: BPFLSM" and node label kubearmor.io/enforcer: bpf
 ```
 
+KubeArmor's agents default to `logPath=none`, which sends alerts over gRPC only
+and writes nothing to the agent pod's stdout. coxswain's relay reads exactly
+that stdout, so without this patch the blocked-action count and the audit trail
+stay empty:
+
+```bash
+# Point the KubeArmor agent pods at stdout (the KubeArmor operator reads
+# LOGPATH from the agent's environment and rolls the DaemonSet)
+kubectl -n kubearmor patch kubearmorconfig kubearmorconfig-default --type merge -p '{"spec":{"globalEnv":[{"name":"LOGPATH","value":"stdout"}]}}'
+
+# Verify: the agent log's "Final Configuration" line shows the applied value
+kubectl -n kubearmor logs -l kubearmor-app=kubearmor -c kubearmor --tail=-1 | grep 'Final Configuration' | grep -o 'LogPath:[a-z]*' | sort -u
+# Expected: LogPath:stdout
+```
+
 ### Step 4: Install agent-sandbox
 
 ```bash

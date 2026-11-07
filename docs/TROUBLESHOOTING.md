@@ -1374,6 +1374,18 @@ Three states, three different meanings:
 - `AuditStreamUndecodable` — a run of lines it could not decode (the engine's
   alert format changed, or the stream is not the one it expected).
 
+**No KubeArmor line ever arrives.** The relay follows the KubeArmor agent
+pods' stdout, and the agent writes alerts there only with `logPath=stdout` —
+the default `none` sends them over gRPC only, so no line the relay can read is
+ever produced. Set it with:
+
+```bash
+kubectl -n kubearmor patch kubearmorconfig kubearmorconfig-default --type merge -p '{"spec":{"globalEnv":[{"name":"LOGPATH","value":"stdout"}]}}'
+```
+
+and check the agent log's `Final Configuration` line, which shows `LogPath:stdout`
+(the `Arguments` line shows only the command-line flag, which stays `none`).
+
 The message also names how many alerts could not be attributed to **any** Loop:
 a sandbox pod without the operator's `coxswain.io/loop` label (hand-created, or
 an old pod) is a diagnostic, never a guessed attribution.

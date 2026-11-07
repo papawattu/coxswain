@@ -120,7 +120,7 @@ before.
 ### I224: AgentPolicy files entries must be canonical absolute paths — #417
 - **What was wrong:** `spec.files` (AgentPolicy and ClusterAgentPolicy) had no validation. It accepted relative paths and `..`, `//` or `.` segments, and a files entry is a grant.
 - **What changed:** the CRD rejects such an entry at admission, with the message `files entries must be absolute canonical paths …`, and limits the list to 64 entries of at most 512 characters each. A trailing `/` is still allowed: it means the directory, recursively (D113).
-- **On upgrade:** a policy already stored with a bad entry is NOT re-checked until it is next edited. The edit is then rejected until the entry is fixed. List policies to check with `kubectl get agentpolicies,clusteragentpolicies -A -o yaml | grep -A3 'files:'`.
+- **On upgrade:** a policy already stored with a bad entry is NOT re-checked until it is next edited. Whether a later edit that leaves that entry unchanged is accepted depends on the cluster's CRD validation ratcheting; fix the entry when you next edit the policy. List policies to check with `kubectl get agentpolicies,clusteragentpolicies -A -o yaml | grep -A3 'files:'`.
 
 ### D78(b): a credential key followed by ':' and any value is dropped from lessons — #401
 

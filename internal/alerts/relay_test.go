@@ -142,8 +142,8 @@ func (s *blockingSource) followCount() int {
 
 // perPodSource is a test-only source keyed by pod: each pod's stream feeds its
 // own lines ("" = none) and then blocks until the ctx is done, like
-// blockingSource. It lets a spec where one peer has no line at all coexist with
-// a peer that has one.
+// blockingSource. It lets a spec where one peer has no line at all coexist
+// with a peer that has one.
 type perPodSource struct {
 	mu    sync.Mutex
 	lines map[string][]string
@@ -757,10 +757,12 @@ func TestRelayWorkloadAfterAttachWithNoLineIsNoAlerts(t *testing.T) {
 // egress-proxy line can arrive and be counted BEFORE the engine stream has
 // produced a line (the engine's logPath may be empty), so the proxy's count
 // must not publish a Healthy 1 — the Loop stays not-Healthy until the engine
-// has a real line of its own.
+// has a real line of its own. On a real cluster the engine stream attaches
+// first, so the proxy is discovered only AFTER the engine has attached with no
+// line; that also means engineOK (not an early proxy attach) is what the
+// mutation below targets.
 //
-// Mutation: noteHealthy on the proxy's counted line regardless of the engine's
-// line state → Healthy.
+// Mutation: engineOK without the engine-line term (return !failed) → Healthy.
 func TestRelayProxyLineBeforeEngineLineIsNotHealthy(t *testing.T) {
 	src := &perPodSource{lines: map[string][]string{
 		f62LoopNS + "/l1-egress-proxy": {
@@ -770,11 +772,12 @@ func TestRelayProxyLineBeforeEngineLineIsNotHealthy(t *testing.T) {
 		// The engine (kubearmor/agent-node-1) has no lines at all.
 	}}
 	relay := f62NewRelay(src)
-	relay.Discoverer = &fixedDiscoverer{peers: []Peer{
+	disc := &fixedDiscoverer{peers: []Peer{
 		{Namespace: "kubearmor", Pod: "agent-node-1", Kind: PeerEngine, Source: SourceKubeArmor},
 		{Namespace: f62Sandbox, Pod: f62SandboxP, Kind: PeerWorkload},
-		{Namespace: f62LoopNS, Pod: "l1-egress-proxy", Kind: PeerProxy, Source: SourceEgress},
 	}}
+	relay.Discoverer = disc
+	relay.Interval = 20 * time.Millisecond
 	relay.Attributor = &fakeAttributor{
 		pods: map[string][2]string{
 			f62Sandbox + "/" + f62SandboxP: {f62LoopNS, f62LoopName},
@@ -784,6 +787,15 @@ func TestRelayProxyLineBeforeEngineLineIsNotHealthy(t *testing.T) {
 	}
 	holder := startTestRelay(t, relay)
 
+	waitFor(t, "the Loop to be Unavailable/NoAlerts once the engine has attached with no line", func() bool {
+		s, ok := holder.Snapshot(f62UID)
+		return ok && s.Health == HealthUnavailable && s.Reason == ReasonNoAlerts
+	})
+	disc.setPeers(
+		Peer{Namespace: "kubearmor", Pod: "agent-node-1", Kind: PeerEngine, Source: SourceKubeArmor},
+		Peer{Namespace: f62Sandbox, Pod: f62SandboxP, Kind: PeerWorkload},
+		Peer{Namespace: f62LoopNS, Pod: "l1-egress-proxy", Kind: PeerProxy, Source: SourceEgress},
+	)
 	waitFor(t, "the proxy line to be counted", func() bool {
 		s, ok := holder.Snapshot(f62UID)
 		return ok && s.Count == 1

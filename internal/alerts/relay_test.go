@@ -153,6 +153,7 @@ type perPodSource struct {
 	mu      sync.Mutex
 	lines   map[string][]string
 	follows int
+	byNS    map[string]int
 }
 
 func (s *perPodSource) followCount() int {
@@ -161,12 +162,23 @@ func (s *perPodSource) followCount() int {
 	return s.follows
 }
 
+// followsByNS returns the number of Follow calls for a specific namespace.
+func (s *perPodSource) followsByNS(ns string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.byNS[ns]
+}
+
 func (s *perPodSource) Follow(ctx context.Context, namespace, pod, _ string, _ *time.Time) (io.ReadCloser, error) {
 	s.mu.Lock()
 	s.follows++
 	if namespace == "kubearmor" {
 		s.follows++
 	}
+	if s.byNS == nil {
+		s.byNS = map[string]int{}
+	}
+	s.byNS[namespace]++
 	batch := append([]string{}, s.lines[namespace+"/"+pod]...)
 	s.mu.Unlock()
 	pr, pw := io.Pipe()
@@ -824,7 +836,7 @@ func TestRelayProxyLineBeforeEngineLineIsNotHealthy(t *testing.T) {
 	)
 	// Wait for the proxy's Source.Follow to be called (followCount >= 3:
 	// engine + proxy + engine restart).
-	waitFor(t, "the proxy stream to attach", func() bool { return src.followCount() >= 3 })
+	waitFor(t, "the proxy stream to attach", func() bool { return src.followsByNS(f62LoopNS) >= 1 })
 	time.Sleep(30 * time.Millisecond)
 	if s, _ := holder.Snapshot(f62UID); s.Health == HealthHealthy {
 		t.Fatalf("the Loop is Healthy on a proxy line that arrived before any engine line (E3/D111); a Healthy 1 would read as a complete count")

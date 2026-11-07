@@ -65,6 +65,7 @@ const (
 	kaptNameKey        = "name"
 	kaptNamespaceKey   = "namespace"
 	KaptFileKey        = "file"
+	KaptMatchDirsKey   = "matchDirectories"
 )
 
 // EmitKubeArmorPolicy translates Coxswain's EnginePolicy (per-container, D29)
@@ -195,6 +196,16 @@ func emitKubeArmorPolicy(loopName, namespace string, ep policy.EnginePolicy) *un
 			kaptActionKey:     kaptAllowAction,
 			KaptMatchPathsKey: toPathItems(files),
 		}
+	}
+
+	// D110 (P6b-4): learn mode records every exec and file access. Under D46
+	// the agent policy has no process/file rules, so Audit alone records
+	// nothing; the catch-all Audit rules replace any exec/file allows (in
+	// learn mode nothing is blocked anyway). Never added when enforcing.
+	if ep.AuditOnly {
+		everything := []any{map[string]any{"dir": "/", "recursive": true}}
+		spec[KaptProcessKey] = map[string]any{kaptActionKey: kaptAuditActionValue, KaptMatchDirsKey: everything}
+		spec[KaptFileKey] = map[string]any{kaptActionKey: kaptAuditActionValue, KaptMatchDirsKey: everything}
 	}
 
 	obj := &unstructured.Unstructured{Object: map[string]any{

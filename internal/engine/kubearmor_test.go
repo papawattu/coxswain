@@ -101,6 +101,33 @@ func TestEmitKubeArmorPolicyAuditOnlyIsAudit(t *testing.T) {
 	}
 }
 
+// D110: learn mode renders catch-all Audit process and file rules; enforcing
+// mode with no exec/file allows renders neither section.
+func TestEmitKubeArmorPolicyLearnModeRecordsEverything(t *testing.T) {
+	learn := EmitKubeArmorPolicy("l1", "ns", policy.Translate(policy.EffectivePolicy{AuditOnly: true}, "l1-proxy.ns.svc", ""))
+	spec := learn.Object["spec"].(map[string]any)
+	for _, k := range []string{KaptProcessKey, KaptFileKey} {
+		sec, ok := spec[k].(map[string]any)
+		if !ok {
+			t.Fatalf("learn mode must render a %s section", k)
+		}
+		if sec["action"] != kaptAuditActionValue {
+			t.Errorf("%s action = %v, want Audit", k, sec["action"])
+		}
+		dirs, _ := sec[KaptMatchDirsKey].([]any)
+		if len(dirs) != 1 || dirs[0].(map[string]any)["dir"] != "/" || dirs[0].(map[string]any)["recursive"] != true {
+			t.Errorf("%s must match every directory recursively, got %v", k, sec[KaptMatchDirsKey])
+		}
+	}
+	enf := EmitKubeArmorPolicy("l1", "ns", policy.Translate(policy.EffectivePolicy{}, "l1-proxy.ns.svc", ""))
+	espec := enf.Object["spec"].(map[string]any)
+	for _, k := range []string{KaptProcessKey, KaptFileKey} {
+		if _, ok := espec[k]; ok {
+			t.Errorf("enforcing mode with no allows must not render a %s section (D46 unchanged)", k)
+		}
+	}
+}
+
 func TestEmitKubeArmorPolicyExecUsesProcessMatchPaths(t *testing.T) {
 	obj := EmitKubeArmorPolicy("loop-x", "ns-x", epForTest())
 	spec := obj.Object["spec"].(map[string]any)

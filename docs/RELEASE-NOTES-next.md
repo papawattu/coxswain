@@ -107,6 +107,14 @@ before.
 
 **On upgrade:** nothing; existing entries without a trailing `/` are unchanged.
 
+### P6d: `cox retry` for a Loop that failed with SandboxFailed (D86, D116) — #418
+
+**What was wrong:** `SandboxFailed` was terminal; the remedy was delete-and-re-apply, which loses history.
+
+**What changed:** `kubectl cox retry <loop>` sets the one-shot `coxswain.io/retry` annotation. The operator resumes the phase the Loop failed in, from its current checkpoint, resets the sandbox-attempt count, deletes the failed Sandbox, and emits a Normal `Retried` Event. It applies only to `SandboxFailed`; every other Failed reason is refused (the CLI names it; the operator ignores and removes an annotation it did not accept).
+
+**On upgrade:** nothing; a new CLI command and annotation.
+
 ### D112: cox policy suggest condenses to the agent's paths and directories — #411
 
 **What was wrong:** a kind-ref learn-mode run printed 1242 exec and 6260 files entries. Each exec entry was a full command line, which the AgentPolicy CRD rejects (absolute paths only, at most 64 entries).

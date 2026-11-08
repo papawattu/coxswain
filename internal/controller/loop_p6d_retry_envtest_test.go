@@ -31,6 +31,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
@@ -38,6 +39,7 @@ import (
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
 	"github.com/papawattu/coxswain/internal/cni"
+	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 )
 
 // p6dSandboxFailedLoopSpec is the exhausted Loop's spec: the F48 shape (a
@@ -145,6 +147,50 @@ var _ = Describe("P6d: the operator consumes coxswain.io/retry", func() {
 		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
 	}
 
+	// p6dCreateSandbox creates the Loop's Sandbox object if it does not
+	// exist yet (the loop_s4_pvc_test pattern: a bare ObjectMeta is the
+	// minimal shape envtest needs). It stands in for the Sandbox a real
+	// operator leaves behind when the sandbox run fails — the one a retry
+	// must delete (D116) and that an ineligible retry must NOT delete.
+	p6dCreateSandbox := func(ns, loopName string) {
+		sb := &sandboxv1beta1.Sandbox{}
+		if err := k8sClient.Get(ctx, types.NamespacedName{Name: sandboxName(loopName), Namespace: ns}, sb); apierrors.IsNotFound(err) {
+			// The Sandbox CRD requires a pod template with a container; a bare
+			// ObjectMeta is rejected (spec.podTemplate.spec.containers is
+			// Required). The stub's image is never run — envtest has no pod
+			// scheduler — so the name is the only thing the specs read back.
+			Expect(k8sClient.Create(ctx, &sandboxv1beta1.Sandbox{
+				// No sandboxDesiredPhaseAnnotation: the S4 recycle in
+				// ensureSandbox only fires when the annotation is SET and
+				// differs from status.desiredPhase. An empty annotation is
+				// NOT a mismatch, so the bootstrap will NOT delete the old
+				// sandbox on its own — the only delete path is
+				// applyRetry's own DeleteSandboxForRetry call (the D116
+				// guarantee this spec exists to catch).
+				ObjectMeta: metav1.ObjectMeta{Name: sandboxName(loopName), Namespace: ns},
+				Spec: sandboxv1beta1.SandboxSpec{SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
+					PodTemplate: sandboxv1beta1.PodTemplate{
+						Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: loopName, Image: "p6d-stub"}}},
+					},
+				}},
+			})).To(Succeed())
+		}
+	}
+
+	// p6dSandbox reads the Loop's Sandbox, returning (sb, true) when it is
+	// present and (nil, false) when it is NotFound.
+	p6dSandbox := func(ns, loopName string) (*sandboxv1beta1.Sandbox, bool) {
+		sb := &sandboxv1beta1.Sandbox{}
+		if err := k8sClient.Get(ctx, types.NamespacedName{Name: sandboxName(loopName), Namespace: ns}, sb); err != nil {
+			if apierrors.IsNotFound(err) {
+				return nil, false
+			}
+			Expect(err).NotTo(HaveOccurred())
+			return nil, false
+		}
+		return sb, true
+	}
+
 	// p6dSetRetryAnnotation sets the coxswain.io/retry annotation (the value
 	// is the CLI's; any value is a request).
 	p6dSetRetryAnnotation := func(ns, name string) {
@@ -169,13 +215,37 @@ var _ = Describe("P6d: the operator consumes coxswain.io/retry", func() {
 			Spec:       p6dSandboxFailedLoopSpec(),
 		})).To(Succeed())
 
-		By("the exhausted state + the annotation (built directly, as the F48g specs build their seed state)")
+		By("the exhausted state, the failed Sandbox a real operator leaves behind, and the annotation")
 		p6dSeedFailedState(ns, name, sandboxInfraFailedCondition)
+		p6dCreateSandbox(ns, name)
 		p6dSetRetryAnnotation(ns, name)
 		r, rec := p6dRetryReconciler()
 
 		By("the reconcile")
+		sbBefore, _ := p6dSandbox(ns, name)
 		got := p6dRetryReconcile(r, ns, name)
+
+		By("the retry deleted the failed Sandbox (D116: a fresh one is created on the next ensureSandbox)")
+		// applyRetry deletes the failed Sandbox; the bootstrap's ensureSandbox
+		// runs in the same reconcile (post-retry phase is Implementing, not
+		// terminal) and recreates a fresh Sandbox from the workspace PVC. So
+		// after the reconcile the Sandbox is EITHER: (a) gone (the bootstrap
+		// hasn't recreated it yet — NotFound), (b) in Terminating (the delete
+		// is still in flight — DeletionTimestamp set), or (c) a NEW Sandbox
+		// with a different UID (the bootstrap recreated it in the same pass).
+		// All three prove the old failed Sandbox was deleted.
+		Eventually(func() bool {
+			sb, ok := p6dSandbox(ns, name)
+			if !ok {
+				return true // NotFound
+			}
+			if sb.DeletionTimestamp != nil {
+				return true // Terminating
+			}
+			// A fresh Sandbox (the bootstrap recreated it): the UID differs.
+			return sbBefore != nil && sb.UID != sbBefore.UID
+		}, "10s", "200ms").Should(BeTrue(),
+			"the retry deletes the failed Sandbox so it is not counted as a new failure")
 
 		By("the resume (D116): the failed phase, the episode reset, the Failed condition gone")
 		Expect(got.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseImplementing),
@@ -212,13 +282,21 @@ var _ = Describe("P6d: the operator consumes coxswain.io/retry", func() {
 			Spec:       p6dSandboxFailedLoopSpec(),
 		})).To(Succeed())
 
-		By("the same exhausted state with a DIFFERENT reason (TamperedVerify) + the annotation")
+		By("the same exhausted state with a DIFFERENT reason (TamperedVerify), the failed Sandbox, and the annotation")
 		p6dSeedFailedState(ns, name, TamperedVerifyReason)
+		p6dCreateSandbox(ns, name)
 		p6dSetRetryAnnotation(ns, name)
 		r, _ := p6dRetryReconciler()
 
 		By("the reconcile")
 		got := p6dRetryReconcile(r, ns, name)
+
+		By("the ineligible retry did NOT delete the Sandbox (a verify-integrity failure is never retried)")
+		Consistently(func() bool {
+			sb, ok := p6dSandbox(ns, name)
+			return ok && sb.DeletionTimestamp == nil
+		}, "2s", "200ms").Should(BeTrue(),
+			"the failed Sandbox is kept for a TamperedVerify Loop — nothing is retried")
 
 		By("the retry is refused: the phase and the condition are kept (a verify-integrity failure must never resume)")
 		Expect(got.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseFailed),

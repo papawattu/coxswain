@@ -180,8 +180,10 @@ owner asked for. #424 merged without the owner's read-through, on the owner's wo
   rejected (`refusing to allow a Personal Access Token to create or update workflow
   .github/workflows/release.yml without workflow scope`), and the reviewer stopped there.
 
+- **D119**, 11-08 ~16:40Z: option **(b)**, recorded below with the question as asked.
+
 **Open:**
-- **D119 (I236):** where should `suggest`'s input come from, given the operator log rotates during a
+- **D119 (I236), decided (b):** where should `suggest`'s input come from, given the operator log rotates during a
   learn run? Options: (a) document reading the node's rotated files, or a log pipeline, as the input;
   (b) the operator also keeps a bounded per-Loop summary of distinct allows (for example in a
   ConfigMap or the Loop's status) for `suggest` to read; (c) the operator stops writing ALLOWED

@@ -103,6 +103,91 @@ func TestSuggestFromRecordsCollapsesBusyDirs(t *testing.T) {
 	}
 }
 
+// R49 I228: busy directory trees collapse recursively: 6 sub-directories each
+// with 6 files collapse to the single deepest busy ancestor, and 6 busy
+// top-level directories do NOT collapse to "/" itself.
+func TestSuggestFromRecordsCollapsesRecursively(t *testing.T) {
+	recs := make([]alerts.Record, 0, 72)
+	for i := range 6 {
+		for j := range 6 {
+			recs = append(recs, alerts.Record{Loop: "l1", Namespace: "ns", Source: alerts.SourceKubeArmor, Action: "Audit", Target: fmt.Sprintf("/a/b/c%d/f%d", i, j), Verdict: "allowed", Detail: "operation=File, pod=l1-sandbox"})
+		}
+	}
+	s := SuggestFromRecords(recs, "l1", "ns")
+	if want := []string{"/a/b/"}; !slices.Equal(s.Files, want) {
+		t.Errorf("files = %v, want %v", s.Files, want)
+	}
+
+	recs = recs[:0]
+	for i := range 6 {
+		for j := range 6 {
+			recs = append(recs, alerts.Record{Loop: "l1", Namespace: "ns", Source: alerts.SourceKubeArmor, Action: "Audit", Target: fmt.Sprintf("/x%d/f%d", i, j), Verdict: "allowed", Detail: "operation=File, pod=l1-sandbox"})
+		}
+	}
+	s = SuggestFromRecords(recs, "l1", "ns")
+	wantFiles := make([]string, 0, 6)
+	for i := range 6 {
+		wantFiles = append(wantFiles, fmt.Sprintf("/x%d/", i))
+	}
+	if !slices.Equal(s.Files, wantFiles) {
+		t.Errorf("files = %v, want %v (top level must not collapse to root)", s.Files, wantFiles)
+	}
+}
+
+// R49 I228 (review on #420): a collapsed "dir/" entry is recursive (D113),
+// so entries under it are dropped into their nearest strict ancestor "dir/"
+// entry, and unrelated entries survive.
+func TestSuggestFromRecordsDropsEntriesUnderACollapsedDir(t *testing.T) {
+	// /a/ holds 6 distinct files -> it collapses to "/a/" (threshold 5).
+	// /a/b/c.txt, /a/d/ (inside it) and /z.txt (unrelated) must not survive.
+	recs := make([]alerts.Record, 0, 10)
+	for i := range 6 {
+		recs = append(recs, alerts.Record{Loop: "l1", Namespace: "ns", Source: alerts.SourceKubeArmor, Action: "Audit", Target: "/a/f" + string(rune('a'+i)), Verdict: "allowed", Detail: "operation=File, pod=l1-sandbox"})
+	}
+	recs = append(recs,
+		alerts.Record{Loop: "l1", Namespace: "ns", Source: alerts.SourceKubeArmor, Action: "Audit", Target: "/a/b/c.txt", Verdict: "allowed", Detail: "operation=File, pod=l1-sandbox"},
+		alerts.Record{Loop: "l1", Namespace: "ns", Source: alerts.SourceKubeArmor, Action: "Audit", Target: "/a/d/x.txt", Verdict: "allowed", Detail: "operation=File, pod=l1-sandbox"},
+		alerts.Record{Loop: "l1", Namespace: "ns", Source: alerts.SourceKubeArmor, Action: "Audit", Target: "/a/d/y.txt", Verdict: "allowed", Detail: "operation=File, pod=l1-sandbox"},
+		alerts.Record{Loop: "l1", Namespace: "ns", Source: alerts.SourceKubeArmor, Action: "Audit", Target: "/z.txt", Verdict: "allowed", Detail: "operation=File, pod=l1-sandbox"},
+	)
+	s := SuggestFromRecords(recs, "l1", "ns")
+	if want := []string{"/a/", "/z.txt"}; !slices.Equal(s.Files, want) {
+		t.Errorf("files = %v, want %v", s.Files, want)
+	}
+	// /a/ must carry the sum of the entries it covers (6 collapsed files +
+	// 1 /a/b/c.txt + 1 /a/d/): the collapsed map keeps exactly the sum.
+	if got := collapseFileDirs(map[string]int{
+		"/a/fa": 1, "/a/fb": 1, "/a/fc": 1, "/a/fd": 1, "/a/fe": 1, "/a/ff": 1,
+		"/a/b/c.txt": 1, "/a/d/": 1,
+	}); len(got) != 1 || got["/a/"] != 8 {
+		t.Errorf("collapsed = %v, want {/a/: 8} (sum of covered entries)", got)
+	}
+
+	// A collapsed directory UNDER another collapsed directory is subsumed by
+	// the OUTERMOST ancestor too (R49 I228, review on #420: run 8 listed
+	// /usr/local/go/src/ next to /usr/local/go/src/compress/flate/). The
+	// result is exactly ["/a/"] carrying all three counts, and the unrelated
+	// /z.txt survives.
+	recs = recs[:0]
+	for i := range 6 {
+		recs = append(recs, alerts.Record{Loop: "l1", Namespace: "ns", Source: alerts.SourceKubeArmor, Action: "Audit", Target: "/a/f" + string(rune('a'+i)), Verdict: "allowed", Detail: "operation=File, pod=l1-sandbox"})
+	}
+	recs = append(recs,
+		alerts.Record{Loop: "l1", Namespace: "ns", Source: alerts.SourceKubeArmor, Action: "Audit", Target: "/a/b/c.txt", Verdict: "allowed", Detail: "operation=File, pod=l1-sandbox"},
+		alerts.Record{Loop: "l1", Namespace: "ns", Source: alerts.SourceKubeArmor, Action: "Audit", Target: "/z.txt", Verdict: "allowed", Detail: "operation=File, pod=l1-sandbox"},
+	)
+	s = SuggestFromRecords(recs, "l1", "ns")
+	if want := []string{"/a/", "/z.txt"}; !slices.Equal(s.Files, want) {
+		t.Errorf("files = %v, want %v (nested collapsed dir subsumed by its outermost ancestor)", s.Files, want)
+	}
+	// Direct subsumption of the input {"/a/", "/a/b/", "/a/b/c.txt"} (plus the
+	// unrelated /z.txt survivor): the result is exactly "/a/" carrying all
+	// three counts.
+	if got := collapseFileDirs(map[string]int{"/a/": 1, "/a/b/": 1, "/a/b/c.txt": 1, "/z.txt": 1}); len(got) != 2 || got["/a/"] != 3 || got["/z.txt"] != 1 {
+		t.Errorf("collapsed = %v, want {/a/: 3, /z.txt: 1} (nested dir/ and its file roll into the outermost ancestor)", got)
+	}
+}
+
 // D112: 70 distinct exec paths overflow the 64-entry cap; the kept 64 are
 // the highest-count entries (ties broken by name), the rest go to
 // ExecOverflow.

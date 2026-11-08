@@ -46,3 +46,4 @@ rules:
   # conditions the CLI used to set are read back as the operator's own
   # writes and the hold releases — the known-issue documented in
   # UPGRADE.md's v0.1.2 note; this role change is the durable fix.)
+  # P6c (D114): a ValidatingAdmissionPolicy now enforces this: no one but the operator's ServiceAccount can write loops/status.

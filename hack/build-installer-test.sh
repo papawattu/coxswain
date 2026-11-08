@@ -131,4 +131,45 @@ sys.exit(0)
 I85PY
 ) || { echo "$i85_check"; exit 1; }
 
-echo "OK: build-installer renders install.yaml with tag $TAG on all five coxswain images (controller + runner + model-proxy + tool-proxy + egress-proxy), preserves the base manager args, and includes BOTH the ValidatingAdmissionPolicy (cluster-scoped, no namespace) and its ValidatingAdmissionPolicyBinding (namespaced, policyName matches) (I85): $i85_check"
+# 9. (P6c/D114) the rendered install.yaml contains BOTH the
+#    coxswain-deny-loop-status-writes ValidatingAdmissionPolicy AND its
+#    ValidatingAdmissionPolicyBinding, and the binding's policyName matches
+#    the VAP's name. The VAP is cluster-scoped (no namespace field); the
+#    binding carries no namespace either.
+p6c_check=$(python3 - "$OUT" <<'P6CPY'
+import yaml, sys
+path = sys.argv[1]
+VAP_NAME = "coxswain-deny-loop-status-writes"
+docs = list(yaml.safe_load_all(open(path)))
+vap = None
+binding = None
+for d in docs:
+    if not d:
+        continue
+    if d.get("kind") == "ValidatingAdmissionPolicy" and d.get("metadata", {}).get("name") == VAP_NAME:
+        vap = d
+    if d.get("kind") == "ValidatingAdmissionPolicyBinding" and d.get("metadata", {}).get("name") == VAP_NAME:
+        binding = d
+if vap is None:
+    print("FATAL: ValidatingAdmissionPolicy '%s' is missing from install.yaml" % VAP_NAME)
+    sys.exit(1)
+ns = vap.get("metadata", {}).get("namespace", "")
+if ns:
+    print("FATAL: VAP %s has namespace=%s (cluster-scoped resources must not have a namespace)" % (VAP_NAME, ns))
+    sys.exit(1)
+if binding is None:
+    print("FATAL: ValidatingAdmissionPolicyBinding '%s' is missing from install.yaml (the admission gate is off - the policy exists but is not bound)" % VAP_NAME)
+    sys.exit(1)
+if not binding.get("metadata", {}).get("namespace", ""):
+    print("FATAL: the binding's namespace is empty (kustomize requires a namespace on the namespaced binding; the standalone admission kustomization sets it explicitly, unlike the cluster-scoped VAP which must carry none)")
+    sys.exit(1)
+policy_name = binding.get("spec", {}).get("policyName", "")
+if policy_name != VAP_NAME:
+    print("FATAL: the binding's policyName=%s does not match the VAP's name=%s" % (policy_name, VAP_NAME))
+    sys.exit(1)
+print("OK: VAP (cluster-scoped, no namespace) + binding (namespaced, policyName matches) both present")
+sys.exit(0)
+P6CPY
+) || { echo "$p6c_check"; exit 1; }
+
+echo "OK: build-installer renders install.yaml with tag $TAG on all five coxswain images (controller + runner + model-proxy + tool-proxy + egress-proxy), preserves the base manager args, and includes BOTH the ValidatingAdmissionPolicy (cluster-scoped, no namespace) and its ValidatingAdmissionPolicyBinding (namespaced, policyName matches) (I85): $i85_check" "$p6c_check"

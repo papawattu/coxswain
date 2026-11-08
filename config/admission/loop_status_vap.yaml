@@ -1,0 +1,57 @@
+# P6c (D85(a), D114): deny EVERY loops/status write except the operator's own
+# ServiceAccount (system:serviceaccount:coxswain-system:
+# coxswain-controller-manager).
+#
+# Since D85 the CLI writes only the one-shot coxswain.io/approve /
+# coxswain.io/reject annotations on the Loop OBJECT — the operator is the sole
+# writer of the status subresource (the PlanApproved / PlanRejected
+# conditions, the phase machine, the checkpoint records, everything). The
+# editor role's loops/status grant is get-only, but the admission chain here
+# is the hard boundary: the VAP matches loops/status UPDATE and PATCH and
+# allows it ONLY for the operator's ServiceAccount.
+#
+# Cluster admins are blocked too (D114): this is not a role-based exemption,
+# it is a "who wrote this status" gate. A break-glass edit removes the
+# binding (documented in the step-2 docs), never a change to the policy.
+#
+# NOTE (P6c): admissionregistration.k8s.io/v1 ValidatingAdmissionPolicy uses
+# the GA-on-k8s-1.34 v1 schema (spec.matchConstraints.resourceRules /
+# spec.validations / spec.policyName), same shape as
+# validating_admission_policy.yaml. Apply it with kubectl against a 1.34+
+# cluster.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: deny-loop-status-writes
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["coxswain.wattu.com"]
+        apiVersions: ["v1alpha1"]
+        resources: ["loops/status"]
+        operations: ["UPDATE"]
+  validations:
+    - expression: >-
+        request.userInfo.username ==
+        'system:serviceaccount:coxswain-system:coxswain-controller-manager'
+      message: >-
+        Loop status is written only by the coxswain operator (D85/D114);
+        approve or reject a plan with cox approve / cox reject (an annotation
+        on the Loop).
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: deny-loop-status-writes
+  # I85: the binding is namespaced (unlike the cluster-scoped VAP). The
+  # namespace is set explicitly here because the admission kustomization is
+  # standalone (not under config/default's namespace transform).
+  namespace: coxswain-system
+spec:
+  # I85: the kustomize namePrefix (coxswain-) transforms metadata.name but
+  # NOT spec.policyName (a spec field). The VAP is rendered as
+  # coxswain-deny-loop-status-writes, so the binding must reference the
+  # prefixed name explicitly.
+  policyName: coxswain-deny-loop-status-writes
+  validationActions: ["Deny"]

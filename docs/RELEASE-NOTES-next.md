@@ -117,6 +117,14 @@ before.
 
 ## Security fixes
 
+### P6c: only the operator writes Loop status (D85(a), D114) — #416
+
+**What was wrong:** D85 made the operator the sole writer of Loop status at the CLI level (approve/reject now annotate the Loop, not the status subresource), but the admission chain had no hard boundary: a user with the editor role's old grants, or a cluster admin, could still `kubectl patch` `loops/status` directly and move a Loop's phase or approval state by hand.
+
+**What changed:** a new cluster-scoped ValidatingAdmissionPolicy (`coxswain-deny-loop-status-writes`) plus binding denies every `loops/status` write except the operator's own ServiceAccount — including cluster admins. Approve or reject with `cox approve` / `cox reject` (which write a one-shot annotation on the Loop); the operator consumes the annotation and writes the status itself. Break-glass hand-edits are documented in `docs/OPERATOR.md` (delete the binding, edit, re-apply it).
+
+**On upgrade:** install.yaml and the chart ship the new VAP and binding; any tooling that patched Loop status directly is now denied.
+
 ### I224: AgentPolicy files entries must be canonical absolute paths — #417
 - **What was wrong:** `spec.files` (AgentPolicy and ClusterAgentPolicy) had no validation. It accepted relative paths and `..`, `//` or `.` segments, and a files entry is a grant.
 - **What changed:** the CRD rejects such an entry at admission, with the message `files entries must be absolute canonical paths …`, and limits the list to 64 entries of at most 512 characters each. A trailing `/` is still allowed: it means the directory, recursively (D113).

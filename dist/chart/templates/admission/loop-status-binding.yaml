@@ -1,0 +1,15 @@
+{{- /*
+P6c (D85(a), D114): the ValidatingAdmissionPolicyBinding for the
+coxswain-deny-loop-status-writes VAP (loop-status-vap.yaml next to this
+one). Like the I45 deny-ephemeral-containers binding, both objects carry
+the literal name the kustomize install.yaml produces, so the chart and
+install.yaml yield the same pair at any release name. A binding is
+cluster-scoped, so it carries no namespace.
+*/}}
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: coxswain-deny-loop-status-writes
+spec:
+  policyName: coxswain-deny-loop-status-writes
+  validationActions: ["Deny"]

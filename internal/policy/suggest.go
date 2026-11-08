@@ -160,31 +160,44 @@ func execAllowable(p string) bool {
 		p != "/tmp" && !strings.HasPrefix(p, "/tmp/")
 }
 
-// collapseFileDirs turns a busy directory into one "dir/" entry: a directory
-// with more than suggestDirCollapse distinct targets is replaced by its dir +
-// "/" (the union of its targets' counts), the rest stay exact paths (D112).
+// collapseFileDirs turns busy directory trees into one "dir/" entry,
+// recursively (R49 I228): a directory with more than suggestDirCollapse
+// distinct targets is replaced by its dir + "/" (the sum of its targets'
+// counts), then the collapsed tree is regrouped and re-collapsed until a
+// full pass changes nothing — so a busy subtree stays collapsed to its
+// deepest busy ancestor, not one level. The root "/" is never collapsed
+// itself: a parent of "/" stays as distinct entries (D112).
 func collapseFileDirs(files map[string]int) map[string]int {
-	byDir := map[string]map[string]int{}
-	for target, count := range files {
-		dir := path.Dir(target)
-		if byDir[dir] == nil {
-			byDir[dir] = map[string]int{}
-		}
-		byDir[dir][target] = count
-	}
-	out := map[string]int{}
-	for dir, targets := range byDir {
-		if len(targets) > suggestDirCollapse {
-			total := 0
-			for _, count := range targets {
-				total += count
+	entries := map[string]int{}
+	maps.Copy(entries, files)
+	for {
+		byDir := map[string]map[string]int{}
+		for entry, count := range entries {
+			dir := path.Dir(strings.TrimSuffix(entry, "/"))
+			if byDir[dir] == nil {
+				byDir[dir] = map[string]int{}
 			}
-			out[dir+"/"] = total
-			continue
+			byDir[dir][entry] = count
 		}
-		maps.Copy(out, targets)
+		out := map[string]int{}
+		changed := false
+		for dir, group := range byDir {
+			if dir != "/" && len(group) > suggestDirCollapse {
+				total := 0
+				for _, count := range group {
+					total += count
+				}
+				out[dir+"/"] = total
+				changed = true
+				continue
+			}
+			maps.Copy(out, group)
+		}
+		entries = out
+		if !changed {
+			return out
+		}
 	}
-	return out
 }
 
 // capList keeps the suggestLimit entries with the highest counts (ties broken

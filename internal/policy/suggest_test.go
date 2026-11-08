@@ -103,6 +103,37 @@ func TestSuggestFromRecordsCollapsesBusyDirs(t *testing.T) {
 	}
 }
 
+// R49 I228: busy directory trees collapse recursively: 6 sub-directories each
+// with 6 files collapse to the single deepest busy ancestor, and 6 busy
+// top-level directories do NOT collapse to "/" itself.
+func TestSuggestFromRecordsCollapsesRecursively(t *testing.T) {
+	recs := make([]alerts.Record, 0, 72)
+	for i := range 6 {
+		for j := range 6 {
+			recs = append(recs, alerts.Record{Loop: "l1", Namespace: "ns", Source: alerts.SourceKubeArmor, Action: "Audit", Target: fmt.Sprintf("/a/b/c%d/f%d", i, j), Verdict: "allowed", Detail: "operation=File, pod=l1-sandbox"})
+		}
+	}
+	s := SuggestFromRecords(recs, "l1", "ns")
+	if want := []string{"/a/b/"}; !slices.Equal(s.Files, want) {
+		t.Errorf("files = %v, want %v", s.Files, want)
+	}
+
+	recs = recs[:0]
+	for i := range 6 {
+		for j := range 6 {
+			recs = append(recs, alerts.Record{Loop: "l1", Namespace: "ns", Source: alerts.SourceKubeArmor, Action: "Audit", Target: fmt.Sprintf("/x%d/f%d", i, j), Verdict: "allowed", Detail: "operation=File, pod=l1-sandbox"})
+		}
+	}
+	s = SuggestFromRecords(recs, "l1", "ns")
+	wantFiles := make([]string, 0, 6)
+	for i := range 6 {
+		wantFiles = append(wantFiles, fmt.Sprintf("/x%d/", i))
+	}
+	if !slices.Equal(s.Files, wantFiles) {
+		t.Errorf("files = %v, want %v (top level must not collapse to root)", s.Files, wantFiles)
+	}
+}
+
 // D112: 70 distinct exec paths overflow the 64-entry cap; the kept 64 are
 // the highest-count entries (ties broken by name), the rest go to
 // ExecOverflow.

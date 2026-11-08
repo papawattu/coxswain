@@ -41,9 +41,12 @@ type scriptedSource struct {
 type attachment struct {
 	lines []string
 	err   error
+	// gate, when non-nil, is waited on (with ctx) before the attach returns
+	// its reader or error, so the test can hold a reattach open.
+	gate chan struct{}
 }
 
-func (s *scriptedSource) Follow(_ context.Context, _, _, _ string, since *time.Time) (io.ReadCloser, error) {
+func (s *scriptedSource) Follow(ctx context.Context, _, _, _ string, since *time.Time) (io.ReadCloser, error) {
 	s.mu.Lock()
 	idx := s.follows
 	s.follows++
@@ -53,6 +56,13 @@ func (s *scriptedSource) Follow(_ context.Context, _, _, _ string, since *time.T
 		idx = len(s.attaches) - 1
 	}
 	a := s.attaches[idx]
+	if a.gate != nil {
+		select {
+		case <-a.gate:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
 	if a.err != nil {
 		return nil, a.err
 	}
@@ -681,9 +691,12 @@ func TestRelayProxyStreamAloneIsNotHealthy(t *testing.T) {
 // Mutation: make noteHealthy refuse Unavailable too → the Loop stays Unknown.
 func TestRelayRecoversFromUnavailableOnAFullReattach(t *testing.T) {
 	base := time.Date(2026, 10, 26, 10, 0, 0, 0, time.UTC)
+	// The reattach gate holds the second Follow open so the transient
+	// Unavailable state is observable before the full re-read clears it (I229).
+	reattach := make(chan struct{})
 	src := &scriptedSource{attaches: []attachment{
 		{err: errors.New("temporary apiserver error")},
-		{lines: []string{kubeArmorBlock(base.Add(time.Second), "Block", f62Sandbox, f62SandboxP, "/a")}},
+		{gate: reattach, lines: []string{kubeArmorBlock(base.Add(time.Second), "Block", f62Sandbox, f62SandboxP, "/a")}},
 	}}
 	holder := f62Fixture(t, src)
 
@@ -691,6 +704,7 @@ func TestRelayRecoversFromUnavailableOnAFullReattach(t *testing.T) {
 		s, ok := holder.Snapshot(f62UID)
 		return ok && s.Health == HealthUnavailable
 	})
+	close(reattach)
 	waitFor(t, "recovery to Healthy after the full re-read", func() bool {
 		s, ok := holder.Snapshot(f62UID)
 		return ok && s.Health == HealthHealthy

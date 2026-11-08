@@ -440,6 +440,23 @@ The plan the agent wrote (`.coxswain/PLAN.md` in the workspace):
 kubectl cox plan <loop>
 ```
 
+### Who may write Loop status (P6c, D114)
+
+Only the operator's own ServiceAccount may write `loops/status`: a
+ValidatingAdmissionPolicy (`coxswain-deny-loop-status-writes`) denies every
+other writer — including cluster admins. To approve or reject a plan, use
+`cox approve` / `cox reject`; those commands write a one-shot annotation on
+the Loop, and the operator consumes it and writes the status itself.
+
+**Break-glass:** to hand-edit `loops/status`, delete the binding first,
+then re-apply it afterwards:
+
+```bash
+kubectl delete validatingadmissionpolicybinding coxswain-deny-loop-status-writes
+# … make the hand edit …
+kubectl apply -f dist/install.yaml   # or a `helm upgrade` for a chart install
+```
+
 ### What `Succeeded` means (P5f, I98)
 
 `Succeeded` means the verify checks passed AND delivery has finished (a PR

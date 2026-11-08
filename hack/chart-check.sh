@@ -128,11 +128,31 @@ for k in dups:
 for d in docs:
     if d.get('kind') in CLUSTER_SCOPED and 'namespace' in d['metadata']:
         bad.append("cluster-scoped %s/%s carries metadata.namespace=%s" % (d['kind'], d['metadata']['name'], d['metadata']['namespace']))
-# F45's outcome is ONE effective binding: a consistent second VAP+binding pair
-# would resolve and not collide, but is the same defect in a quieter form.
+# F45's outcome is ONE binding per policy, and P6c added the second policy
+# (coxswain-deny-loop-status-writes): the render must carry exactly this set,
+# no duplicates, no drops.
+EXPECTED_BINDINGS = {'coxswain-deny-ephemeral-containers', 'coxswain-deny-loop-status-writes'}
 bindings = [d for d in docs if d.get('kind') == 'ValidatingAdmissionPolicyBinding']
-if len(bindings) != 1:
-    bad.append("expected exactly 1 ValidatingAdmissionPolicyBinding, found %d: %s" % (len(bindings), [b['metadata']['name'] for b in bindings]))
+names = {b['metadata']['name'] for b in bindings}
+if names != EXPECTED_BINDINGS:
+    bad.append("expected exactly the ValidatingAdmissionPolicyBindings %s, found %s" % (sorted(EXPECTED_BINDINGS), sorted(names)))
+# P6c: the loop-status VAP's expression names the operator's ServiceAccount in
+# the release namespace. A FIXED namespace/name there would deny the operator
+# itself on a non-default install (D114), so the rendered expression must carry
+# the templated SA of this render.
+sas = [d for d in docs if d.get('kind') == 'ServiceAccount' and d['metadata']['name'].endswith('controller-manager')]
+if not sas:
+    bad.append("no ServiceAccount named *controller-manager in the render (cannot verify the VAP's SA reference)")
+else:
+    sa = sas[0]['metadata']['name']
+    loop_vap = [d for d in docs if d.get('kind') == 'ValidatingAdmissionPolicy' and d['metadata']['name'] == 'coxswain-deny-loop-status-writes']
+    if not loop_vap:
+        bad.append("ValidatingAdmissionPolicy coxswain-deny-loop-status-writes missing from the render")
+    else:
+        expr = loop_vap[0]['spec']['validations'][0]['expression']
+        want = "system:serviceaccount:%s:%s" % (sas[0]['metadata']['namespace'], sa)
+        if want not in expr:
+            bad.append("coxswain-deny-loop-status-writes expression does not contain %s: a fixed name would deny the operator itself on a non-default install (D114)" % want)
 if not vaps:
     bad.append("no ValidatingAdmissionPolicy in the render (the guard would pass vacuously)")
 if bad:

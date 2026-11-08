@@ -1,0 +1,38 @@
+{{- /*
+P6c (D85(a), D114): the ValidatingAdmissionPolicy that denies every
+loops/status write EXCEPT the operator's own ServiceAccount. The kustomize
+install.yaml install applies this (config/admission, the standalone
+kustomization hack/build-installer.sh appends to install.yaml); the generated
+chart template loop-status-binding.yaml (next to this one) carries the
+matching ValidatingAdmissionPolicyBinding.
+The VAP carries the LITERAL name coxswain-deny-loop-status-writes (the
+kustomize namePrefix coxswain- in config/admission, not the Helm fullname —
+the two install methods are independent), so the binding's policyName
+references that fixed name.
+But the validation expression TEMPLATES the operator's ServiceAccount
+instead of pinning coxswain-system/coxswain-controller-manager: a Helm
+install can use a release namespace or name other than install.yaml's
+coxswain-system/coxswain-controller-manager, and a fixed name would deny
+the operator itself (its own status writes would fail the VAP and every
+Loop would stall at the admission gate).
+*/}}
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: coxswain-deny-loop-status-writes
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["coxswain.wattu.com"]
+        apiVersions: ["v1alpha1"]
+        resources: ["loops/status"]
+        operations: ["UPDATE"]
+  validations:
+    - expression: >-
+        request.userInfo.username ==
+        'system:serviceaccount:{{ .Release.Namespace }}:{{ include "coxswain.serviceAccountName" . }}'
+      message: >-
+        Loop status is written only by the coxswain operator (D85/D114);
+        approve or reject a plan with cox approve / cox reject (an annotation
+        on the Loop).

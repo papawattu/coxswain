@@ -98,7 +98,7 @@ evidence the owner asked for.
 
   **Acceptance:** that run shows an `egress-proxy` record for the Loop and a `network` entry in `suggest`.
 
-- [ ] **I223: the agent's KubeArmorPolicy also covers the verify pod (owner question)**
+- [x] **I223: the agent's KubeArmorPolicy also covers the verify pod (owner question)** (`d2aca41`)
 
   **Where:** `internal/engine/kubearmor.go:163`: the selector is `coxswain.io/loop: <loop>`. The verify pod carries that label (run 3's verify-pod labels in `run3/p6b3-ka-stdout.jsonl`), and the verify pod's records match the agent policy in runs 4-8.
 
@@ -117,7 +117,7 @@ evidence the owner asked for.
 
   **Acceptance:** the decision is recorded, plus a spec on the selector.
 
-- [ ] **I224: AgentPolicy `files` entries have no path validation**
+- [x] **I224: AgentPolicy `files` entries have no path validation** (`6b49389`)
 
   **Where:** `api/v1alpha1/agentpolicy_types.go:107-110` (no XValidation); `internal/controller/loop_controller.go:7165` canonicalises `exec` only.
 
@@ -184,7 +184,7 @@ evidence the owner asked for.
 
   **Acceptance:** run 8's log yields 20 or fewer files entries with no overflow.
 
-- [ ] **I229: `TestRelayRecoversFromUnavailableOnAFullReattach` polls a ~5ms transient state**
+- [x] **I229: `TestRelayRecoversFromUnavailableOnAFullReattach` polls a ~5ms transient state** (`7317832`)
 
   **Where:** `internal/alerts/relay_test.go` (the spec); `scratchpad/f62b-full3.log` (`timed out waiting for the unavailable state` at load ~11).
 

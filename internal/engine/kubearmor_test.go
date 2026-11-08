@@ -343,3 +343,33 @@ func TestEmitKubeArmorPolicyDNSAllowUDPAndTCP(t *testing.T) {
 		t.Errorf("matchDNSQueries must include l1-proxy.ns.svc (the proxy Service FQDN), got %v", domains)
 	}
 }
+
+// D115: the agent KubeArmorPolicy's selector must match the sandbox pod ONLY
+// (not the verify pod, which carries the coxswain.io/loop label but not the
+// component label). The selector is exactly {coxswain.io/loop: <loop>,
+// app.kubernetes.io/component: agent}.
+func TestEmitKubeArmorPolicySelectsTheSandboxOnly(t *testing.T) {
+	want := map[string]any{
+		"coxswain.io/loop":       "l1",
+		policy.ComponentLabelKey: policy.ComponentAgentLabel,
+	}
+	for name, obj := range map[string]map[string]any{
+		"enforcing": EmitKubeArmorPolicy("l1", "ns", policy.Translate(policy.EffectivePolicy{}, "l1-proxy.ns.svc", "")).Object,
+		"auditOnly": EmitKubeArmorPolicy("l1", "ns", policy.Translate(policy.EffectivePolicy{AuditOnly: true}, "l1-proxy.ns.svc", "")).Object,
+	} {
+		spec := obj["spec"].(map[string]any)
+		sel := spec["selector"].(map[string]any)
+		got, ok := sel["matchLabels"].(map[string]any)
+		if !ok {
+			t.Fatalf("%s: matchLabels must be a map, got %v", name, sel)
+		}
+		if len(got) != 2 {
+			t.Errorf("%s: selector must have exactly 2 labels, got %v", name, got)
+		}
+		for k, v := range want {
+			if got[k] != v {
+				t.Errorf("%s: selector must match %s=%v, got %v", name, k, v, got)
+			}
+		}
+	}
+}

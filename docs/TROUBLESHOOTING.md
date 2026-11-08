@@ -638,8 +638,9 @@ ignored (the read filters on the pod's UID), so the retries are not burned on
 old evidence.
 
 **What to do:** create the Secret (or fix the volume) named in the message,
-then **delete and re-apply the Loop** — `Failed:SandboxFailed` is terminal and
-there is no retry command. The attempt count belongs to one **run**
+then run **`kubectl cox retry <loop>`** (P6d, D116): the Loop resumes the
+phase it failed in, from its current checkpoint, with the sandbox-attempt count
+reset; a Normal `Retried` Event records it. The attempt count belongs to one **run**
 (`status.agent.infraAttempts`, keyed by `status.agent.infraEpisode` = the
 iteration + desired phase, F48g), so only an EPISODE BOUNDARY resets the count
 for a Loop that has not failed yet. There are four of them: a new run (the
@@ -649,7 +650,8 @@ the rollback — and the A2 empty-workspace rebuild. A UID change does **not**
 reset it: the operator's own retry recreates the sandbox, so a reset there would
 make the bound unreachable (that was the F6/#266 defect). But a Loop already
 `Failed:SandboxFailed` stays `Failed` through a rollback (a rollback never
-changes the phase), so delete and re-apply it.
+changes the phase), so use `cox retry` (it applies only to `SandboxFailed`;
+every other Failed reason is refused).
 Notes: a wedge that produces no such Event (e.g. a
 node that cannot schedule the pod) is still only surfaced as
 `SandboxNotStarting`, not failed; the kubelet's Events expire with the

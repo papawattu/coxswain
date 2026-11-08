@@ -674,6 +674,18 @@ kubectl cox redeliver <loop>
 This sets the `coxswain.io/redeliver` annotation, which the operator picks
 up on the next reconcile and re-runs the deliver Job.
 
+### 8. Retry a Loop that failed with SandboxFailed
+
+A `Failed:SandboxFailed` Loop (e.g. a missing `gitCredentialSecret`) can be
+retried once the cause is fixed, without deleting and re-applying the Loop
+and losing its history:
+
+```sh
+kubectl cox retry <loop>
+```
+
+It sets the one-shot `coxswain.io/retry` annotation. The operator resumes the phase the Loop failed in, from its current checkpoint, resets the sandbox-attempt count, deletes the failed Sandbox, and emits a Normal `Retried` Event. Any other Failed reason is refused (the CLI names it; the operator ignores and removes an annotation it did not accept).
+
 ---
 
 ## Uninstall

@@ -174,7 +174,7 @@ make lint-fix   # Auto-fix code style
 make test       # Run unit tests
 ```
 
-### Test norms (R16 I43; R20 I49; R21 I55; R25 I84; R26 I90; R28 I92)
+### Test norms (R16 I43; R20 I49; R21 I55; R25 I84; R26 I90; R28 I92; R49 I220; R50)
 
 - Every object the controller reconciles gets at least one **same-Loop**
   envtest spec that changes an input and re-reconciles, asserting the object
@@ -333,6 +333,35 @@ make test       # Run unit tests
 - **Use `~/go/bin/kind`** (or put it on `PATH` in hack scripts) (R28 I92).
   A `kind` not found on `PATH` is not a kind fault — check `~/go/bin` first
   before claiming the tooling is broken (see the rule above).
+- **A feature that consumes a third-party component's output is proven with
+  that component's REAL output** (R49 I220). A spec parses a line captured
+  from the real component (testdata copied byte for byte, not hand-written),
+  and one kind run shows a non-empty result end to end. An RBAC proof
+  (`can-i` plus zero `forbidden`) is not enough: F62's relay merged on RBAC
+  evidence alone and never saw a real KubeArmor alert (wrong key case, no
+  stdout logging, a false zero from an attached-but-silent stream).
+- **Dry-run every generated manifest against the real CRD** (R49 I226(e)).
+  A tool that emits a Kubernetes object (`cox policy suggest`, a rendered
+  policy) is checked with `kubectl apply --dry-run=server` on a cluster with
+  the current CRD installed. A candidate can pass every unit test and still
+  be rejected by a CRD rule, as the run-7 `suggest` candidate was.
+- **An order-dependent mutation is run with `-count` of at least 20**
+  (R50). A spec whose outcome depends on map iteration or goroutine order
+  can pass a single run with the mutation applied. Run the mutation at least
+  20 times and report the FAIL count.
+- **A mutation of a clause that appears more than once targets the exact
+  occurrence** (R50 I235(a)). Check the occurrence count before replacing.
+  The first I224 mutation removed the exec rule's identical
+  `!e.contains('/../')` instead of the files rule's, and passed for the
+  wrong reason.
+- **A builder's root-cause claim carries the failing output** (R50 I234(f),
+  extending I76 and R25 I84). "Envtest does not enforce X" or "the tool is
+  broken" is accepted only with the failing command and its output. In P6c
+  the output showed RBAC (`User … cannot update resource "loops/status"`),
+  not the claimed admission gap.
+- **A test-only flake fix shows a before/after under load** (R50, #419).
+  Run the old and new spec under the same stress (CPU burners,
+  `GOMAXPROCS=1`, `-count=200`) and report both failure counts.
 
 ## CLI Commands Cheat Sheet
 

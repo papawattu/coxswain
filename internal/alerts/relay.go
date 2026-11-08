@@ -510,6 +510,15 @@ func (r *Relay) pruneFollowers(current map[string]struct{}) {
 // stream ends (a rotation, a broken read), re-attaches from the last accepted
 // alert, and retries a follow that could not be opened at all. It returns when
 // the pod's follower is pruned or the manager stops.
+//
+// D118 (R51 P1): the REPLAY filter runs only at a reattach boundary — the few
+// lines the re-attach re-reads at or below the last accepted time. KubeArmor
+// timestamps are NOT monotonic: on the kind-ref run 10 agent log, 30% of the
+// lines carry an updatedTime EARLIER than an earlier line. A per-line "not
+// strictly after the last accepted" filter therefore dropped out-of-order
+// lines mid-stream (6904 of 9092 real sandbox lines relayed), and a block
+// among them undercounted a healthy Loop. After the boundary is passed (the
+// first line strictly after the boundary time), every line is accepted.
 func (r *Relay) follow(ctx context.Context, peer Peer) {
 	log := r.log().WithValues("pod", peer.Namespace+"/"+peer.Pod, "container", peer.Container)
 	retry := r.Retry
@@ -517,6 +526,10 @@ func (r *Relay) follow(ctx context.Context, peer Peer) {
 		retry = defaultFollowRetry
 	}
 	var since *time.Time
+	// sinceAtMax maps the raw lines accepted AT the latest accepted time (the
+	// replay filter skips them on a reattach even at the same instant). It is
+	// reset whenever since moves to a later time. D118.
+	var sinceAtMax map[string]struct{}
 	attached := false
 	for {
 		if ctx.Err() != nil {
@@ -543,8 +556,27 @@ func (r *Relay) follow(ctx context.Context, peer Peer) {
 		// gapPending: this is a RE-attach (since != nil) and the first line
 		// that is not a replay decides whether the window is provable. The rule
 		// (design F62): a first line later than the last accepted alert is a
-		// gap → Unknown, never a smaller number.
+		// gap → Unknown, never a smaller number. D118 keeps this rule EXACTLY
+		// as it was: the skip branches below are no-ops (continue) on the
+		// skipped lines, so the first NON-REPLAYED line of a reattach is what
+		// trips it.
 		gapPending := since != nil
+		// boundary is this attach's reattach point (nil on the first attach):
+		// lines at or before it may be replays of lines already accepted; the
+		// first line strictly AFTER it ends the filter for this attach (D118).
+		var boundary *time.Time
+		var boundarySeen map[string]struct{}
+		// attachSeenAtBoundary: the raw lines accepted at this attach's
+		// boundary instant so far — the in-attach dedup for a replayed
+		// copy (D118).
+		attachSeenAtBoundary := map[string]struct{}{}
+		if since != nil {
+			boundary = since
+			boundarySeen = make(map[string]struct{}, len(sinceAtMax))
+			for line := range sinceAtMax {
+				boundarySeen[line] = struct{}{}
+			}
+		}
 		failures := 0
 		scanner := bufio.NewScanner(rc)
 		scanner.Buffer(make([]byte, 0, 64*1024), maxLineBytes)
@@ -563,20 +595,51 @@ func (r *Relay) follow(ctx context.Context, peer Peer) {
 				continue
 			}
 			failures = 0
-			if since != nil {
-				if !al.Time.After(*since) {
-					// A replayed line at the attach boundary (sinceTime is
-					// inclusive): it is not a new alert, and counting it twice
-					// would inflate the count.
+			if boundary != nil {
+				// D118: the replay filter applies ONLY at this reattach
+				// boundary (sinceTime is inclusive of the last accepted line).
+				switch {
+				case al.Time.Before(*boundary):
+					// An earlier instant: a replayed line (KubeArmor
+					// timestamps are not monotonic, so this is the ONLY time
+					// test mid-attach — out-of-order lines are real alerts).
 					continue
+				case !al.Time.After(*boundary):
+					// The boundary instant itself: skip the raw lines already
+					// accepted at that time before this attach (a real re-read
+					// replays them) and duplicates within this attach (a stream
+					// that redelivers a line counts it once); any other line at
+					// the same time is a new alert.
+					raw := string(scanner.Bytes())
+					if _, seen := boundarySeen[raw]; seen {
+						continue
+					}
+					if _, dup := attachSeenAtBoundary[raw]; dup {
+						continue
+					}
+					attachSeenAtBoundary[raw] = struct{}{}
+				default:
+					// First line after the boundary: the re-read is exhausted,
+					// the filter stops for this attach.
+					boundary = nil
 				}
 				if gapPending {
 					r.degraded(ctx, peer, HealthGap, ReasonStreamGap)
 					gapPending = false
 				}
 			}
-			ts := al.Time
-			since = &ts
+			if since == nil || al.Time.After(*since) {
+				// MAX update: KubeArmor lines are out of order (D118), so a
+				// late-arriving earlier instant must not pull the reattach
+				// window backwards.
+				since = &al.Time
+				sinceAtMax = map[string]struct{}{string(scanner.Bytes()): {}}
+			} else {
+				if sinceAtMax == nil {
+					sinceAtMax = map[string]struct{}{}
+				}
+				sinceAtMax[string(scanner.Bytes())] = struct{}{}
+			}
 			r.accept(ctx, peer, al)
 			if peer.Kind == PeerEngine {
 				r.markEngineLine(peer)

@@ -20,6 +20,8 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -372,15 +374,21 @@ func TestRelayGapAfterReattach(t *testing.T) {
 }
 
 // TestRelayReplayedLineIsNotCountedTwice is F62 spec 6's second half: sinceTime
-// is inclusive, so the line at the boundary comes back — it must not count
-// twice, and a non-Block line must not count at all.
+// is inclusive, so the line at the boundary comes back on a RE-attach — it must
+// not count twice, and a non-Block line must not count at all.
 //
-// Mutation: remove the dedup/replay check → the count is 3.
+// D118: mid-attach the relay keeps every line (KubeArmor timestamps are not
+// monotonic), so the replay the spec means is the re-read after the stream
+// ends, modelled as two scripted attaches: the first delivers Block and
+// Allow, the second re-reads the Allow line at the boundary and ends. A
+// line already accepted at the boundary time is counted once.
+//
+// Mutation: remove the dedup/replay check → the count is 2.
 func TestRelayReplayedLineIsNotCountedTwice(t *testing.T) {
 	base := time.Date(2026, 10, 26, 10, 0, 0, 0, time.UTC)
 	line := kubeArmorBlock(base.Add(time.Second), "Block", f62Sandbox, f62SandboxP, "/a")
 	allow := kubeArmorBlock(base.Add(2*time.Second), "Allow", f62Sandbox, f62SandboxP, "api")
-	src := &scriptedSource{attaches: []attachment{{lines: []string{line, line, allow}}}}
+	src := &scriptedSource{attaches: []attachment{{lines: []string{line, allow}}, {lines: []string{allow}}}}
 	holder := f62Fixture(t, src)
 
 	waitFor(t, "a count of 1", func() bool {
@@ -926,5 +934,139 @@ func TestRelayFirstEngineLineMakesItHealthy(t *testing.T) {
 	time.Sleep(20 * time.Millisecond)
 	if s, _ := holder.Snapshot(f62UID); s.Health != HealthHealthy {
 		t.Errorf("health = %q reason = %q, want Healthy after the first engine line", s.Health, s.Reason)
+	}
+}
+
+// TestRelayKeepsOutOfOrderLines is D118 (R51 P1): KubeArmor timestamps are not
+// monotonic — in a real agent log 30% of the lines carry an updatedTime earlier
+// than an earlier line (kind-ref run 10: the old per-line "strictly after"
+// filter kept 6904 of 9092 sandbox lines). One attach that delivers the real
+// testdata lines (lines 5 and 6 are EARLIER than line 4) must emit all six.
+//
+// Mutation: put the old per-line filter back (skip any line whose time is not
+// after since) → lines 5 and 6 are dropped and this fails.
+func TestRelayKeepsOutOfOrderLines(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("testdata", "kubearmor-out-of-order.jsonl"))
+	if err != nil {
+		t.Fatalf("reading the real out-of-order agent lines: %v", err)
+	}
+	data := strings.TrimRight(string(raw), "\n")
+	lines := strings.Split(data, "\n")
+	if len(lines) != 6 {
+		t.Fatalf("testdata has %d lines, want 6 real agent lines", len(lines))
+	}
+	var wantTimes = make([]time.Time, 0, len(lines))
+	for _, line := range lines {
+		al, ok := ParseLine([]byte(line))
+		if !ok {
+			t.Fatalf("testdata line does not decode as an alert: %s", line)
+		}
+		wantTimes = append(wantTimes, al.Time)
+	}
+	// The fixture really is out of order: line 5 (index 4) is earlier than
+	// line 4 (index 3), and line 6 (index 5) is earlier than line 4.
+	if !wantTimes[4].Before(wantTimes[3]) || !wantTimes[5].Before(wantTimes[3]) {
+		t.Fatalf("the fixture must be out of order (line 4 = %s, line 5 = %s, line 6 = %s)",
+			wantTimes[3], wantTimes[4], wantTimes[5])
+	}
+	src := &scriptedSource{attaches: []attachment{{lines: lines}}}
+	relay := f62NewRelay(src)
+	var buf bytes.Buffer
+	var mu sync.Mutex
+	relay.Emit = &lockedWriter{w: &buf, mu: &mu}
+	startTestRelay(t, relay)
+
+	// The testdata lines name a pod the fake attributor does not know: every
+	// line is still EMITTED (every alert is), attributed as unattributed.
+	waitFor(t, "six audit lines", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return strings.Count(buf.String(), "\n") >= 6
+	})
+	mu.Lock()
+	emitted := strings.Split(strings.TrimSpace(buf.String()), "\n")
+	mu.Unlock()
+	if len(emitted) != 6 {
+		t.Fatalf("got %d emitted lines for 6 in-order-of-delivery alerts, want exactly one line each: %v", len(emitted), emitted)
+	}
+	gotTimes := make([]string, 0, len(emitted))
+	for _, line := range emitted {
+		var rec map[string]string
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Fatalf("line is not a JSON object: %v (%s)", err, line)
+		}
+		if rec["source"] != SourceKubeArmor {
+			t.Errorf("source = %q, want %q: %s", rec["source"], SourceKubeArmor, line)
+		}
+		// Attributable to the pod: the unattributed detail names the workload
+		// the engine line named (the line's own pod, not the fixture's).
+		if !strings.Contains(rec["detail"], "p6b-learn-verify-1-xns5c") {
+			t.Errorf("detail does not attribute to the pod the line names: %q", rec["detail"])
+		}
+		gotTimes = append(gotTimes, rec["time"])
+	}
+	wantRendered := make([]string, 0, len(wantTimes))
+	for _, ts := range wantTimes {
+		wantRendered = append(wantRendered, ts.UTC().Format(time.RFC3339Nano))
+	}
+	if strings.Join(gotTimes, "|") != strings.Join(wantRendered, "|") {
+		t.Fatalf("emitted times = %v, want all six lines in delivery order %v", gotTimes, wantRendered)
+	}
+}
+
+// TestRelayReattachSkipsOnlyReplayedLines is D118's boundary semantics: on a
+// reattach the replay filter applies ONLY to the re-read prefix. Attach 1 sees
+// A (t1) and B (t2). Attach 2 re-reads B (an exact replay, skipped), a
+// DIFFERENT line C at the same boundary time t2 (kept), an out-of-order line
+// A' at t0 < t2 (skipped: before the boundary), and D (t3) — the first line
+// after the boundary, which ends the filter. Exactly A, B, C, D are emitted,
+// each once.
+//
+// Mutation: skip a boundary-time line that is not in the re-read set (drop the
+// boundarySeen dedup) → B is emitted twice; or filter every line strictly
+// after since → C and A' handling flips and this fails.
+func TestRelayReattachSkipsOnlyReplayedLines(t *testing.T) {
+	t0 := time.Date(2026, 10, 26, 10, 0, 0, 0, time.UTC)
+	t1 := t0.Add(1 * time.Second)
+	t2 := t0.Add(2 * time.Second)
+	t3 := t0.Add(3 * time.Second)
+	A := kubeArmorBlock(t1, "Block", f62Sandbox, f62SandboxP, "/a")
+	B := kubeArmorBlock(t2, "Block", f62Sandbox, f62SandboxP, "/b")
+	C := kubeArmorBlock(t2, "Block", f62Sandbox, f62SandboxP, "/c")
+	A2 := kubeArmorBlock(t0, "Block", f62Sandbox, f62SandboxP, "/a2")
+	D := kubeArmorBlock(t3, "Block", f62Sandbox, f62SandboxP, "/d")
+	src := &scriptedSource{attaches: []attachment{
+		{lines: []string{A, B}},
+		{lines: []string{B, C, A2, D}},
+	}}
+	relay := f62NewRelay(src)
+	var buf bytes.Buffer
+	var mu sync.Mutex
+	relay.Emit = &lockedWriter{w: &buf, mu: &mu}
+	startTestRelay(t, relay)
+
+	waitFor(t, "four audit lines", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return strings.Count(buf.String(), "\n") >= 4
+	})
+	mu.Lock()
+	emitted := strings.Split(strings.TrimSpace(buf.String()), "\n")
+	mu.Unlock()
+	if len(emitted) != 4 {
+		t.Fatalf("got %d emitted lines for A, B, C, D, want exactly 4 (B not twice, A' not at all): %v", len(emitted), emitted)
+	}
+	wantTargets := []string{"/a", "/b", "/c", "/d"}
+	for i, line := range emitted {
+		var rec map[string]string
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Fatalf("line is not a JSON object: %v (%s)", err, line)
+		}
+		if rec["loop"] != f62LoopName {
+			t.Errorf("emitted line %d: loop = %q, want %q: %s", i, rec["loop"], f62LoopName, line)
+		}
+		if i < len(wantTargets) && rec["target"] != wantTargets[i] {
+			t.Errorf("emitted line %d: target = %q, want %q: %s", i, rec["target"], wantTargets[i], line)
+		}
 	}
 }

@@ -68,7 +68,7 @@ YAML
 if out="$("$ROOT/hack/chart-check.sh" "$TMP/chart3" 2>&1)"; then
 	echo "FAIL: the render guard passed a chart with an inert second VAP binding"; exit 1
 fi
-echo "$out" | grep -q "expected exactly 1 ValidatingAdmissionPolicyBinding" || {
+echo "$out" | grep -q "expected exactly the ValidatingAdmissionPolicyBindings" || {
 	echo "FAIL: the render guard failed but did not name the binding count:"; echo "$out"; exit 1
 }
 echo "OK: render guard fails (naming the binding count) on a chart with an inert second VAP binding"

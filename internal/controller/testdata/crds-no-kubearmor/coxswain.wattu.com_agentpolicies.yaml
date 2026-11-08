@@ -51,6 +51,15 @@ spec:
               only ever allows; a Loop's effective policy is the union of the allows across
               every AgentPolicy it references (spec.policyRefs[]).
             properties:
+              auditOnly:
+                description: |-
+                  auditOnly is learn mode (P6b, ADR-0007 D31): the engine RECORDS instead of
+                  blocking for a Loop whose referenced policies are ALL auditOnly
+                  (PolicyEnforced=False reason AuditOnly). Never defaulted. If any
+                  referenced policy is enforcing, the Loop enforces the union of the
+                  allows and this flag has no effect (D108); the ignored policies are
+                  recorded in status.
+                type: boolean
               exec:
                 description: |-
                   exec is the commands the agent may run, as ABSOLUTE binary paths (e.g.
@@ -106,9 +115,19 @@ spec:
                 description: |-
                   files is the paths the agent may access (e.g. "/workspace"). The agent's
                   own workspace is always accessible; a path here grants access elsewhere.
+                  An entry ending in "/" grants that directory recursively (KubeArmor matchDirectories); any other entry is an exact path (D113).
                 items:
+                  maxLength: 512
                   type: string
+                maxItems: 64
                 type: array
+                x-kubernetes-validations:
+                - message: files entries must be absolute canonical paths (no spaces,
+                    //, . or .. segments); a trailing / means the directory, recursively
+                    (D113)
+                  rule: self.all(e, e.startsWith('/') && !e.contains(' ') && !e.contains('//')
+                    && !e.contains('/./') && !e.contains('/../') && !e.endsWith('/.')
+                    && !e.endsWith('/..'))
               network:
                 description: |-
                   network is the host:port endpoints the agent may reach (e.g.

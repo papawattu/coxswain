@@ -108,6 +108,9 @@ type AgentPolicySpec struct {
 	// own workspace is always accessible; a path here grants access elsewhere.
 	// An entry ending in "/" grants that directory recursively (KubeArmor matchDirectories); any other entry is an exact path (D113).
 	// +optional
+	// +kubebuilder:validation:MaxItems=64
+	// +kubebuilder:validation:items:MaxLength=512
+	// +kubebuilder:validation:XValidation:rule="self.all(e, e.startsWith('/') && !e.contains(' ') && !e.contains('//') && !e.contains('/./') && !e.contains('/../') && !e.endsWith('/.') && !e.endsWith('/..'))",message="files entries must be absolute canonical paths (no spaces, //, . or .. segments); a trailing / means the directory, recursively (D113)"
 	Files []string `json:"files,omitempty"`
 
 	// tools is the credentialed external tools the agent may use through

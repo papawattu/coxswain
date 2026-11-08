@@ -105,6 +105,42 @@ func p6dRetryReconcile(r *LoopReconciler, ns, name string) *coxv1alpha1.Loop {
 	return loop
 }
 
+// p6dSeedState writes the exhausted state (package-level so one seed func
+// can forward to the other — the I230 unknown-episode spec needs the
+// episode key made explicit). get/update are set by the Describe before the
+// specs run.
+var p6dSeedState struct {
+	get    func(ns, name string) *coxv1alpha1.Loop
+	update func(loop *coxv1alpha1.Loop)
+}
+
+// p6dSeedFailedStateWithEpisode sets the EXHAUSTED state a real operator
+// leaves at the bound (loop_s4_phase.go: the Failed condition with the
+// SandboxFailed reason, the terminal phase, and the infra-episode status —
+// the count from the run that failed, with the episode key naming the phase
+// the failures happened in).
+func p6dSeedFailedStateWithEpisode(ns, name, reason, episode string) {
+	loop := p6dSeedState.get(ns, name)
+	loop.Status.Phase = coxv1alpha1.LoopPhaseFailed
+	loop.Status.DesiredPhase = coxv1alpha1.LoopPhaseFailed
+	loop.Status.Conditions = []metav1.Condition{{
+		Type: string(coxv1alpha1.LoopPhaseFailed), Status: metav1.ConditionTrue,
+		Reason: reason, Message: "sandbox failed without a phase claim after 3 attempts",
+		LastTransitionTime: metav1.Now(),
+	}}
+	loop.Status.Agent = &coxv1alpha1.AgentStatus{
+		InfraAttempts:   3,
+		InfraSandboxUID: "p6d-failed-sandbox-uid",
+		InfraEpisode:    episode,
+	}
+	p6dSeedState.update(loop)
+}
+
+// p6dSeedFailedState is the default episode ("0/Implementing").
+func p6dSeedFailedState(ns, name, reason string) {
+	p6dSeedFailedStateWithEpisode(ns, name, reason, "0/Implementing")
+}
+
 var _ = Describe("P6d: the operator consumes coxswain.io/retry", func() {
 	ctx := context.Background()
 
@@ -125,25 +161,10 @@ var _ = Describe("P6d: the operator consumes coxswain.io/retry", func() {
 		return loop
 	}
 
-	// p6dSeedFailedState sets the EXHAUSTED state a real operator leaves at
-	// the bound (loop_s4_phase.go: the Failed condition with the
-	// SandboxFailed reason, the terminal phase, and the infra-episode status
-	// — the count from the run that failed, with the episode key naming the
-	// phase the failures happened in).
-	p6dSeedFailedState := func(ns, name string, reason string) {
-		loop := p6dGet(ns, name)
-		loop.Status.Phase = coxv1alpha1.LoopPhaseFailed
-		loop.Status.DesiredPhase = coxv1alpha1.LoopPhaseFailed
-		loop.Status.Conditions = []metav1.Condition{{
-			Type: string(coxv1alpha1.LoopPhaseFailed), Status: metav1.ConditionTrue,
-			Reason: reason, Message: "sandbox failed without a phase claim after 3 attempts",
-			LastTransitionTime: metav1.Now(),
-		}}
-		loop.Status.Agent = &coxv1alpha1.AgentStatus{
-			InfraAttempts:   3,
-			InfraSandboxUID: "p6d-failed-sandbox-uid",
-			InfraEpisode:    "0/Implementing",
-		}
+	// The package-level seed helpers (p6dSeedState) write through the suite
+	// client with this spec's ctx.
+	p6dSeedState.get = p6dGet
+	p6dSeedState.update = func(loop *coxv1alpha1.Loop) {
 		Expect(k8sClient.Status().Update(ctx, loop)).To(Succeed())
 	}
 
@@ -342,5 +363,38 @@ var _ = Describe("P6d: the operator consumes coxswain.io/retry", func() {
 		Expect(cond.Reason).To(Equal(sandboxInfraFailedCondition))
 		Expect(drainEvents(rec)).ToNot(ContainElement(ContainSubstring(retryEventReason)),
 			"no audit Event without a retry")
+	})
+
+	It("(d) a Failed:SandboxFailed Loop whose infraEpisode names an unknown phase (Paused) is refused (phase + condition kept), the annotation removed", func() {
+		ns := p6dNs("p6d-d")
+		const name = "p6d-d"
+		Expect(k8sClient.Create(ctx, &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: p2fModelSecret, Namespace: ns},
+			StringData: map[string]string{modelAPIKey: "p6d-d-dummy", modelBaseURL: p2fModelEndpoint},
+		})).To(Succeed())
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec:       p6dSandboxFailedLoopSpec(),
+		})).To(Succeed())
+
+		By("the same exhausted state with an UNKNOWN phase in the episode key (Paused), and the annotation")
+		p6dSeedFailedStateWithEpisode(ns, name, sandboxInfraFailedCondition, "0/Paused")
+		p6dSetRetryAnnotation(ns, name)
+		r, _ := p6dRetryReconciler()
+
+		By("the reconcile")
+		got := p6dRetryReconcile(r, ns, name)
+
+		By("the retry is refused: Paused is not a phase a sandbox run can fail in (I230), so the phase and the condition are kept")
+		Expect(got.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseFailed),
+			"an unknown run phase is not a retry target: the phase stays Failed")
+		Expect(got.Status.DesiredPhase).To(Equal(coxv1alpha1.LoopPhaseFailed))
+		cond := findConditionFn(got.Status.Conditions, string(coxv1alpha1.LoopPhaseFailed))
+		Expect(cond).NotTo(BeNil(), "the Failed condition is kept")
+		Expect(cond.Reason).To(Equal(sandboxInfraFailedCondition))
+
+		By("the annotation is removed anyway (a mis-aimed retry is discarded, not re-queued)")
+		_, annOk := got.Annotations[retryAnnotation]
+		Expect(annOk).To(BeFalse())
 	})
 })

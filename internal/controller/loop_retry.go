@@ -48,16 +48,6 @@ const retryAnnotation = "coxswain.io/retry"
 // retryEventReason is the Normal Event's reason (the D100 audit).
 const retryEventReason = "Retried"
 
-// retryFailedPhase is the phase name a parsed infraEpisode must carry to be a
-// retry target: the episode key is "<iteration>/<desiredPhase>" (F48g), and
-// only a real phase name can be written back to status.phase /
-// status.desiredPhase. The Failed phase itself is rejected: a SandboxFailed
-// Loop's failure is recorded in the episode key written at the last COUNTED
-// failure (sandboxRunKey, before the phase was set to Failed), so a key ending
-// in /Failed never comes from the operator — and resuming "Failed" would be a
-// no-op that consumed the annotation anyway.
-const retryFailedPhase = "Failed"
-
 // retryEpisodeSeparator splits the infraEpisode key into iteration and phase.
 const retryEpisodeSeparator = "/"
 
@@ -97,9 +87,12 @@ func retryEligible(loop *coxv1alpha1.Loop) (bool, string) {
 // retryPhaseFromEpisode parses the infraEpisode key ("<iteration>/<phase>",
 // F48g) into the phase to resume. The phase is everything AFTER the first
 // separator: the iteration is numeric (strconv.Atoi would also parse it), but
-// the phase is what a resume needs. A key with no separator, an empty phase,
-// or the Failed phase itself is not a retry target (the D116 guarantee: a
-// retried Loop resumes in the phase it failed IN).
+// the phase is what a resume needs. It is accepted ONLY when it names a phase
+// a sandbox run can fail in — Planning, Implementing or Verifying (R50 I230:
+// any other value, e.g. Paused, would be written to Phase/DesiredPhase
+// unchecked). A key with no separator, an empty phase, or any other phase
+// name is not a retry target (the D116 guarantee: a retried Loop resumes in
+// the phase it failed IN).
 func retryPhaseFromEpisode(loop *coxv1alpha1.Loop) (string, bool) {
 	if loop.Status.Agent == nil {
 		return "", false
@@ -109,10 +102,12 @@ func retryPhaseFromEpisode(loop *coxv1alpha1.Loop) (string, bool) {
 		return "", false
 	}
 	phase := loop.Status.Agent.InfraEpisode[sep+1:]
-	if phase == "" || phase == retryFailedPhase {
+	switch phase {
+	case string(coxv1alpha1.LoopPhasePlanning), string(coxv1alpha1.LoopPhaseImplementing), string(coxv1alpha1.LoopPhaseVerifying):
+		return phase, true
+	default:
 		return "", false
 	}
-	return phase, true
 }
 
 // applyRetry consumes the coxswain.io/retry annotation (D116). It returns

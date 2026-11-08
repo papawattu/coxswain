@@ -953,6 +953,22 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		return ctrl.Result{}, err
 	}
 
+	// D116: the coxswain.io/retry trigger (p6dRetryStep, extracted for the
+	// gocyclo budget). It runs AFTER the validate holds (a held Loop — a bad
+	// AgentPolicy or model config — is not a resume target; the hold's own
+	// requeue re-evaluates) and BEFORE every terminal-phase short-circuit
+	// that would skip a Failed Loop: a Failed Loop's normal passes do
+	// nothing (the claim advance, the sandbox-failure count, and the phases
+	// all early-return on the terminal phase), so without this early pass an
+	// annotated Failed Loop would never resume. applyRetry mutates the
+	// in-memory Loop (the episode reset, the Failed-condition clear, the
+	// phase move to the phase it failed in) and returns true only on an
+	// eligible retry; the mutation reaches the SAME trailing status write as
+	// every other pass (no extra write path, no early return), and the
+	// annotation is removed AFTER it, in finalizeLoopStatus, next to
+	// removeDeliverAnnotation (the I52 pattern).
+	retryApplied := r.p6dRetryStep(ctx, &loop)
+
 	// D38: capture the condition set before applyEffectivePolicyAndConditions so
 	// a condition-only change (e.g. the NetworkEnforced reason flipping on a
 	// probe result change) still triggers a status update. Without this, the
@@ -999,7 +1015,7 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	changed := b2Changed // the B2 restore step's condition change (the I90 point-of-decision write)
+	changed := b2Changed || retryApplied // D116: an applied retry's status change (the episode reset, the Failed-condition clear, the phase move) reaches the trailing write
 
 	// Phase 0: a fresh Loop is Pending. (Phase 1 drives the full phase machine.)
 	// Phase 0 + S4 bootstrap + P2f pause mechanics + ensureSandbox (the
@@ -1014,18 +1030,20 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	changed = changed || bootChanged || resumeCleared
-
+	changed = changed || bootChanged
 	// B1 (D59): the checkpoint support check (CheckpointsAvailable condition)
 	// and the Required gate. The gate fails the Loop (terminal
 	// Failed:CheckpointUnavailable) at start — before any phase work — when
 	// spec.checkpoints=Required and the snapshot support is absent (no
 	// VolumeSnapshot CRD, or no VolumeSnapshotClass for the PVC's CSI driver).
-	cpChanged, done, err := r.applyCheckpointGate(ctx, &loop)
-	if done || err != nil {
+	// p6dCheckpointGate (extracted for the gocyclo budget) runs the gate and,
+	// on a non-hold pass, ORs the bootstrap's resumeCleared flag into changed
+	// (the I90 point-of-decision write: the resume annotation is removed in
+	// finalizeLoopStatus, and the status write must carry the resumeCleared
+	// change so the annotation is not re-asserted by a later pass).
+	if done, err := r.p6dCheckpointGate(ctx, &loop, &changed, resumeCleared); done || err != nil {
 		return ctrl.Result{}, err
 	}
-	changed = changed || cpChanged
 
 	// D33+D34+D35: the per-Loop proxy, NetworkPolicies, and condition snapshot.
 	policiesChanged, err := r.ensureProxyAndNetPolicies(ctx, &loop)
@@ -1214,6 +1232,22 @@ func (r *LoopReconciler) reconcileFinal(ctx context.Context, loop *coxv1alpha1.L
 // writer just set). Extracted so the top-level reconcile stays within the
 // gocyclo budget.
 
+// p6dCheckpointGate runs the B1 checkpoint gate (applyCheckpointGate) and,
+// on a non-hold pass, ORs the bootstrap's resumeCleared flag into the
+// caller's changed (the I90 point-of-decision write: the resume annotation
+// is removed in finalizeLoopStatus, and the status write must carry the
+// resumeCleared change so the annotation is not re-asserted by a later
+// pass). Extracted from Reconcile to keep the top-level function within the
+// gocyclo budget; the behavior is unchanged — the gate's requeue and the
+// resume-clear persistence both still run on the same trailing status write.
+func (r *LoopReconciler) p6dCheckpointGate(ctx context.Context, loop *coxv1alpha1.Loop, changed *bool, resumeCleared bool) (bool, error) {
+	cpChanged, done, err := r.applyCheckpointGate(ctx, loop)
+	if !done {
+		*changed = *changed || cpChanged || resumeCleared
+	}
+	return done, err
+}
+
 // f84cF56Surfaces runs the F84c terminal model-proxy-hold clear and the F56
 // runner-available surface on the Loop in place. Extracted to keep the
 // top-level reconcile within the gocyclo budget; both calls are pure in-place
@@ -1297,10 +1331,32 @@ func (r *LoopReconciler) finalizeLoopStatus(ctx context.Context, loop *coxv1alph
 	// the rest of the reconcile is persisted — only the annotation removal is
 	// skipped.
 	if redeliverKeep {
-		return nil
+		// D116: the retry removal still runs (it is independent of the deliver
+		// keep decision — a retried Loop's resume and a running deliver Job
+		// never coexist: a Failed Loop has no deliver Job).
+		return r.removeRetryAnnotation(ctx, loop)
 	}
 	_, err := r.removeDeliverAnnotation(ctx, loop)
-	return err
+	if err != nil {
+		return err
+	}
+	// D116: the retry annotation is removed here, AFTER the trailing status
+	// write, exactly as the redeliver annotation is (the I52 pattern): the
+	// fresh re-read inside the patch carries a resourceVersion that already
+	// includes the status write, so the two Loop writes never race. It runs
+	// for eligible AND ineligible annotated Loops alike (applyRetry decided
+	// the eligibility; this is the one-shot cleanup).
+	return r.removeRetryAnnotation(ctx, loop)
+}
+
+// p6dRetryStep is the D116 coxswain.io/retry trigger, extracted to keep the
+// top-level Reconcile within the gocyclo budget (Reconcile calls it once and
+// ORs the result into changed — the helper carries no branch of its own).
+// See the D116 comment at the call site for the ordering and persistence
+// rules (the mutation rides the shared trailing status write; the annotation
+// is removed in finalizeLoopStatus, after it).
+func (r *LoopReconciler) p6dRetryStep(ctx context.Context, loop *coxv1alpha1.Loop) bool {
+	return r.applyRetry(ctx, loop)
 }
 
 // emitPhaseAdvancedEvent (OS5, S4) emits the Kubernetes Event on a phase

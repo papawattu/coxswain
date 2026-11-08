@@ -511,8 +511,9 @@ simply ignores it. `status.verify.infraAttempts` needs no upgrade line: it has
 no episode key, a pre-I65 status has no count, and its reset rule (a new pin) is
 unchanged by this work.
 
-A sandbox volume the kubelet cannot mount (a `gitCredentialSecret` that does not
-exist, say) now ends at `Failed:SandboxFailed`, with one attempt per recreate up
+A sandbox volume the kubelet cannot mount (for example a Secret deleted or
+changed after the Loop started; a Secret missing at the start is held earlier,
+with `SecretsUsable=False`, D76) now ends at `Failed:SandboxFailed`, with one attempt per recreate up
 to the bound rather than an unbounded recreate loop. Create or fix the Secret, then run `kubectl cox retry <loop>` (P6d).
 (Since D84b, a completed rollback (`spec.restoreFrom`) also clears the
 terminal `Failed` condition and re-verifies the restored tree at its

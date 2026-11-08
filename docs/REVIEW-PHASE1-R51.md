@@ -120,8 +120,12 @@ owner asked for. #424 merged without the owner's read-through, on the owner's wo
     (I227 above), not rotation. See I240.
   - **(c) A missed empty result:** run 12's `suggest lines: 10 exec: 0` (:81) was not read as a failure
     until this round was written (I236).
+  - **(d) A test diff not read before merge:** #426 was reviewed from its `relay.go` diff, the mutation
+    and the kind run. Its rewrite of `TestRelayReplayedLineIsNotCountedTwice` was not read and
+    turned out vacuous (I243). Rule: read every changed test before the verdict; a changed spec's
+    stated mutation is run.
 
-  **Acceptance:** none of (a)-(c) recurs in R52's window.
+  **Acceptance:** none of (a)-(d) recurs in R52's window.
 
 ## P3
 
@@ -165,6 +169,22 @@ owner asked for. #424 merged without the owner's read-through, on the owner's wo
   **Fix:** add only lines whose time equals the max.
 
   **Acceptance:** the two D118 specs still pass, and the D118 mutation still fails them.
+
+- [ ] **I243: `TestRelayReplayedLineIsNotCountedTwice` no longer tests a replayed Block (#426)**
+
+  **Where:** `internal/alerts/relay_test.go`, `TestRelayReplayedLineIsNotCountedTwice` (rewritten by
+  #426, `dc388ce`).
+
+  **Problem:** the second attach re-reads only the Allow line, and Allow lines never change `Count`.
+  The spec's comment says "Mutation: remove the dedup/replay check → the count is 2". With exactly that
+  mutation (the three replay `continue`s disabled, `scratchpad/d118-nodedup.py`), the spec PASSES 3/3,
+  and `TestRelayReattachSkipsOnlyReplayedLines` FAILS 3/3. Coverage holds through the new spec; the old
+  one is vacuous and its comment is false.
+
+  **Fix:** make the Block the boundary line: attach 1 delivers the Allow (t1) then the Block (t2);
+  attach 2 re-reads the Block. Keep the comment's mutation claim only if it is then true.
+
+  **Acceptance:** the `d118-nodedup.py` mutation fails the spec with `count = 2`.
 
 ## Owner decisions
 

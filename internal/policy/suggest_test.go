@@ -162,6 +162,30 @@ func TestSuggestFromRecordsDropsEntriesUnderACollapsedDir(t *testing.T) {
 	}); len(got) != 1 || got["/a/"] != 8 {
 		t.Errorf("collapsed = %v, want {/a/: 8} (sum of covered entries)", got)
 	}
+
+	// A collapsed directory UNDER another collapsed directory is subsumed by
+	// the OUTERMOST ancestor too (R49 I228, review on #420: run 8 listed
+	// /usr/local/go/src/ next to /usr/local/go/src/compress/flate/). The
+	// result is exactly ["/a/"] carrying all three counts, and the unrelated
+	// /z.txt survives.
+	recs = recs[:0]
+	for i := range 6 {
+		recs = append(recs, alerts.Record{Loop: "l1", Namespace: "ns", Source: alerts.SourceKubeArmor, Action: "Audit", Target: "/a/f" + string(rune('a'+i)), Verdict: "allowed", Detail: "operation=File, pod=l1-sandbox"})
+	}
+	recs = append(recs,
+		alerts.Record{Loop: "l1", Namespace: "ns", Source: alerts.SourceKubeArmor, Action: "Audit", Target: "/a/b/c.txt", Verdict: "allowed", Detail: "operation=File, pod=l1-sandbox"},
+		alerts.Record{Loop: "l1", Namespace: "ns", Source: alerts.SourceKubeArmor, Action: "Audit", Target: "/z.txt", Verdict: "allowed", Detail: "operation=File, pod=l1-sandbox"},
+	)
+	s = SuggestFromRecords(recs, "l1", "ns")
+	if want := []string{"/a/", "/z.txt"}; !slices.Equal(s.Files, want) {
+		t.Errorf("files = %v, want %v (nested collapsed dir subsumed by its outermost ancestor)", s.Files, want)
+	}
+	// Direct subsumption of the input {"/a/", "/a/b/", "/a/b/c.txt"} (plus the
+	// unrelated /z.txt survivor): the result is exactly "/a/" carrying all
+	// three counts.
+	if got := collapseFileDirs(map[string]int{"/a/": 1, "/a/b/": 1, "/a/b/c.txt": 1, "/z.txt": 1}); len(got) != 2 || got["/a/"] != 3 || got["/z.txt"] != 1 {
+		t.Errorf("collapsed = %v, want {/a/: 3, /z.txt: 1} (nested dir/ and its file roll into the outermost ancestor)", got)
+	}
 }
 
 // D112: 70 distinct exec paths overflow the 64-entry cap; the kept 64 are

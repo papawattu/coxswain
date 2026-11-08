@@ -199,26 +199,30 @@ func collapseFileDirs(files map[string]int) map[string]int {
 		}
 	}
 	// A collapsed "dir/" entry is recursive (D113): every entry under it is
-	// covered by it. Drop each entry in favor of its NEAREST strict ancestor
+	// covered by it — including another collapsed "dir/" entry. Drop each
+	// entry (file or directory) in favor of its OUTERMOST strict ancestor
 	// "dir/" entry, rolling the count into that ancestor (R49 I228, review on
 	// #420: run 8 listed /scratch/.cache/go-build/ next to 1122 entries under
 	// it, and /usr/local/go/src/ next to /usr/local/go/src/crypto/cipher/).
-	for e, count := range entries {
-		if strings.HasSuffix(e, "/") {
-			continue
-		}
+	// The drops are computed from a snapshot of the keys first, so the map is
+	// never mutated while it is read.
+	keys := make([]string, 0, len(entries))
+	for k := range entries {
+		keys = append(keys, k)
+	}
+	for _, e := range keys {
 		ancestor := ""
-		for a := range entries {
-			if !strings.HasSuffix(a, "/") || a == e || !strings.HasPrefix(e, a) {
+		for _, a := range keys {
+			if a == e || !strings.HasSuffix(a, "/") || !strings.HasPrefix(e, a) {
 				continue
 			}
-			if len(a) > len(ancestor) {
+			if ancestor == "" || len(a) < len(ancestor) {
 				ancestor = a
 			}
 		}
 		if ancestor != "" {
+			entries[ancestor] += entries[e] // read BEFORE delete
 			delete(entries, e)
-			entries[ancestor] += count
 		}
 	}
 	return entries

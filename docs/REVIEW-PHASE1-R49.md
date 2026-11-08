@@ -58,7 +58,7 @@ evidence the owner asked for.
 
 ## P2
 
-- [ ] **I220: F62 had never seen a real KubeArmor alert; three defects stacked (fixed in this window, recorded so the class is not repeated)**
+- [x] **I220: F62 had never seen a real KubeArmor alert; three defects stacked (fixed in this window, recorded so the class is not repeated)** (`8b141d4`)
 
   **Where:** kind-ref runs 1-3 (`.samples/p6b3-kind/p6b3.log:36`, `run2/p6b3-run2.log:37`, `run3/p6b3-run3.log:38`: 0 audit lines each); #324's kind proof (RBAC `can-i` plus zero `forbidden` only).
 
@@ -164,7 +164,7 @@ evidence the owner asked for.
 
 ## P3
 
-- [ ] **I227: the KubeArmor agent log rotates every few seconds under learn mode**
+- [x] **I227: the KubeArmor agent log rotates every few seconds under learn mode** (`dc388ce`)
 
   **Where:** `run5/p6b3-run5.log` (ref-worker: rotations at 19:44:24, 19:45:24, 19:45:44 and 19:46:04); `run7/p6b3-run7.log:71-74` (ref-worker2: 4 rotations in ~2 minutes).
 

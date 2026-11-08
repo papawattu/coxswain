@@ -195,9 +195,33 @@ func collapseFileDirs(files map[string]int) map[string]int {
 		}
 		entries = out
 		if !changed {
-			return out
+			break
 		}
 	}
+	// A collapsed "dir/" entry is recursive (D113): every entry under it is
+	// covered by it. Drop each entry in favor of its NEAREST strict ancestor
+	// "dir/" entry, rolling the count into that ancestor (R49 I228, review on
+	// #420: run 8 listed /scratch/.cache/go-build/ next to 1122 entries under
+	// it, and /usr/local/go/src/ next to /usr/local/go/src/crypto/cipher/).
+	for e, count := range entries {
+		if strings.HasSuffix(e, "/") {
+			continue
+		}
+		ancestor := ""
+		for a := range entries {
+			if !strings.HasSuffix(a, "/") || a == e || !strings.HasPrefix(e, a) {
+				continue
+			}
+			if len(a) > len(ancestor) {
+				ancestor = a
+			}
+		}
+		if ancestor != "" {
+			delete(entries, e)
+			entries[ancestor] += count
+		}
+	}
+	return entries
 }
 
 // capList keeps the suggestLimit entries with the highest counts (ties broken

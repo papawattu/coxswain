@@ -126,6 +126,7 @@ func NewRootCommand(deps Deps) *cobra.Command {
 		newPauseCommand(),
 		newResumeCommand(),
 		newRedeliverCommand(),
+		newRetryCommand(),
 		newForkCommand(),
 		newApproveCommand(),
 		newRejectCommand(),

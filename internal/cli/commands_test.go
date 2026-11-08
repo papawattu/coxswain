@@ -474,6 +474,80 @@ func TestRedeliver_FailedDeliveryMessage(t *testing.T) {
 	}
 }
 
+// --- retry (D116: Failed:SandboxFailed only) ---
+
+func TestRetry_SetsAnnotation(t *testing.T) {
+	l := makeLoop("Failed", 1)
+	unstructuredSet(l, "conditions", []any{
+		map[string]any{"type": "Failed", "status": "True", "reason": "SandboxFailed", "message": "sandbox mount wedge"},
+	})
+	fc := newFakeLoopClient()
+	fc.setLoop(l)
+	deps := Deps{Loops: fc}
+
+	out := runCmd(t, deps, func(ctx context.Context, dc Deps, ns, name string, out *bytes.Buffer) error {
+		return retryLoop(ctx, dc, ns, name, out)
+	}, "loop1")
+
+	p := fc.lastPatch()
+	if p == nil {
+		t.Fatal("expected a Patch call for retry")
+	}
+	var patch map[string]any
+	if err := json.Unmarshal(p.patch, &patch); err != nil {
+		t.Fatalf("bad patch JSON: %v", err)
+	}
+	meta, _ := patch["metadata"].(map[string]any)
+	ann, _ := meta["annotations"].(map[string]any)
+	if v, ok := ann[retryAnnotation].(string); !ok || v != "true" {
+		t.Errorf("retry should set the %s=true annotation, got %v", retryAnnotation, patch)
+	}
+	if !strings.Contains(out, retryAnnotation) {
+		t.Errorf("retry output should mention the annotation, got %q", out)
+	}
+}
+
+func TestRetry_RefusesTamperedVerify(t *testing.T) {
+	l := makeLoop("Failed", 1)
+	unstructuredSet(l, "conditions", []any{
+		map[string]any{"type": "Failed", "status": "True", "reason": "TamperedVerify", "message": "checkpoint tampered"},
+	})
+	fc := newFakeLoopClient()
+	fc.setLoop(l)
+	deps := Deps{Loops: fc}
+
+	out := &bytes.Buffer{}
+	err := retryLoop(context.Background(), deps, "samples", "loop1", out)
+	if err == nil {
+		t.Fatal("expected an error for a TamperedVerify retry (a gate bypass)")
+	}
+	if !strings.Contains(err.Error(), "TamperedVerify") {
+		t.Errorf("error should name the TamperedVerify reason, got %q", err)
+	}
+	if p := fc.lastPatch(); p != nil {
+		t.Errorf("no annotation may be set for a TamperedVerify retry, got patch %q", p.patch)
+	}
+}
+
+func TestRetry_RefusesNotFailed(t *testing.T) {
+	l := makeLoop("Implementing", 1)
+	fc := newFakeLoopClient()
+	fc.setLoop(l)
+	deps := Deps{Loops: fc}
+
+	out := &bytes.Buffer{}
+	err := retryLoop(context.Background(), deps, "samples", "loop1", out)
+	if err == nil {
+		t.Fatal("expected an error for a non-Failed retry")
+	}
+	if !strings.Contains(err.Error(), "not Failed") {
+		t.Errorf("error should say the Loop is not Failed, got %q", err)
+	}
+	if p := fc.lastPatch(); p != nil {
+		t.Errorf("no annotation may be set for a non-Failed retry, got patch %q", p.patch)
+	}
+}
+
 // F52 C3: the Use strings must name the <loop> argument — cobra prints Use in
 // --help and in the usage line of an argument error, and both commands take
 // exactly one loop, so a bare "describe" / "history" hides the only argument.

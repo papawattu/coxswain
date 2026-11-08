@@ -643,7 +643,13 @@ func (r *Relay) accept(ctx context.Context, peer Peer, al Alert) {
 		loopNS, loopName, uid = attr.loopNS, attr.loopName, attr.uid
 	}
 	if uid == "" {
-		r.Holder.noteUnattributed()
+		// D117 (R50 I232): the first attach re-reads up to the recent agent
+		// lines, including ones from Loops that no longer exist. A line OLDER
+		// than this relay's own start is still emitted to the audit trail (the
+		// line above does not change), but it is NOT counted as unattributed.
+		if !al.Time.Before(r.startedAt) {
+			r.Holder.noteUnattributed()
+		}
 		r.emit(al, "", "", unattributedDetail(loopName, al))
 		return
 	}

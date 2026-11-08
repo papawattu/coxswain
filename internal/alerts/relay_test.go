@@ -399,10 +399,16 @@ func TestRelayReplayedLineIsNotCountedTwice(t *testing.T) {
 // it is visible as unattributed.
 //
 // Mutation: attribute by namespace → some Loop gets a count it did not earn.
+//
+// D117 (R50 I232): the alert's timestamp must be at the relay's own start or
+// later, otherwise it is a REPLAYED line and is not counted — the new spec
+// TestRelayReplayedUnattributedLineIsNotCounted covers that boundary.
 func TestRelayUnattributedAlertIsCountedNotGuessed(t *testing.T) {
-	base := time.Date(2026, 10, 26, 10, 0, 0, 0, time.UTC)
+	// D117 (R50 I232): a line OLDER than the relay's own start is not counted
+	// (the new spec TestRelayReplayedUnattributedLineIsNotCounted covers that
+	// boundary), so the alert's timestamp is safely after the start.
 	src := &scriptedSource{attaches: []attachment{{lines: []string{
-		kubeArmorBlock(base, "Block", "some-other-ns", "unlabelled-pod", "/etc/shadow"),
+		kubeArmorBlock(time.Now().Add(time.Second), "Block", "some-other-ns", "unlabelled-pod", "/etc/shadow"),
 	}}}}
 	relay := f62NewRelay(src)
 	relay.Attributor = &fakeAttributor{noPods: true}
@@ -411,6 +417,40 @@ func TestRelayUnattributedAlertIsCountedNotGuessed(t *testing.T) {
 	waitFor(t, "an unattributed alert", func() bool { return holder.Unattributed() == 1 })
 	if _, ok := holder.Snapshot(f62UID); ok {
 		t.Errorf("an unattributed alert must not create a count for a Loop")
+	}
+}
+
+// TestRelayReplayedUnattributedLineIsNotCounted is D117 (R50 I232): the
+// first attach re-reads recent engine lines, and a replayed unattributable
+// line OLDER than the relay's own start is still emitted to the audit trail
+// but not counted as unattributed; one line newer than the start is counted.
+//
+// Mutation: count every unattributed line → the count is 2, not 1.
+func TestRelayReplayedUnattributedLineIsNotCounted(t *testing.T) {
+	// Both lines are captured BEFORE the relay starts (its startedAt is the
+	// time.Now() in Start, after this), so the replayed line is unambiguously
+	// OLDER than the relay and the fresh line at or after it. A RE-attach
+	// replays the first line from the fresh one's timestamp (a replayed line,
+	// dropped, not counted) and re-delivers the fresh line (newer: counted).
+	lines := []string{
+		kubeArmorBlock(time.Now().Add(-time.Hour), "Block", "some-other-ns", "unlabelled-pod", "/etc/shadow"),
+		kubeArmorBlock(time.Now().Add(time.Hour), "Block", "some-other-ns", "unlabelled-pod", "/etc/shadow"),
+	}
+	src := &scriptedSource{attaches: []attachment{{lines: lines}}}
+	relay := f62NewRelay(src)
+	relay.Attributor = &fakeAttributor{noPods: true}
+	var buf bytes.Buffer
+	var mu sync.Mutex
+	relay.Emit = &lockedWriter{w: &buf, mu: &mu}
+	holder := startTestRelay(t, relay)
+
+	waitFor(t, "both audit lines", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return strings.Count(buf.String(), "\n") >= 2
+	})
+	if n := holder.Unattributed(); n != 1 {
+		t.Fatalf("unattributed = %d, want exactly 1 (the replayed pre-start line is not counted)", n)
 	}
 }
 

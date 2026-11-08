@@ -70,7 +70,7 @@ the owner asked for.
 
 ## P2
 
-- [ ] **I231: the docs' "missing gitCredentialSecret ends at SandboxFailed" example has been stale since D76**
+- [x] **I231: the docs' "missing gitCredentialSecret ends at SandboxFailed" example has been stale since D76** (`a3a7a01`)
 
   **Where:** `docs/UPGRADE.md` ~515 ("A sandbox volume the kubelet cannot mount (a `gitCredentialSecret` that does not exist, say) now ends at `Failed:SandboxFailed`"), and #418's new `docs/OPERATOR.md` `### 8. Retry` ("e.g. a missing `gitCredentialSecret`"). The opposite is in `internal/controller/loop_secrets.go:104`: the D76 gate covers `spec.workspace.gitCredentialSecret`, and a missing one holds the Loop with `SecretsUsable=False SecretNotFound` before any sandbox exists (TROUBLESHOOTING's D76 section says the same).
 
@@ -115,7 +115,7 @@ the owner asked for.
 
 ## P3
 
-- [ ] **I230: `retryPhaseFromEpisode` accepts any string after the `/`**
+- [x] **I230: `retryPhaseFromEpisode` accepts any string after the `/`** (`36e134f`)
 
   **Where:** `internal/controller/loop_retry.go` (`retryPhaseFromEpisode`).
 
@@ -125,7 +125,7 @@ the owner asked for.
 
   **Acceptance:** a spec with `infraEpisode: "0/Paused"` leaves the Loop `Failed`.
 
-- [ ] **I232: replayed previous-run lines are counted as "unattributed" (from R49 I221)**
+- [x] **I232: replayed previous-run lines are counted as "unattributed" (from R49 I221)** (`f4faffe`)
 
   **Where:** `internal/alerts/relay.go` (`accept`, and the first attach's `firstAttachTailLines`).
 

@@ -676,7 +676,7 @@ up on the next reconcile and re-runs the deliver Job.
 
 ### 8. Retry a Loop that failed with SandboxFailed
 
-A `Failed:SandboxFailed` Loop (e.g. a missing `gitCredentialSecret`) can be
+A `Failed:SandboxFailed` Loop (e.g. a Secret deleted or changed after the Loop started; a missing one is held earlier with `SecretsUsable=False`) can be
 retried once the cause is fixed, without deleting and re-applying the Loop
 and losing its history:
 

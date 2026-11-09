@@ -161,37 +161,98 @@ func execAllowable(p string) bool {
 }
 
 // collapseFileDirs turns busy directory trees into one "dir/" entry,
-// recursively (R49 I228): a directory with more than suggestDirCollapse
-// distinct targets is replaced by its dir + "/" (the sum of its targets'
-// counts), then the collapsed tree is regrouped and re-collapsed until a
-// full pass changes nothing — so a busy subtree stays collapsed to its
-// deepest busy ancestor, not one level. The root "/" is never collapsed
-// itself: a parent of "/" stays as distinct entries (D112).
+// recursively (R49 I228, R51 I237): a directory (never "/") with more
+// than suggestDirCollapse distinct IMMEDIATE children is replaced by its
+// dir + "/" (the sum of every entry under it), then the collapsed tree is
+// re-counted and re-collapsed until a full pass changes nothing — so a
+// busy subtree stays collapsed to its deepest busy ancestor, not one
+// level. A child is either an entry directly in the directory or the
+// first path segment below it of any deeper entry (R51 I237: a wide,
+// shallow tree — many small subdirectories each with a few files —
+// collapses the parent, not just a directory full of file entries). The
+// root "/" is never collapsed itself: a parent of "/" stays as distinct
+// entries (D112).
 func collapseFileDirs(files map[string]int) map[string]int {
 	entries := map[string]int{}
 	maps.Copy(entries, files)
 	for {
-		byDir := map[string]map[string]int{}
+		// children[d] is the set of d's distinct immediate children: an
+		// entry directly in d names its base name, a deeper entry names
+		// its first segment below d, and a "d/" collapsed entry under d
+		// names its first segment below d too.
+		// cover[d] is the sum of every entry under d.
+		children := map[string]map[string]bool{}
+		cover := map[string]int{}
 		for entry, count := range entries {
-			dir := path.Dir(strings.TrimSuffix(entry, "/"))
-			if byDir[dir] == nil {
-				byDir[dir] = map[string]int{}
+			// Walk up from entry's parent to the root (exclusive).
+			// For each ancestor dir, record the first segment of entry
+			// below dir as a child, and add entry's count to cover[dir].
+			trimmed := strings.TrimSuffix(entry, "/")
+			for dir := path.Dir(trimmed); dir != "/"; dir = path.Dir(dir) {
+				if children[dir] == nil {
+					children[dir] = map[string]bool{}
+				}
+				// entry is under dir: entry starts with dir + "/".
+				// The child is the first path segment after dir + "/".
+				after := entry[len(dir)+1:]
+				child := after
+				for i := 0; i < len(after); i++ {
+					if after[i] == '/' {
+						child = after[:i]
+						break
+					}
+				}
+				children[dir][child] = true
+				cover[dir] += count
 			}
-			byDir[dir][entry] = count
 		}
 		out := map[string]int{}
 		changed := false
-		for dir, group := range byDir {
-			if dir != "/" && len(group) > suggestDirCollapse {
-				total := 0
-				for _, count := range group {
-					total += count
+		for entry, count := range entries {
+			// An entry directly in a busy directory (more than
+			// suggestDirCollapse distinct immediate children) is replaced by
+			// the directory's collapsed "dir/" entry: a file entry's count
+			// rolls into out[dir+"/"] (which equals cover[dir], the sum of
+			// every entry under dir, once built), and a collapsed entry under
+			// a busy parent is dropped — its count already reached that parent
+			// via cover, so rolling it again would double-count it. A pass
+			// changes the tree only when a busy directory is not already
+			// covered by a collapsed entry (entries[dir+"/"] exists).
+			dir := path.Dir(strings.TrimSuffix(entry, "/"))
+			if dir != "/" && len(children[dir]) > suggestDirCollapse {
+				if !strings.HasSuffix(entry, "/") {
+					out[dir+"/"] += count
 				}
-				out[dir+"/"] = total
-				changed = true
+				if _, ok := entries[dir+"/"]; !ok {
+					changed = true
+				}
 				continue
 			}
-			maps.Copy(out, group)
+			out[entry] = count
+		}
+		for dir, n := range children {
+			if dir == "/" || len(n) <= suggestDirCollapse {
+				continue
+			}
+			// A busy directory's parent that is also busy absorbs the
+			// parent's collapsed entry (its count is already in the parent's
+			// cover), so only emit a collapsed entry when the parent is not
+			// itself busy. The count is recomputed from out — not from
+			// cover[dir] — because cover[dir] includes entries that were
+			// dropped into a deeper collapsed directory this pass (the
+			// original /a/ = 9 = 8 + the 1 count of /a/d/ that was folded
+			// into /a/ but is no longer a distinct entry under /a/).
+			parent := path.Dir(dir)
+			if parent != "/" && len(children[parent]) > suggestDirCollapse {
+				continue
+			}
+			collapsedCount := 0
+			for e, c := range out {
+				if strings.HasPrefix(e, dir+"/") {
+					collapsedCount += c
+				}
+			}
+			out[dir+"/"] = collapsedCount
 		}
 		entries = out
 		if !changed {

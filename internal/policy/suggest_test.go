@@ -188,6 +188,53 @@ func TestSuggestFromRecordsDropsEntriesUnderACollapsedDir(t *testing.T) {
 	}
 }
 
+// R51 I237: a wide, shallow tree — 10 subdirectories with 2 files each —
+// collapses to the parent directory, because the parent has more than 5
+// distinct immediate children (the subdirectories themselves); the
+// unrelated file survives and nothing overflows.
+func TestSuggestFromRecordsCollapsesWideShallowTree(t *testing.T) {
+	recs := make([]alerts.Record, 0, 21)
+	for i := range 10 {
+		dir := fmt.Sprintf("/scratch/.cache/go-build/%c", '0'+i)
+		for j := range 2 {
+			recs = append(recs, alerts.Record{Loop: "l1", Namespace: "ns", Source: alerts.SourceKubeArmor, Action: "Audit", Target: dir + "/f" + string(rune('a'+j)), Verdict: "allowed", Detail: "operation=File, pod=l1-sandbox"})
+		}
+	}
+	recs = append(recs, alerts.Record{Loop: "l1", Namespace: "ns", Source: alerts.SourceKubeArmor, Action: "Audit", Target: "/etc/hosts", Verdict: "allowed", Detail: "operation=File, pod=l1-sandbox"})
+	s := SuggestFromRecords(recs, "l1", "ns")
+	if want := []string{"/etc/hosts", "/scratch/.cache/go-build/"}; !slices.Equal(s.Files, want) {
+		t.Errorf("files = %v, want %v", s.Files, want)
+	}
+	if len(s.FilesOverflow) != 0 {
+		t.Errorf("files overflow = %v, want none", s.FilesOverflow)
+	}
+}
+
+// R51 I237: a narrow tree — 3 subdirectories with 2 files each — does NOT
+// collapse: 3 immediate children is under the 5-children threshold, so all
+// 6 files are listed.
+func TestSuggestFromRecordsKeepsANarrowTree(t *testing.T) {
+	recs := make([]alerts.Record, 0, 6)
+	for i := range 3 {
+		dir := fmt.Sprintf("/srv/a/d%d", i)
+		for j := range 2 {
+			recs = append(recs, alerts.Record{Loop: "l1", Namespace: "ns", Source: alerts.SourceKubeArmor, Action: "Audit", Target: dir + "/f" + string(rune('a'+j)), Verdict: "allowed", Detail: "operation=File, pod=l1-sandbox"})
+		}
+	}
+	s := SuggestFromRecords(recs, "l1", "ns")
+	want := []string{
+		"/srv/a/d0/fa", "/srv/a/d0/fb",
+		"/srv/a/d1/fa", "/srv/a/d1/fb",
+		"/srv/a/d2/fa", "/srv/a/d2/fb",
+	}
+	if !slices.Equal(s.Files, want) {
+		t.Errorf("files = %v, want %v (narrow tree must not collapse)", s.Files, want)
+	}
+	if len(s.FilesOverflow) != 0 {
+		t.Errorf("files overflow = %v, want none", s.FilesOverflow)
+	}
+}
+
 // D112: 70 distinct exec paths overflow the 64-entry cap; the kept 64 are
 // the highest-count entries (ties broken by name), the rest go to
 // ExecOverflow.

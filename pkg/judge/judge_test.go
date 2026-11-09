@@ -155,7 +155,13 @@ func TestBuildPromptSmallDiff(t *testing.T) {
 	if truncated {
 		t.Fatalf("truncated = true, want false for a small diff")
 	}
-	for _, want := range []string{"add a retry", "step one", "diff --git a/a b/a", "- unit: exit 0", "- lint: exit 0"} {
+	for _, want := range []string{
+		"add a retry",
+		"step one",
+		"diff --git a/a b/a",
+		"- unit: exit 0 (passed)",
+		"- lint: exit 0 (passed)",
+	} {
 		if !strings.Contains(prompt, want) {
 			t.Errorf("prompt missing %q", want)
 		}
@@ -521,36 +527,100 @@ func TestJudgeRetriesTransportError(t *testing.T) {
 	}
 }
 
-// TestJudgeValidReplyFromTestdata loads testdata/reply-valid.json (a
-// chat-completions response body) and checks the reply parses to the
-// recorded verdict.
-//
-// NOTE: testdata/reply-valid.json is HAND-WRITTEN, pending a real capture
-// (the reviewer captures the real one). It is shaped like the proxy's
-// OpenAI-compatible envelope, not a byte-for-byte capture.
-func TestJudgeValidReplyFromTestdata(t *testing.T) {
-	raw, err := os.ReadFile("testdata/reply-valid.json")
+// TestParseRealReplies decodes each REAL model reply captured from the
+// homelab model (qwen3.8-27b via 192.168.1.20:8000, captured 2026-11-09;
+// R49 I220: a component's output is proven with the component's REAL
+// output, not a hand-written approximation) with ParseVerdict and checks
+// the recorded verdict.
+func TestParseRealReplies(t *testing.T) {
+	for _, tc := range []struct {
+		file      string
+		wantTrue  bool
+		wantScore int32
+	}{
+		{file: "testdata/reply-real-honest.json", wantTrue: true, wantScore: 100},
+		{file: "testdata/reply-real-gaming.json", wantTrue: false, wantScore: 0},
+	} {
+		t.Run(tc.file, func(t *testing.T) {
+			raw, err := os.ReadFile(tc.file)
+			if err != nil {
+				t.Fatalf("read %s: %v", tc.file, err)
+			}
+			var envelope struct {
+				Choices []struct {
+					Message struct {
+						Content string `json:"content"`
+					} `json:"message"`
+				} `json:"choices"`
+			}
+			if err := json.Unmarshal(raw, &envelope); err != nil {
+				t.Fatalf("reply envelope does not parse: %v", err)
+			}
+			if len(envelope.Choices) != 1 {
+				t.Fatalf("choices = %d, want 1", len(envelope.Choices))
+			}
+			v, err := ParseVerdict(envelope.Choices[0].Message.Content)
+			if err != nil {
+				t.Fatalf("ParseVerdict on the testdata reply: %v", err)
+			}
+			if v.Verdict != tc.wantTrue {
+				t.Errorf("verdict = %v, want %v", v.Verdict, tc.wantTrue)
+			}
+			if v.Score != tc.wantScore {
+				t.Errorf("score = %d, want %d", v.Score, tc.wantScore)
+			}
+			if v.Reason == "" {
+				t.Error("reason is empty, want a one-line reason")
+			}
+		})
+	}
+}
+
+// TestJudgeRealReplyServedFromProxy serves the REAL gaming reply
+// (testdata/reply-real-gaming.json, captured 2026-11-09) from an httptest
+// model proxy and checks the Client parses it to verdict false.
+func TestJudgeRealReplyServedFromProxy(t *testing.T) {
+	raw, err := os.ReadFile("testdata/reply-real-gaming.json")
 	if err != nil {
-		t.Fatalf("read testdata/reply-valid.json: %v", err)
+		t.Fatalf("read testdata/reply-real-gaming.json: %v", err)
 	}
-	var envelope struct {
-		Choices []struct {
-			Message struct {
-				Content string `json:"content"`
-			} `json:"message"`
-		} `json:"choices"`
-	}
-	if err := json.Unmarshal(raw, &envelope); err != nil {
-		t.Fatalf("reply envelope does not parse: %v", err)
-	}
-	if len(envelope.Choices) != 1 {
-		t.Fatalf("choices = %d, want 1", len(envelope.Choices))
-	}
-	v, err := ParseVerdict(envelope.Choices[0].Message.Content)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(raw)
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "test-model", 1024)
+	v, truncated, err := c.Judge(context.Background(), Input{Goal: "g", Plan: "p", Diff: "d"})
 	if err != nil {
-		t.Fatalf("ParseVerdict on the testdata reply: %v", err)
+		t.Fatalf("Judge error = %v, want none", err)
 	}
-	if !v.Verdict || v.Score != 88 || v.Reason != "meets the goal without touching the acceptance checks" {
-		t.Errorf("verdict = %+v, want {true 88 \"meets the goal without touching the acceptance checks\"}", v)
+	if truncated {
+		t.Error("truncated = true, want false (small diff)")
+	}
+	if v.Verdict {
+		t.Errorf("verdict = true, want false (the model judged the gaming change false)")
+	}
+}
+
+// TestBuildPromptChecksStateExitCodeMeaning checks that the CHECKS section
+// states each line's exit-code meaning plainly: a check with exit 0 renders
+// "passed", a check with exit 1 renders "failed".
+func TestBuildPromptChecksStateExitCodeMeaning(t *testing.T) {
+	prompt, _ := BuildPrompt(Input{
+		Goal: "g", Plan: "p", Diff: "d",
+		Checks: []Check{
+			{Name: "ok-check", ExitCode: 0},
+			{Name: "bad-check", ExitCode: 1},
+		},
+	})
+	if !strings.Contains(prompt, "- ok-check: exit 0 (passed)") {
+		t.Errorf("prompt does not render an exit-0 check as passed:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "- bad-check: exit 1 (failed)") {
+		t.Errorf("prompt does not render an exit-1 check as failed:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "exit 0 means the check PASSED") {
+		t.Errorf("prompt does not state plainly that exit 0 means the check PASSED:\n%s", prompt)
 	}
 }

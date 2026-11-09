@@ -1,6 +1,6 @@
 # ADR-0011: the Judge — an advisory verdict after verify
 
-**Status:** Proposed
+**Status:** Accepted
 **Date:** 2026-11-09
 **Extends:** ADR-0002 (LLM curation, rule-gated), ADR-0005 (operator
 verifies via an isolated Job), ADR-0009 (metering in the model proxy)

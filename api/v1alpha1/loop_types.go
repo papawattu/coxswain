@@ -144,6 +144,11 @@ const (
 	// the Loop passed verify and is held at phase Verifying until Delivered is
 	// terminal (P5f, I98). Succeeded is set only after.
 	ReasonVerifyingDelivering = "Delivering"
+	// ReasonVerifyingJudging: the reason on the Verifying condition while the
+	// Loop passed verify and the advisory Judge Job (ADR-0011) is running. The
+	// hold releases when the Judge Job is terminal (verdict recorded), then the
+	// delivery hold (if enabled) or Succeeded takes over.
+	ReasonVerifyingJudging = "Judging"
 	// ReasonDeliveryInProgress: the deliver Job has not terminated yet.
 	ReasonDeliveryInProgress = "InProgress"
 	// ReasonDeliveryFailed: the deliver Job definitively failed (an init or

@@ -1101,6 +1101,20 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	}
 	changed = changed || s4Changed
 
+	// ADR-0011 (J1c3): the advisory Judge. When the Loop is held at Verifying
+	// for the Judge (reason Judging — set by applyVerifySucceeded when the
+	// Judge is enabled), judgeSettleStep ensures the Judge NetworkPolicy +
+	// Job and decides the hold: in progress -> requeue (no decision); a
+	// terminal Job records the verdict (or JudgeUnavailable, D124) and
+	// releases the hold to the delivery hold or Succeeded. It runs BEFORE
+	// ensureDeliverAndSettle (which follows applyVerifyOutcome below) so the
+	// release-to-Delivering in the same reconcile does not race the
+	// delivery path's hold check. It is a no-op when the Loop is not held
+	// for the Judge.
+	if err := r.judgeSettleStep(ctx, &loop, &changed, &verifyRequeue); err != nil {
+		return ctrl.Result{}, err
+	}
+
 	// The gate's phase change is recorded in advancedFrom (the PhaseAdvanced
 	// Event covers the gate's advance, not just the claim-driven advance).
 	// The claim-driven advance is already recorded in advancedFrom by

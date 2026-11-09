@@ -300,6 +300,19 @@ func (r *LoopReconciler) applyVerifySucceeded(loop *coxv1alpha1.Loop) (bool, boo
 	// B4: clear the failure summary (the last verify passed — the failure
 	// is resolved; the next planning prompt must not carry a stale summary).
 	clearLastFailureSummary(loop)
+	// ADR-0011 (J1c3): when the advisory Judge is enabled, hold at Verifying
+	// (reason Judging) until the Judge Job is terminal. The Judge is advisory
+	// (D122): it never changes Succeeded, only records a verdict and — for a
+	// false verdict — holds the delivered PR to a draft. The hold clears
+	// status.judge (a fresh Judge run) and the existing delivery-hold path
+	// takes over after the Judge settles (ensureJudgeAndSettle releases it).
+	if judgeEnabled(loop) {
+		loop.Status.Judge = nil
+		setCondition(loop, string(coxv1alpha1.LoopPhaseVerifying), metav1.ConditionTrue,
+			coxv1alpha1.ReasonVerifyingJudging,
+			"verify passed; holding Succeeded until the Judge Job (ADR-0011) reports")
+		return true, false
+	}
 	if deliveryEnabled(loop) {
 		// P5f (I98, D69 option i): hold at Verifying (reason Delivering)
 		// until the Delivered condition is terminal; Succeeded (phase and

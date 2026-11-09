@@ -182,7 +182,7 @@ func TestJudgeBuildSpec(t *testing.T) {
 	// The env (every var, exact values).
 	assertJudgeEnv(t, judge)
 	// The owner reference: the Loop, controller: true (the caller sets it
-	// via ctrl.SetControllerReference \u2014 the builder's job is to NOT set a
+	// via ctrl.SetControllerReference — the builder's job is to NOT set a
 	// foreign owner, and the test asserts the reference is absent before
 	// the caller adds it [the memory-writer pattern: ensureMemoryWriterJobAndNetPolicy
 	// calls SetControllerReference after build]).
@@ -238,9 +238,9 @@ func assertJudgeEnv(t *testing.T, judge corev1.Container) {
 	}
 	// COX_JUDGE_CHECKS: the JSON from the last verify's check commands + exit
 	// codes. The NAME is the acceptance check COMMAND (spec.verify
-	// .acceptanceChecks[i]), NOT the container name (check-0, check-1, \u2026) \u2014
+	// .acceptanceChecks[i]), NOT the container name (check-0, check-1, …) —
 	// the Judge needs to know WHAT the check verifies. The exit codes are
-	// status.verify.lastCheckResults (one per acceptance check, in order \u2014
+	// status.verify.lastCheckResults (one per acceptance check, in order —
 	// the -1 sentinel means "did not run / no exit code yet").
 	var checks []struct {
 		Name     string `json:"name"`

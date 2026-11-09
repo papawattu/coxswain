@@ -50,7 +50,7 @@ locally with the then-current main (they were cut before #430/#432 landed).
 
 ## P2
 
-- [ ] **I244: a kubeconfig error masked every offline CLI error (fixed in #433)**
+- [x] **I244: a kubeconfig error masked every offline CLI error (fixed in #433)** (`35fc411`)
 
   **Where:** `internal/cli/cli.go` ~103, the root `PersistentPreRun`.
 
@@ -66,7 +66,7 @@ locally with the then-current main (they were cut before #430/#432 landed).
   **Acceptance:** met for `suggest` (mutation: `policy_test.go:77: kubeconfig error leaked into the
   output`). For the other commands, the owner's call (D121).
 
-- [ ] **I245: `suggest` listed per-run file names (fixed in #434)**
+- [x] **I245: `suggest` listed per-run file names (fixed in #434)** (`b83646c`)
 
   **Where:** `internal/policy/suggest.go`. Evidence: run 8 and run 12 candidates.
 
@@ -119,7 +119,7 @@ locally with the then-current main (they were cut before #430/#432 landed).
 
 ## P3
 
-- [ ] **I248: `stableFilePath` would map an atomic-writer directory directly under `/` to `/`**
+- [x] **I248: `stableFilePath` would map an atomic-writer directory directly under `/` to `/`** (`e0eaaff`)
 
   **Where:** `internal/policy/suggest.go`, `stableFilePath`.
 
@@ -159,7 +159,7 @@ locally with the then-current main (they were cut before #430/#432 landed).
 
 ### P2
 
-- [ ] **I250: the chart wiring check flaked on SIGPIPE (fixed in #440)**
+- [x] **I250: the chart wiring check flaked on SIGPIPE (fixed in #440)** (`7edb4e8`)
 
   **Where:** `hack/chart-drift-check-test.sh`, the F87 wiring check.
 
@@ -169,7 +169,7 @@ locally with the then-current main (they were cut before #430/#432 landed).
 
   **Acceptance:** met in #440.
 
-- [ ] **I251: `suggest` trusted any ConfigMap named `<loop>-learn-summary` (fixed in #441)**
+- [x] **I251: `suggest` trusted any ConfigMap named `<loop>-learn-summary` (fixed in #441)** (`991373b`)
 
   **Where:** `internal/cli/client.go`, `ReadLearnSummary`.
 
@@ -197,7 +197,7 @@ locally with the then-current main (they were cut before #430/#432 landed).
 
 ### P3
 
-- [ ] **I254: an ownerReference is forgeable by anyone who can write ConfigMaps in the namespace**
+- [x] **I254: an ownerReference is forgeable by anyone who can write ConfigMaps in the namespace** (`f804a71`)
 
   **Where:** `internal/cli/client.go`, `learnSummaryOwnedBy` (I251).
 
@@ -207,7 +207,7 @@ locally with the then-current main (they were cut before #430/#432 landed).
 
   **Acceptance:** the docs name the boundary.
 
-- [ ] **I255: #439's small leftovers**
+- [x] **I255: #439's small leftovers** (`22c2dcb`)
   - `loop_controller.go:305` says CompareAndDelete; the code uses `Load`/`Store` (`loop_learn_summary.go:476-477`).
   - `loopNameTakenSummaryEvents` is keyed by UID and never pruned on delete: a small leak per deleted Loop that hit `LearnSummaryNameTaken`.
   - `compactLearnFileRecords`' `rawByEntry` loop is O(raw × compacted) per write.

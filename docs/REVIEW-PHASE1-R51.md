@@ -59,7 +59,7 @@ owner asked for. #424 merged without the owner's read-through, on the owner's wo
 
 ## P2
 
-- [ ] **I236: `cox policy suggest`'s documented input loses everything before the operator's last log rotation**
+- [x] **I236: `cox policy suggest`'s documented input loses everything before the operator's last log rotation** (`10e96cd`, `a5f7720`, `1738c74`, `1d73ff9`)
 
   **Where:** `docs/OPERATOR.md` ~948 (`kubectl logs -n coxswain-system deploy/coxswain-controller-manager | kubectl cox policy suggest <loop> -f -`), and the same line in `docs/RELEASE-NOTES-next.md` ~55. Evidence: run 12.
 

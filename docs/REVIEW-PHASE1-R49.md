@@ -88,7 +88,7 @@ evidence the owner asked for.
 
   **Acceptance:** a kind run names the pods behind the unattributed count.
 
-- [ ] **I222: the egress proxy recorded no connects in any learn-mode run**
+- [x] **I222: the egress proxy recorded no connects in any learn-mode run** (no fix needed: kind-ref run 14 `.samples/run14-kind/lab-run14.log:77` egress-proxy record, `:99` network 1/1)
 
   **Where:** runs 4-8. Every audit line for the Loop is `source: kubearmor` (`run4` by source: `{'kubearmor': 30493}`); `suggest` never listed a `network` entry.
 

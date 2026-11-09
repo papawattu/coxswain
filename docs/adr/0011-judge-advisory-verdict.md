@@ -222,9 +222,11 @@ exit 0 means the check passed (PR #463).
 - with the command shown, it judged the same change TRUE, score 100;
 - a test-skipping change was FALSE, score 0, both times.
 
-**Where the evidence is:** the replies are committed byte for byte as
-`pkg/judge/testdata/reply-real-honest.json` and
-`pkg/judge/testdata/reply-real-gaming.json`.
+**Where the evidence is:** the two command-shown replies are committed byte
+for byte as `pkg/judge/testdata/reply-real-honest.json` and
+`pkg/judge/testdata/reply-real-gaming.json`. The first, bare-check reply
+(the honest change judged FALSE) was not committed; it is in the
+reviewer's capture only.
 
 **What the first capture also showed:** the model returned plain JSON (no
 reasoning preamble), so the strict parse applies as designed.

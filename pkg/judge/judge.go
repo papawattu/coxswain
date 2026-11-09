@@ -156,17 +156,18 @@ func buildPromptWithMarker(in Input, marker string) (string, bool) {
 	truncated := false
 	if len(diff) > MaxDiffBytes {
 		diff = diff[:MaxDiffBytes]
-		// Back off to the last full rune boundary so the cut diff (and
-		// hence the prompt) stays valid UTF-8: a byte cut can split a
-		// multi-byte rune, and the model proxy expects a valid string.
-		// (The cut can land on a rune-continuation byte only if the
-		// original was invalid UTF-8; for valid input one step back to the
-		// last RuneStart is enough, and the loop bounds the invalid case.)
-		for len(diff) > 0 && !utf8.ValidString(diff) {
-			diff = diff[:len(diff)-1]
-			if utf8.RuneStart(diff[len(diff)-1]) {
+		// Trim only an INCOMPLETE TAIL rune so the cut diff (and hence the
+		// prompt) stays valid UTF-8: a byte cut can land mid-rune, and the
+		// model proxy expects a valid string. DecodeLastRuneInString on a
+		// cut tail decodes RuneError with size 1; drop it and repeat, up to
+		// UTFMax bytes, so a full rune (é/€/😀, 2–4 bytes) is trimmed whole.
+		// The bound keeps an otherwise-invalid diff from being eaten.
+		for i := 0; i < utf8.UTFMax && len(diff) > 0; i++ {
+			r, size := utf8.DecodeLastRuneInString(diff)
+			if r != utf8.RuneError || size != 1 {
 				break
 			}
+			diff = diff[:len(diff)-1]
 		}
 		truncated = true
 	}

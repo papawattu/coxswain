@@ -187,7 +187,7 @@ verdicts: #368 OK+notes (review `...#pullrequestreview-5715783729`), #369 OK (`.
 
 ## P3
 
-- [ ] **I199: the F60 open limit (a probe that reads the canary token) is merged with the fix out of scope**
+- [x] **I199: the F60 open limit (a probe that reads the canary token) is merged with the fix out of scope** (decided: D125, accept permanently, owner 2026-11-09; evidence `docs/CANARY-CHANNEL.md`, `06ec3a5`)
 
   **Where:** #371 round-1 CHANGES, P2 (review `...#pullrequestreview-5722092520`): "the token is neither
   random nor secret, and a comment claims otherwise … Readable anyway. The token is written in plain text

@@ -115,7 +115,7 @@ func SuggestFromRecords(records []alerts.Record, loop, namespace string) Suggest
 					execRejected[bin] = true
 				}
 			case strings.HasPrefix(r.Detail, "operation=File"):
-				files[r.Target]++
+				files[stableFilePath(r.Target)]++
 			}
 		case alerts.SourceEgress:
 			if r.Action == "connect" {
@@ -158,6 +158,31 @@ func execAllowable(p string) bool {
 		p != "/workspace" && !strings.HasPrefix(p, "/workspace/") &&
 		p != "/scratch" && !strings.HasPrefix(p, "/scratch/") &&
 		p != "/tmp" && !strings.HasPrefix(p, "/tmp/")
+}
+
+// stableFilePath maps a file path that changes on every run to the stable
+// directory that contains it (R52, reviewer finding 11-09 from I237's run-8
+// and run-12 data: the candidate listed names that are different on every
+// run, so enforcing it would block the next run):
+//   - a Secret volume's atomic-writer directory: a path segment that starts
+//     with ".." followed by a digit ("..2026_11_07_21_02_45.2174268029") is
+//     rewritten on every mount, so the file under it becomes its directory;
+//   - the operator's memory mount (COX_MEMORY_DIR, "/memory", in
+//     internal/controller/loop_memory_writer_job.go): the lesson files are
+//     named by a content hash, so /memory/<hash>.txt becomes /memory/.
+//
+// Any other path is returned unchanged.
+func stableFilePath(p string) string {
+	for i, seg := range strings.Split(p, "/") {
+		if strings.HasPrefix(seg, "..") && len(seg) > 2 && seg[2] >= '0' && seg[2] <= '9' {
+			// Everything up to this segment, with a trailing "/".
+			return strings.TrimRight(strings.Join(strings.Split(p, "/")[:i], "/"), "/") + "/"
+		}
+	}
+	if path.Dir(p) == "/memory" {
+		return "/memory/"
+	}
+	return p
 }
 
 // collapseFileDirs turns busy directory trees into one "dir/" entry,

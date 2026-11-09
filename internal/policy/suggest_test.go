@@ -349,3 +349,39 @@ func TestRenderSuggestionOverflowComment(t *testing.T) {
 		t.Errorf("rendered candidate lists %d exec entries, want 64:\n%s", len(listed), out)
 	}
 }
+
+// R52: per-run file names become their stable directory. (a) A path segment
+// that starts with ".." followed by a digit is a Secret volume's
+// atomic-writer directory, rewritten on every mount; (b) the memory mount's
+// files are named by a content hash.
+func TestStableFilePath(t *testing.T) {
+	tests := []struct{ in, want string }{
+		{"/workspace-creds/..2026_11_07_21_02_45.2174268029/password", "/workspace-creds/"},
+		{"/workspace-creds/..2026_11_07_21_02_45.2174268029/username", "/workspace-creds/"},
+		{"/memory/19076493ba2fd0e1c7b5a48c6d9e2f304152637485960718293a4b5c6d7e8f8f.txt", "/memory/"},
+		{"/memory", "/memory"},
+		{"/etc/hosts", "/etc/hosts"},
+		{"/a/..b/c", "/a/..b/c"},
+	}
+	for _, tc := range tests {
+		if got := stableFilePath(tc.in); got != tc.want {
+			t.Errorf("stableFilePath(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// R52: two creds files (different atomic-writer dirs collapse to the same
+// stable dir) plus three memory files give exactly two files entries.
+func TestSuggestFromRecordsStablePaths(t *testing.T) {
+	recs := []alerts.Record{
+		{Loop: "l1", Namespace: "ns", Source: alerts.SourceKubeArmor, Action: "Audit", Target: "/workspace-creds/..2026_11_07_21_02_45.2174268029/password", Verdict: "allowed", Detail: "operation=File, pod=l1-sandbox"},
+		{Loop: "l1", Namespace: "ns", Source: alerts.SourceKubeArmor, Action: "Audit", Target: "/workspace-creds/..2026_11_07_21_02_45.2174268029/username", Verdict: "allowed", Detail: "operation=File, pod=l1-sandbox"},
+		{Loop: "l1", Namespace: "ns", Source: alerts.SourceKubeArmor, Action: "Audit", Target: "/memory/19076493ba2fd0e1c7b5a48c6d9e2f304152637485960718293a4b5c6d7e8f8f.txt", Verdict: "allowed", Detail: "operation=File, pod=l1-sandbox"},
+		{Loop: "l1", Namespace: "ns", Source: alerts.SourceKubeArmor, Action: "Audit", Target: "/memory/a31f9b2c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8.txt", Verdict: "allowed", Detail: "operation=File, pod=l1-sandbox"},
+		{Loop: "l1", Namespace: "ns", Source: alerts.SourceKubeArmor, Action: "Audit", Target: "/memory/b52ca03d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f7081b.txt", Verdict: "allowed", Detail: "operation=File, pod=l1-sandbox"},
+	}
+	s := SuggestFromRecords(recs, "l1", "ns")
+	if want := []string{"/memory/", "/workspace-creds/"}; !slices.Equal(s.Files, want) {
+		t.Errorf("files = %v, want %v", s.Files, want)
+	}
+}

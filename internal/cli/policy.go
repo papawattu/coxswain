@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -42,32 +43,49 @@ func newPolicySuggestCommand() *cobra.Command {
 	var file, name string
 	cmd := &cobra.Command{
 		Use: "suggest <loop>",
-		// Offline: -f only reads a local file, so the kubeconfig must not be
-		// loaded and a bad one must not mask this command's own error (R52).
+		// Offline with -f: the file flag reads only a local file, so the
+		// kubeconfig must not be loaded and a bad one must not mask this
+		// command's own error (R52). Without -f it reads the learn-summary
+		// ConfigMap and needs the client-go deps (D119 = (b)).
 		Annotations: map[string]string{annotationOffline: "true"},
-		Short:       "Print a candidate AgentPolicy from a Loop's recorded activity (the operator's audit lines)",
-		Long: "Reads the operator's Q4 audit lines (e.g. `kubectl logs -n coxswain-system deploy/coxswain-controller-manager`)\n" +
-			"and prints a candidate AgentPolicy with the allows the Loop's agent used. Review it before applying.",
+		Short:       "Print a candidate AgentPolicy from a Loop's recorded activity (the learn summary, or the operator's audit lines)",
+		Long: "Reads the Loop's learn summary (the operator's per-Loop ConfigMap <loop>-learn-summary, kept for a\n" +
+			"learn-mode Loop) and prints a candidate AgentPolicy with the allows the Loop's agent used.\n" +
+			"With -f, read the audit lines from an operator log instead (e.g. `kubectl logs -n coxswain-system\n" +
+			"deploy/coxswain-controller-manager` or that log piped on stdin, -f -). Review the candidate before applying.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			in := cmd.InOrStdin()
-			if file != "-" {
-				f, err := os.Open(file)
-				if err != nil {
-					return err
-				}
-				defer func() { _ = f.Close() }()
-				in = f
-			}
 			if name == "" {
 				name = args[0] + "-suggested"
 			}
-			return suggestPolicy(in, cmd.OutOrStdout(), args[0], namespaceOf(), name)
+			if cmd.Flags().Changed("file") {
+				in := cmd.InOrStdin()
+				if file != "-" {
+					f, err := os.Open(file)
+					if err != nil {
+						return err
+					}
+					defer func() { _ = f.Close() }()
+					in = f
+				}
+				return suggestPolicy(in, cmd.OutOrStdout(), args[0], namespaceOf(), name)
+			}
+			// Default: read the learn-summary ConfigMap (D119 = (b)).
+			if currentDeps.LearnSummary == nil {
+				return fmt.Errorf("cox policy suggest: no learn summary reader is configured (the CLI could not build its client)")
+			}
+			records, dropped, err := currentDeps.LearnSummary.ReadLearnSummary(cmd.Context(), namespaceOf(), args[0])
+			if err != nil {
+				return err
+			}
+			if dropped > 0 {
+				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "warning: the learn summary dropped %d record(s) at its bound; the candidate may be missing allows\n", dropped)
+			}
+			return suggestPolicy(strings.NewReader(records), cmd.OutOrStdout(), args[0], namespaceOf(), name)
 		},
 	}
-	cmd.Flags().StringVarP(&file, "file", "f", "", "the audit lines to read (- for stdin)")
+	cmd.Flags().StringVarP(&file, "file", "f", "", "read the audit lines from this operator log instead of the learn summary (- for stdin)")
 	cmd.Flags().StringVar(&name, "name", "", "the candidate AgentPolicy's name (default <loop>-suggested)")
-	_ = cmd.MarkFlagRequired("file")
 	return cmd
 }
 

@@ -4,7 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
+	"strings"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -32,6 +35,14 @@ func buildConfig(kubeconfigPath, kubeContext string) (*rest.Config, error) {
 	}
 	overrides := &clientcmd.ConfigOverrides{CurrentContext: kubeContext}
 	return clientcmd.NewNonInteractiveDeferredLoadingClientConfig(rules, overrides).ClientConfig()
+}
+
+// configMapGVR is the (core) ConfigMap resource. The learn-summary ConfigMap
+// (D119 = (b)) is read through the same dynamic client the CLI already has.
+var configMapGVR = schema.GroupVersionResource{
+	Group:    "",
+	Version:  "v1",
+	Resource: "configmaps",
 }
 
 // dynamicLoopClient is the real LoopClient: a client-go dynamic client for the
@@ -120,6 +131,41 @@ func mustJSON(v any) []byte {
 	return b
 }
 
+// learnSummaryReader is the real LearnSummaryReader: it GETs the per-Loop
+// learn-summary ConfigMap (<loop>-learn-summary) the operator keeps for a
+// learn-mode Loop (D119 = (b), R51 I236) with the dynamic client. The
+// records.jsonl data key holds one alerts.Record JSON line per distinct
+// allow; the dropped key holds the decimal count of records refused at the
+// bound.
+type learnSummaryReader struct {
+	ns string
+	c  dynamic.Interface
+}
+
+// ReadLearnSummary GETs the learn-summary ConfigMap and returns its records
+// (the records.jsonl data key) and the dropped count (the dropped data key;
+// 0 when the key is absent or unparsable). A missing ConfigMap returns an
+// error explaining what writes the ConfigMap and how to pass an operator log
+// instead.
+func (l *learnSummaryReader) ReadLearnSummary(ctx context.Context, namespace, loop string) (string, int64, error) {
+	cm, err := l.c.Resource(configMapGVR).Namespace(namespace).Get(ctx, loop+"-learn-summary", metav1.GetOptions{})
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return "", 0, fmt.Errorf("no learn summary for Loop %s/%s (ConfigMap %s-learn-summary not found): the operator writes it only for a learn-mode Loop (every referenced AgentPolicy auditOnly) once its sandbox has run; or pass -f <operator log>", namespace, loop, loop)
+		}
+		return "", 0, err
+	}
+	obj := cm
+	records, _, _ := unstructured.NestedString(obj.Object, "data", "records.jsonl")
+	var dropped int64
+	if s, ok2, _ := unstructured.NestedString(obj.Object, "data", "dropped"); ok2 {
+		if n, err2 := strconv.ParseInt(strings.TrimSpace(s), 10, 64); err2 == nil {
+			dropped = n
+		}
+	}
+	return records, dropped, nil
+}
+
 // NewDeps builds the real client-go dependencies from the CLI's --namespace /
 // --context / --kubeconfig flags. It is called by the two mains after cobra
 // parses the persistent flags.
@@ -142,8 +188,9 @@ func NewDeps() (Deps, error) {
 		}
 	}
 	return Deps{
-		Loops:     &dynamicLoopClient{ns: ns, c: dc},
-		Logs:      &kubectlLogStreamer{ns: ns},
-		Workspace: &peekWorkspaceReader{ns: ns, Loops: &dynamicLoopClient{ns: ns, c: dc}},
+		Loops:        &dynamicLoopClient{ns: ns, c: dc},
+		Logs:         &kubectlLogStreamer{ns: ns},
+		Workspace:    &peekWorkspaceReader{ns: ns, Loops: &dynamicLoopClient{ns: ns, c: dc}},
+		LearnSummary: &learnSummaryReader{ns: ns, c: dc},
 	}, nil
 }

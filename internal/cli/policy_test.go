@@ -18,6 +18,8 @@ package cli
 
 import (
 	"bytes"
+	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -127,5 +129,94 @@ func TestPolicySuggestRegistered(t *testing.T) {
 	cmd, _, err := root.Find([]string{"policy", "suggest"})
 	if err != nil || cmd == nil || cmd.Name() != "suggest" {
 		t.Fatalf("policy suggest not registered: %v", err)
+	}
+}
+
+// D119 = (b): the fake LearnSummaryReader stands in for the learn-summary
+// ConfigMap reader.
+type fakeLearnSummaryReader struct {
+	records string
+	dropped int64
+	err     error
+}
+
+func (f *fakeLearnSummaryReader) ReadLearnSummary(_ context.Context, _, _ string) (string, int64, error) {
+	return f.records, f.dropped, f.err
+}
+
+// D119 = (b), R51 I236: without -f, `policy suggest` reads the learn-summary
+// ConfigMap (via the LearnSummary seam) and shapes the candidate from its
+// records.
+func TestSuggestPolicyFromLearnSummary(t *testing.T) {
+	oldDeps := currentDeps
+	currentDeps = Deps{LearnSummary: &fakeLearnSummaryReader{
+		records: strings.Join([]string{
+			`{"time":"2026-11-06T10:00:00Z","loop":"l1","namespace":"ns","iteration":"0","source":"kubearmor","action":"Audit","target":"/usr/bin/git","verdict":"allowed","detail":"operation=File, pod=l1-sandbox, policy=p","count":5}`,
+			`{"time":"2026-11-06T10:00:01Z","loop":"l1","namespace":"ns","iteration":"0","source":"egress-proxy","action":"connect","target":"github.com:443","verdict":"blocked","detail":""}`,
+		}, "\n"),
+	}}
+	t.Cleanup(func() { currentDeps = oldDeps })
+
+	var out, errBuf bytes.Buffer
+	root := NewRootCommand(Deps{LearnSummary: currentDeps.LearnSummary})
+	root.SetOut(&out)
+	root.SetErr(&errBuf)
+	root.SetArgs([]string{"policy", "suggest", "l1", "-n", "ns"})
+	runErr := root.Execute()
+	if runErr != nil {
+		t.Fatalf("Execute() error: %v\n%s", runErr, errBuf.String())
+	}
+	got := out.String()
+	for _, want := range []string{"/usr/bin/git", "github.com:443"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("output lacks %q:\n%s", want, got)
+		}
+	}
+}
+
+// D119 = (b): a missing learn-summary ConfigMap (NotFound from the operator)
+// fails with the explanatory error.
+func TestSuggestPolicyLearnSummaryMissing(t *testing.T) {
+	oldDeps := currentDeps
+	currentDeps = Deps{LearnSummary: &fakeLearnSummaryReader{
+		err: fmt.Errorf("no learn summary for Loop ns/l1 (ConfigMap l1-learn-summary not found): the operator writes it only for a learn-mode Loop (every referenced AgentPolicy auditOnly) once its sandbox has run; or pass -f <operator log>"),
+	}}
+	t.Cleanup(func() { currentDeps = oldDeps })
+
+	var out, errBuf bytes.Buffer
+	root := NewRootCommand(Deps{LearnSummary: currentDeps.LearnSummary})
+	root.SetOut(&out)
+	root.SetErr(&errBuf)
+	root.SetArgs([]string{"policy", "suggest", "l1", "-n", "ns"})
+	runErr := root.Execute()
+	if runErr == nil {
+		t.Fatal("Execute() = nil, want an error")
+	}
+	errOut := runErr.Error() + "\n" + errBuf.String()
+	if !strings.Contains(errOut, "no learn summary for Loop") {
+		t.Errorf("error output lacks %q:\n%s", "no learn summary for Loop", errOut)
+	}
+}
+
+// D119 = (b): a learn summary that dropped records at its bound prints the
+// warning to stderr.
+func TestSuggestPolicyLearnSummaryDropped(t *testing.T) {
+	oldDeps := currentDeps
+	currentDeps = Deps{LearnSummary: &fakeLearnSummaryReader{
+		records: `{"time":"2026-11-06T10:00:00Z","loop":"l1","namespace":"ns","iteration":"0","source":"kubearmor","action":"Audit","target":"/usr/bin/git","verdict":"allowed","detail":"operation=File, pod=l1-sandbox, policy=p","count":5}` + "\n",
+		dropped: 3,
+	}}
+	t.Cleanup(func() { currentDeps = oldDeps })
+
+	var out, errBuf bytes.Buffer
+	root := NewRootCommand(Deps{LearnSummary: currentDeps.LearnSummary})
+	root.SetOut(&out)
+	root.SetErr(&errBuf)
+	root.SetArgs([]string{"policy", "suggest", "l1", "-n", "ns"})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("Execute() error: %v\n%s", err, errBuf.String())
+	}
+	if !strings.Contains(errBuf.String(), "dropped 3 record(s)") {
+		t.Errorf("stderr lacks the dropped warning:\n%s", errBuf.String())
 	}
 }

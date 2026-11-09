@@ -476,6 +476,10 @@ func TestStableFilePath(t *testing.T) {
 		{"/memory", "/memory"},
 		{"/etc/hosts", "/etc/hosts"},
 		{"/a/..b/c", "/a/..b/c"},
+		// I248: an atomic-writer segment that is the first segment under "/"
+		// has no stable directory; returning "/" would be a whole-filesystem
+		// recursive allow, so the path stays unchanged.
+		{"/..2026_01_01_00_00_00.1/x", "/..2026_01_01_00_00_00.1/x"},
 	}
 	for _, tc := range tests {
 		if got := stableFilePath(tc.in); got != tc.want {

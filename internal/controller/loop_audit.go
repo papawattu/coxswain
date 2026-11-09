@@ -135,7 +135,7 @@ func (r *LoopReconciler) recordBlockedActions(loop *coxv1alpha1.Loop, changed *b
 // latest target (what was bounced, not only how often) and the process-wide
 // unattributed count when the relay has one.
 func blockedActionsMessage(snap alerts.Snapshot) string {
-	msg := fmt.Sprintf("the engine blocked %d action(s) for this Loop", snap.Count)
+	msg := fmt.Sprintf("%d action(s) blocked", snap.Count)
 	if snap.LatestTarget != "" && !snap.LatestAt.IsZero() {
 		msg += fmt.Sprintf("; latest target %s at %s", snap.LatestTarget, snap.LatestAt.UTC().Format(time.RFC3339))
 	}

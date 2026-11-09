@@ -132,7 +132,7 @@ var _ = Describe("F62: the blocked-action count is relayed into status", func() 
 		Expect(cond).NotTo(BeNil(), "the PolicyBlocked condition must be written")
 		Expect(cond.Status).To(Equal(metav1.ConditionTrue))
 		Expect(cond.Reason).To(Equal(policyBlocksObservedReason))
-		Expect(cond.Message).To(ContainSubstring("blocked 2 action(s)"))
+		Expect(cond.Message).To(ContainSubstring("2 action(s) blocked"))
 		Expect(cond.Message).To(ContainSubstring("/etc/passwd"),
 			"the message says WHAT was bounced, not only how often")
 
@@ -145,7 +145,7 @@ var _ = Describe("F62: the blocked-action count is relayed into status", func() 
 		Expect(loop.Status.Policy.BlockedCount).NotTo(BeNil())
 		Expect(*loop.Status.Policy.BlockedCount).To(Equal(int64(3)),
 			"the second reconcile must UPDATE the count, not leave the first")
-		Expect(f62Blocks(loop).Message).To(ContainSubstring("blocked 3 action(s)"))
+		Expect(f62Blocks(loop).Message).To(ContainSubstring("3 action(s) blocked"))
 	})
 
 	It("writes UNKNOWN and clears the count when the stream cannot be trusted — never 0 (I32)", func() {

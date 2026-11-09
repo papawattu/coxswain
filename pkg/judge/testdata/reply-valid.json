@@ -1,0 +1,22 @@
+{
+  "_comment": "HAND-WRITTEN, pending a real capture (the reviewer captures the real one). Shaped like the model proxy's OpenAI-compatible /v1/chat/completions response envelope, not a byte-for-byte capture.",
+  "id": "chatcmpl-test-j1b",
+  "object": "chat.completion",
+  "created": 1762675200,
+  "model": "test-model",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "{\"verdict\": true, \"score\": 88, \"reason\": \"meets the goal without touching the acceptance checks\"}"
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 0,
+    "completion_tokens": 0,
+    "total_tokens": 0
+  }
+}

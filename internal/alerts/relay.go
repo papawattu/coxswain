@@ -879,9 +879,6 @@ func (r *Relay) buildRecord(al Alert, loopName, loopNS, detail string) Record {
 	}
 }
 
-// unattributedDetail renders the F63 detail for an alert the relay could not
-// attribute: the line is still emitted (every alert is), with the reason.
-
 // attachedNow records a successful attach: the engine stream's state for the
 // sandbox pods on its node, or one proxy pod's Loop.
 func (r *Relay) attachedNow(ctx context.Context, peer Peer) {

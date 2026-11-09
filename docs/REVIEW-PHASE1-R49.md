@@ -174,7 +174,7 @@ evidence the owner asked for.
 
   **Acceptance:** either the relayed count matches, or a gap is marked (`AuditStreamGap`).
 
-- [ ] **I228: `suggest`'s files list is still fine-grained**
+- [x] **I228: `suggest`'s files list is still fine-grained** (4e52203, b83646c; closed on D120)
 
   **Where:** `run7`/`run8` `p6b3-suggest.yaml`: 64 entries, many sibling `/usr/local/go/src/*/` directories, plus 1661 overflow in run 7.
 

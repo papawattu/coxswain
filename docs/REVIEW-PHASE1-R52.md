@@ -223,7 +223,7 @@ locally with the then-current main (they were cut before #430/#432 landed).
   recommendations are approved. It covered the R51 merge and tag, I236-I243, and D119(b).
 
 **Open (reviewer recommendations, approved overnight, for the owner to confirm or reverse):**
-- **D120 (R49 I228):** close I228 on "no overflow, stable paths, dry-run valid" rather than "≤ 20
+- **D120 (R49 I228)** (**decided: close, owner 2026-11-09**; I228 ticked with 4e52203 and b83646c; kind-ref run 14: 26 files, 0 overflow, the dry-run was created): close I228 on "no overflow, stable paths, dry-run valid" rather than "≤ 20
   entries". Run 8's 21 entries (`scratchpad/main-run8.yaml`) are 8 `dir/` entries and 13 exact
   paths. 3 of the exact paths are directory-self entries next to their `dir/` (`/memory`, `/workspace`,
   `…/telemetry/local`), and 10 are single files the agent read. Recommendation: close.

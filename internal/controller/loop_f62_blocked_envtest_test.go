@@ -41,11 +41,20 @@ import (
 
 // f62Audit is a settable AuditReader: the relay's holder, without the streams.
 type f62Audit struct {
-	mu    sync.Mutex
-	snaps map[types.UID]alerts.Snapshot
+	mu           sync.Mutex
+	snaps        map[types.UID]alerts.Snapshot
+	learnRecs    map[types.UID][]alerts.Record
+	learnDropped map[types.UID]int64
+	forgetUids   []types.UID
 }
 
-func newF62Audit() *f62Audit { return &f62Audit{snaps: map[types.UID]alerts.Snapshot{}} }
+func newF62Audit() *f62Audit {
+	return &f62Audit{
+		snaps:        map[types.UID]alerts.Snapshot{},
+		learnRecs:    map[types.UID][]alerts.Record{},
+		learnDropped: map[types.UID]int64{},
+	}
+}
 
 func (f *f62Audit) Set(uid types.UID, snap alerts.Snapshot) {
 	f.mu.Lock()
@@ -58,6 +67,48 @@ func (f *f62Audit) Snapshot(uid types.UID) (alerts.Snapshot, bool) {
 	defer f.mu.Unlock()
 	snap, ok := f.snaps[uid]
 	return snap, ok
+}
+
+// learnRecs is a settable LearnSummary per UID (D119 step 2).
+// nil / absent = ok=false; non-nil slice = ok=true.
+func (f *f62Audit) SetLearnSummary(uid types.UID, recs []alerts.Record, dropped int64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.learnRecs[uid] = recs
+	f.learnDropped[uid] = dropped
+	if len(recs) == 0 {
+		// An empty slice means "no summary at all" (ok=false), so clear it.
+		delete(f.learnRecs, uid)
+		delete(f.learnDropped, uid)
+	}
+}
+
+func (f *f62Audit) LearnSummary(uid types.UID) ([]alerts.Record, int64, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	recs, ok := f.learnRecs[uid]
+	if !ok {
+		return nil, 0, false
+	}
+	dropped := f.learnDropped[uid]
+	return recs, dropped, true
+}
+
+// forgetUids records the UIDs Forget was called with (the envtest spec asserts
+// the delete path calls it; D119 step 2).
+func (f *f62Audit) Forget(uid types.UID) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.forgetUids = append(f.forgetUids, uid)
+	delete(f.learnRecs, uid)
+	delete(f.learnDropped, uid)
+	delete(f.snaps, uid)
+}
+
+func (f *f62Audit) ForgetUIDs() []types.UID {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]types.UID(nil), f.forgetUids...)
 }
 
 var _ AuditReader = &f62Audit{}

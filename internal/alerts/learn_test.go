@@ -164,6 +164,47 @@ func TestHolderLearnSummaryCountsAndBounds(t *testing.T) {
 	}
 }
 
+// TestHolderForgetIsGone asserts both the learn summary and the F62 snapshot
+// are cleared (R52 I249: neither was ever pruned before; D119 step 2 makes the
+// controller call Forget on a deleting Loop).
+//
+// Mutation m4 (hypothetical): Forget removes only h.loops (not h.learn) → the
+// "learn gone" assertion fails. The symmetric mutation (only h.learn, not
+// h.loops) fails the "snapshot gone" assertion.
+func TestHolderForgetIsGone(t *testing.T) {
+	uid := types.UID("uid-forget")
+	h := NewHolder()
+
+	// Seed the learn summary and a snapshot.
+	base := Record{Loop: "l1", Namespace: "ns", Source: SourceKubeArmor, Action: "Audit", Target: "/tmp/x", Detail: "operation=File, pod=l1-sandbox"}
+	h.addLearn(uid, withTime(base, "2026-11-08T10:00:00Z"))
+	h.observe(uid, Alert{Blocked: true, Target: "/etc/passwd", Time: time.Now()})
+	if _, _, ok := h.LearnSummary(uid); !ok {
+		t.Fatal("the learn summary must exist before Forget")
+	}
+	if _, ok := h.Snapshot(uid); !ok {
+		t.Fatal("the snapshot must exist before Forget")
+	}
+
+	h.Forget(uid)
+
+	if _, _, ok := h.LearnSummary(uid); ok {
+		t.Errorf("LearnSummary still returns ok=true after Forget; the learn summary must be deleted")
+	}
+	if _, ok := h.Snapshot(uid); ok {
+		t.Errorf("Snapshot still returns ok=true after Forget; the snapshot must be deleted")
+	}
+
+	// Forget on an unknown UID is a no-op.
+	h.Forget(types.UID("uid-unknown"))
+	// A subsequent addLearn on the same uid starts from an empty summary.
+	h.addLearn(uid, withTime(base, "2026-11-09T10:00:00Z"))
+	recs, dropped, ok := h.LearnSummary(uid)
+	if !ok || len(recs) != 1 || dropped != 0 {
+		t.Fatalf("after Forget + re-add: recs=%d dropped=%d ok=%v, want recs=1 dropped=0 ok=true", len(recs), dropped, ok)
+	}
+}
+
 // withTime renders a record with the given RFC3339 time string.
 func withTime(rec Record, ts string) Record {
 	rec.Time = ts

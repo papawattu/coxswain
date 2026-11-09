@@ -78,7 +78,7 @@ evidence the owner asked for.
 
   **Rule (for the test norms):** a feature that consumes a third-party component's output is proven by a spec that parses a REAL captured line, and by one kind run that shows a non-empty result, not only RBAC.
 
-- [ ] **I221: KubeArmor alerts that no Loop owns: 797 in run 6, 238 in run 7, 923 in run 8, source not shown**
+- [x] **I221: KubeArmor alerts that no Loop owns: 797 in run 6, 238 in run 7, 923 in run 8, source not shown** (no fix needed: kind-ref run 14, `.samples/run14-kind/lab-run14.log:52` counts 123 = the 123 in-window lines from `samples/gitea-…`, the in-cluster git server, which belongs to no Loop; the 1185 `p6b-learn-verify-1-4lc7d` lines are run 13's pod replayed at attach (04:34Z, before the 06:24Z start) and are not counted, per D117)
 
   **Where:** `run6/p6b3-run6.log:52`, `run7/p6b3-run7.log:56`, `run8/p6b3-run8.log:56` (the `PolicyBlocked` message's "could not be attributed to any Loop").
 
@@ -88,7 +88,7 @@ evidence the owner asked for.
 
   **Acceptance:** a kind run names the pods behind the unattributed count.
 
-- [ ] **I222: the egress proxy recorded no connects in any learn-mode run**
+- [x] **I222: the egress proxy recorded no connects in any learn-mode run** (no fix needed: kind-ref run 14 `.samples/run14-kind/lab-run14.log:77` egress-proxy record, `:99` network 1/1)
 
   **Where:** runs 4-8. Every audit line for the Loop is `source: kubearmor` (`run4` by source: `{'kubearmor': 30493}`); `suggest` never listed a `network` entry.
 
@@ -174,7 +174,7 @@ evidence the owner asked for.
 
   **Acceptance:** either the relayed count matches, or a gap is marked (`AuditStreamGap`).
 
-- [ ] **I228: `suggest`'s files list is still fine-grained**
+- [x] **I228: `suggest`'s files list is still fine-grained** (4e52203, b83646c; closed on D120)
 
   **Where:** `run7`/`run8` `p6b3-suggest.yaml`: 64 entries, many sibling `/usr/local/go/src/*/` directories, plus 1661 overflow in run 7.
 

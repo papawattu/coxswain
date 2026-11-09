@@ -41,10 +41,11 @@ const (
 	// entry that makes the just-appended verify Job a NEW Job — the per-Job
 	// sticky rule fires only on a different-JobName trailing entry).
 	// I219: Job names follow the ONE naming rule (verifyJobName, F90: iteration
-	// ≤ 0 maps to 1), so no -verify-0 Job can exist: the seeded entry names a
-	// Job from a PRIOR iteration (0), and the just-appended entry at iteration
-	// 0 names the -verify-1 Job.
-	p2eStallSeededJob0 = "lp-verify-0" // a prior-iteration Job (distinct name, not -verify-1)
+	// ≤ 0 maps to 1), so no -verify-0 Job can exist: the seeded entry is a
+	// SYNTHETIC JobName, distinct from every real verify Job name, and stands
+	// for "a different Job" in the dedup tests; the just-appended entry at
+	// iteration 0 names the -verify-1 Job.
+	p2eStallSeededJob0 = "lp-verify-0" // synthetic name: distinct from every real verify Job name (none is ever -verify-0 after I219)
 	p2eStallSeededJob1 = "lp-verify-1"
 )
 
@@ -266,7 +267,7 @@ func TestApplyStallGateDecidesOnTerminalFailure(t *testing.T) {
 			t.Fatalf("k=2 < N=3 must NOT fire (the gate decides but does not fire below the threshold)")
 		}
 		// The terminal-failure StallEntry is appended (B3 evidence): the ring
-		// holds the seeded verify-0 + the just-appended verify-1.
+		// holds the seeded synthetic verify-0 + the just-appended verify-1.
 		if len(loop.Status.StallHistory) != 2 {
 			t.Fatalf("a terminal verify failure must append a StallEntry (B3 evidence), got %d entries", len(loop.Status.StallHistory))
 		}
@@ -323,8 +324,8 @@ func TestApplyStallGateDecidesOnTerminalFailure(t *testing.T) {
 // only when the trailing history entry's JobName differs from the just-
 // appended one, so a fresh loop (empty history, or a same-JobName trailing
 // entry) does NOT fire at the threshold — that is the per-Job rule, not a
-// gate bug. Seeding a different JobName (verify-0) makes the new verify-1
-// job the kth consecutive failure that fires.
+// gate bug. Seeding a different JobName (the synthetic verify-0) makes the
+// new verify-1 job the kth consecutive failure that fires.
 //
 // Mutation: a Continue fire that sets the phase to Paused (M11) must FAIL this
 // test (the phase is no longer Verifying/unchanged).
@@ -346,7 +347,7 @@ func TestApplyStallGateContinueLeavesPhaseUnchanged(t *testing.T) {
 	loop.Status.Iteration = 1
 	loop.Spec.Loop.StallAfter = &n
 	loop.Spec.Loop.StallAction = coxv1alpha1.StallActionContinue
-	// Seed the history with a DIFFERENT JobName (a prior-iteration Job) carrying
+	// Seed the history with a DIFFERENT JobName (the synthetic verify-0) carrying
 	// the same hash — the 1st consecutive identical failure. The just-appended
 	// entry is verify-1 (a NEW Job), k=2 == N=2 → fires.
 	loop.Status.StallHistory = append(loop.Status.StallHistory,

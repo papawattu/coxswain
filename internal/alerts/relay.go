@@ -637,10 +637,17 @@ func (r *Relay) follow(ctx context.Context, peer Peer) {
 				since = &al.Time
 				sinceAtMax = map[string]struct{}{string(scanner.Bytes()): {}}
 			} else {
-				if sinceAtMax == nil {
-					sinceAtMax = map[string]struct{}{}
+				// I242: only the max instant is the reattach boundary. A line
+				// strictly earlier than the max is not a replay candidate (the
+				// filter's Before branch already drops it), and adding it here
+				// would grow the set without bound and could dedup the wrong line
+				// at the boundary.
+				if al.Time.Equal(*since) {
+					if sinceAtMax == nil {
+						sinceAtMax = map[string]struct{}{}
+					}
+					sinceAtMax[string(scanner.Bytes())] = struct{}{}
 				}
-				sinceAtMax[string(scanner.Bytes())] = struct{}{}
 			}
 			r.accept(ctx, peer, al)
 			if peer.Kind == PeerEngine {

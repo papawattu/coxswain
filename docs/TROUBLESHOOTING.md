@@ -269,6 +269,23 @@ does not own; the operator leaves it alone and will not record the summary):
    then retry. A captured operator log works too: `kubectl cox policy suggest
    <loop> -n <ns> -f <file|->`.
 
+## `suggest` refuses the learn summary: `is not owned by Loop …; refusing to use it`
+
+**What you see:** `kubectl cox policy suggest <loop> -n <ns>` fails with:
+
+```
+ConfigMap <ns>/<loop>-learn-summary is not owned by Loop <ns>/<loop>; refusing to use it (it was not written by the operator)
+```
+
+**Cause:** the ConfigMap has no controller ownerReference to this Loop (kind
+`Loop`, the same name and uid). It was not written by the operator — the
+operator's summary is always owned by the Loop, so a ConfigMap of that name
+without that owner is foreign.
+
+**What to do:** delete the foreign ConfigMap (`kubectl delete cm
+<loop>-learn-summary -n <ns>`) so the operator can create its own, or pass an
+operator log instead: `kubectl cox policy suggest <loop> -n <ns> -f <file|->`.
+
 ## Reading the memory write outcome
 
 Source: the memory-writer changes F31 (#229), F32 (#233), F33 (#234),

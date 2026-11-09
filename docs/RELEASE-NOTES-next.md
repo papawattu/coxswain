@@ -131,7 +131,7 @@ before.
 
 **What it is:** for a learn-mode Loop, the operator keeps a bounded summary of the distinct allows the Loop's agent recorded (sandbox process/file, egress connects) in the ConfigMap `<loop>-learn-summary`, in the Loop's namespace. Data keys: `records.jsonl` (one record per distinct allow, each with its `count`) and `dropped` (a count, monotonically non-decreasing). It is owned by the Loop (controller owner reference) and is garbage-collected with it. The operator needs no new RBAC: configmaps `create;get;update` are already in the operator's role.
 
-**Bound:** `records.jsonl` is capped at 900 KiB; when it does not fit, the lowest-count records are dropped and the number dropped is added to `dropped`.
+**Bound:** before the size check, the file records are compacted the way `suggest` compacts them: per-run atomic-writer paths become their directory, and a busy directory tree (more than 5 immediate children) becomes one `dir/` entry, with the counts summed. If `records.jsonl` is still over 900 KiB, records are evicted by class: file records first (lowest count first), then process records, and egress connects last. Each evicted record is added to `dropped`. Evidence: kind-ref run 14, 13007 relayed records → 359 summary records, dropped 0; the ConfigMap candidate's exec/files/network sets equal the full-log candidate's.
 
 **Events:** a write error emits a Warning Event `LearnSummaryWriteFailed` on the Loop. If a ConfigMap of the name exists that the Loop does not own, the operator leaves it alone and emits a Warning Event `LearnSummaryNameTaken` on the Loop instead of overwriting it.
 

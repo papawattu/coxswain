@@ -93,10 +93,10 @@ func TestPolicySuggestOfflineShowsItsOwnError(t *testing.T) {
 		t.Fatalf("write temp file: %v", err)
 	}
 	var out2, errBuf2 bytes.Buffer
-	root2 := NewRootCommand(fakeDeps(nil))
+	root2 := NewRootCommand(Deps{})
 	root2.SetOut(&out2)
 	root2.SetErr(&errBuf2)
-	root2.SetArgs([]string{"policy", "suggest", "l1", "--namespace", "ns", "-f", f})
+	root2.SetArgs([]string{"policy", "suggest", "l1", "--namespace", "ns", "--kubeconfig", "/nonexistent/kubeconfig", "-f", f})
 	runErr2 := root2.Execute()
 	if runErr2 == nil {
 		t.Fatal("Execute() = nil, want an error")

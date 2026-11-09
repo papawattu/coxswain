@@ -486,9 +486,9 @@ func TestDeliverDescriptionJudgeLine(t *testing.T) {
 
 	// 5. Truncated: the suffix is appended to each of the three lines.
 	for name, tc := range map[string]*coxv1alpha1.JudgeStatus{
-		"pass":          {Verdict: &tv, Score: 87, Reason: "ok", Truncated: true},
-		"fail":          {Verdict: &fv, Score: 12, Reason: "no", Truncated: true},
-		"unavailable":   {Truncated: true},
+		"pass":        {Verdict: &tv, Score: 87, Reason: "ok", Truncated: true},
+		"fail":        {Verdict: &fv, Score: 12, Reason: "no", Truncated: true},
+		"unavailable": {Truncated: true},
 	} {
 		l := a4FactsLoop()
 		l.Status.Judge = tc

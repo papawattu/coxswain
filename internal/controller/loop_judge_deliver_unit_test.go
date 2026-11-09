@@ -47,10 +47,10 @@ func TestDeliverDraftJudgeVerdict(t *testing.T) {
 	noJudge := coxv1alpha1.JudgeStatus{}
 
 	tests := []struct {
-		name     string
-		draft    *bool // nil = spec.delivery.draft unset
-		judge    *coxv1alpha1.JudgeStatus
-		want     bool
+		name  string
+		draft *bool // nil = spec.delivery.draft unset
+		judge *coxv1alpha1.JudgeStatus
+		want  bool
 	}{
 		{"no judge, draft unset -> true", nil, nil, true},
 		{"no judge, draft false -> false", boolPtr(false), nil, false},

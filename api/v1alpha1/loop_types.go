@@ -352,6 +352,35 @@ type VerifyConfig struct {
 	// limits.memory, not the check command.
 	// +optional
 	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
+
+	// judge opts the Loop into the advisory Judge (ADR-0011): after the
+	// acceptance checks pass, a Judge Job is asked whether the change meets
+	// the goal without gaming the acceptance. It is ADVISORY — it is never
+	// the only gate and never changes Succeeded (D122). It is never
+	// defaulted: a Loop without it behaves exactly as before (no Judge Job,
+	// no JudgeVerdict condition, no model call).
+	// +optional
+	Judge *JudgeConfig `json:"judge,omitempty"`
+}
+
+// JudgeConfig declares the opt-in advisory Judge (ADR-0011). The Judge runs
+// after the acceptance checks pass, through the Loop's model proxy (D123),
+// and its verdict is advisory: a false verdict holds the delivered PR to a
+// draft, nothing more.
+type JudgeConfig struct {
+	// enabled turns the Judge on for this Loop. Never defaulted — without it
+	// (or with it false) no Judge Job is created and nothing in the phase
+	// machine or the PR draft computation changes (ADR-0011, D122).
+	Enabled bool `json:"enabled"`
+
+	// maxTokens caps the Judge's model call output: the Judge sets the model
+	// request's max_tokens to this cap (the 256 KiB diff cap bounds the
+	// input, ADR-0011). No default: an enabled Judge without a cap is
+	// incomplete and is rejected at the request, not silently capped.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=32768
+	// +optional
+	MaxTokens int64 `json:"maxTokens,omitempty"`
 }
 
 // VerifyStatus is the operator's record of the last verify run's evidence
@@ -992,6 +1021,16 @@ type LoopStatus struct {
 	// +optional
 	Verify *VerifyStatus `json:"verify,omitempty"`
 
+	// judge is the operator's record of the advisory Judge's verdict
+	// (ADR-0011): the fixed-shape reply the Judge Job reported via its
+	// termination message — a boolean, a 0-100 score, and a one-line reason.
+	// nil until the Judge Job has reported (or the operator has recorded an
+	// unavailable Judge); the JudgeVerdict condition mirrors it (True /
+	// False / Unknown with reason JudgeUnavailable). Written by the operator
+	// only; the agent has no write path (ADR-0004).
+	// +optional
+	Judge *JudgeStatus `json:"judge,omitempty"`
+
 	// currentVerify is the operator's pin of the CURRENT iteration's verified
 	// commit, written by the operator on entering Verifying (D11) and used to
 	// bind the verify evidence to the commit being verified. It is deliberate
@@ -1402,6 +1441,47 @@ type StallEntry struct {
 	At metav1.Time `json:"at"`
 }
 
+// JudgeStatus is the operator's record of the advisory Judge's verdict
+// (ADR-0011). The Judge's reply has a fixed shape (the same verdict pattern
+// as the Memory Curator, ADR-0002): a boolean, a 0-100 score, and a
+// one-line reason of at most 200 characters. Anything outside that shape —
+// a parse failure, a longer reason, a missing boolean — counts as
+// unavailable, which the operator records as a JudgeVerdict=Unknown
+// condition with reason JudgeUnavailable (D124); the boolean stays nil.
+type JudgeStatus struct {
+	// verdict is the Judge's boolean answer: did the change meet the goal
+	// without gaming the acceptance? nil = Unknown (the Judge was not run or
+	// was unavailable) — distinct from the boolean, never read as a pass or
+	// a fail (D122/D124).
+	// +optional
+	Verdict *bool `json:"verdict,omitempty"`
+
+	// score is the Judge's confidence score, 0-100 (part of the fixed shape;
+	// recorded as-is, never re-interpreted by the operator).
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=100
+	// +optional
+	Score int32 `json:"score,omitempty"`
+
+	// reason is the Judge's one-line reason, at most 200 characters. A
+	// longer reason is a malformed reply (unavailable), not a truncated
+	// record: the operator records the fixed shape, never prose.
+	// +kubebuilder:validation:MaxLength=200
+	// +optional
+	Reason string `json:"reason,omitempty"`
+
+	// truncated is true when the diff handed to the Judge exceeded the 256
+	// KiB cap and was truncated to its first 256 KiB: the verdict is
+	// recorded on that fact (ADR-0011).
+	// +optional
+	Truncated bool `json:"truncated,omitempty"`
+
+	// at is the Judge Job pod's finish time (kubelet-recorded), set when the
+	// verdict is recorded.
+	// +optional
+	At *metav1.Time `json:"at,omitempty"`
+}
+
 // Loop condition types (the DeliveredCondition pattern).
 const (
 	// PlanApprovedCondition (PLAN-BETA B3; PLAN.md Phase 4) is the plan
@@ -1589,6 +1669,19 @@ const (
 	// "true"). True + reason NoSecrets = the Loop names no Secret; the
 	// condition is set (never absent) so the absence never means "unchecked".
 	SecretsUsableCondition = "SecretsUsable"
+	// JudgeVerdictCondition (ADR-0011) mirrors status.judge: True or False
+	// with the recorded verdict, Unknown (reason JudgeUnavailable) when the
+	// Judge Job errored, timed out, or reported a malformed reply (D124).
+	// Advisory only (D122): nothing downstream reads it as a pass or a fail
+	// — the false verdict's only effect is to hold the delivered PR to a
+	// draft, whatever spec.delivery.draft says.
+	JudgeVerdictCondition = "JudgeVerdict"
+	// ReasonJudgeUnavailable is the reason on the JudgeVerdict condition when
+	// the Judge is unavailable (an error, timeout, or malformed reply): the
+	// verdict is Unknown, the Loop proceeds, and Succeeded is recorded as if
+	// the Judge had not run (D124; R26 I90 surfaces the failure via a
+	// Warning Event as well).
+	ReasonJudgeUnavailable = "JudgeUnavailable"
 )
 
 // SecretsUsable condition reasons (the named values on the condition).

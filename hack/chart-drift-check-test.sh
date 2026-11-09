@@ -105,8 +105,13 @@ echo "OK: NOTES guard fails (naming the role name and the missing pods/log rule)
 # so nothing else proves `make test` (what CI runs) calls them. `make -n`
 # prints the chart-drift-test recipe without running it.
 echo "=== wiring: make chart-drift-test must run the chart guards (F87) ==="
+# Capture the recipe once: piping `make -n` into `grep -q` under pipefail
+# flaked on SIGPIPE — grep exits at its first match, and make still writing
+# dies 141, failing the pipeline although the guard IS wired (I250; 1/30
+# repro, a false FAIL in PR #437).
+recipe=$(make -C "$ROOT" -n chart-drift-test 2>&1)
 for guard in hack/chart-check.sh hack/chart-notes-check.sh; do
-	if ! make -C "$ROOT" -n chart-drift-test 2>&1 | grep -q -- "$guard"; then
+	if ! grep -q -- "$guard" <<<"$recipe"; then
 		echo "FAIL: chart-drift-test does not run $guard (the guard is dead in CI)"; exit 1
 	fi
 done

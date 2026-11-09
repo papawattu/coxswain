@@ -53,12 +53,12 @@ func TestDeliverDraftJudgeVerdict(t *testing.T) {
 		want  bool
 	}{
 		{"no judge, draft unset -> true", nil, nil, true},
-		{"no judge, draft false -> false", boolPtr(false), nil, false},
-		{"verdict false, draft false -> true (the advisory forces a draft)", boolPtr(false), &coxv1alpha1.JudgeStatus{Verdict: &fv}, true},
+		{"no judge, draft false -> false", new(bool), nil, false},
+		{"verdict false, draft false -> true (the advisory forces a draft)", new(bool), &coxv1alpha1.JudgeStatus{Verdict: &fv}, true},
 		{"verdict false, draft unset -> true", nil, &coxv1alpha1.JudgeStatus{Verdict: &fv}, true},
-		{"verdict true, draft false -> false", boolPtr(false), &coxv1alpha1.JudgeStatus{Verdict: &tv}, false},
+		{"verdict true, draft false -> false", new(bool), &coxv1alpha1.JudgeStatus{Verdict: &tv}, false},
 		{"verdict true, draft unset -> true", nil, &coxv1alpha1.JudgeStatus{Verdict: &tv}, true},
-		{"verdict nil, draft false -> false", boolPtr(false), &noJudge, false},
+		{"verdict nil, draft false -> false", new(bool), &noJudge, false},
 		{"verdict nil, draft unset -> true", nil, &noJudge, true},
 	}
 
@@ -77,5 +77,5 @@ func TestDeliverDraftJudgeVerdict(t *testing.T) {
 	}
 }
 
-// boolPtr is a helper for the table's *bool draft values (nil = unset).
-func boolPtr(b bool) *bool { return &b }
+// The table's *bool draft values use new(bool) (a pointer to false) for the
+// "draft false" cases (nil = unset, the "draft unset" cases).

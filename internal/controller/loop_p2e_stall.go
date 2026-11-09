@@ -264,9 +264,12 @@ func appendStallEntry(loop *coxv1alpha1.Loop, jobName, hash, check string, at *m
 }
 
 // verifyJobName returns the verify Job's name for the current iteration
-// (the StallEntry dedup key, item 6): <loop>-verify-<iteration>.
+// (the StallEntry dedup key, item 6). It delegates to the package
+// verifyJobName (loop_verify_job.go), the ONE naming rule that CREATES the
+// Job, so the StallEntry's jobName always names the Job that exists: at
+// iteration ≤ 0 the name is <loop>-verify-1 (F90 maps 0 to 1).
 func (r *LoopReconciler) verifyJobName(loop *coxv1alpha1.Loop) string {
-	return loop.Name + "-verify-" + strconv.Itoa(loop.Status.Iteration)
+	return verifyJobName(loop)
 }
 
 // readCheckOutputSeam reads the failing check's raw output via the seam

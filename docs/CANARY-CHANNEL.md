@@ -253,31 +253,39 @@ a file the test process can read.
 **Question.** Can the honest canary test still produce proof without the
 token reaching the process? If not, say so.
 
-**Harness** (`/tmp/k0b-6/`). The runner (outside the namespace) writes the
-token to a secret file, bind-mounts `/dev/null` over it, then runs `go test`
-inside the namespace. The canary test reads the token file and
-`t.Fatal(token)`s.
+**Harness** (`/tmp/k0b-6/`). The bind mount and the `go test` run inside
+ONE `unshare -U -m -r sh -c '…'`, so the mount persists for the test
+process. The runner (outside the namespace) writes the token to a secret
+file; the `unshare` bind-mounts `/dev/null` over it, then runs `go test`.
 
 ```
 $ SEED=$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')
 $ TOKEN="canary-$SEED"
-$ # Write the token, then hide it BEFORE the test process starts
 $ printf "%s" "$TOKEN" > /tmp/k0b-6/secret/token
-$ unshare -U -m -r sh -c 'mount --bind /dev/null /tmp/k0b-6/secret/token'
-$ unshare -U -m -r sh -c "go test -count=1 -run '^TestZZZCanary$SEED$' -json ./pkg" > nsrun4.json
-$ rc=$?
-$ echo "rc=$rc"
+$ unshare -U -m -r sh -c '
+>   mount --bind /dev/null /tmp/k0b-6/secret/token
+>   echo "inside ns: cat = [$(cat /tmp/k0b-6/secret/token)]"
+>   go test -count=1 -run "^TestZZZCanary$SEED$" -json ./pkg
+> ' > nsrun2.json 2>&1
+$ echo "rc=$?"
 rc=1
-$ python3 -c "..."
-canary fail event: True
-token in output: False
-verdict: SUBVERTED (no token in output)
 ```
 
-The honest canary test reads the token file, gets an empty string (the
-bind-mount hides the token), and `t.Fatal("")`s. The `-json` output shows
-the canary test as failed, but the token is not in the output. The canary's
-decision logic (rc≠0 + token-in-output) reads this as SUBVERTED.
+`nsrun2.json` (abridged):
+```
+inside ns: cat = []
+{"Action":"run","Test":"TestZZZCanary3243524225"}
+{"Action":"output","Test":"TestZZZCanary3243524225","Output":"=== RUN   TestZZZCanary3243524225\n"}
+{"Action":"output","Test":"TestZZZCanary3243524225","Output":"    zzz_canary_test.go:13: \n"}
+{"Action":"output","Test":"TestZZZCanary3243524225","Output":"--- FAIL: TestZZZCanary3243524225 (0.00s)\n"}
+{"Action":"fail","Test":"TestZZZCanary3243524225","Elapsed":0}
+```
+
+The `inside ns: cat = []` line confirms the token file is empty inside the
+namespace. The canary test reads the token file, gets an empty string, and
+`t.Fatal("")`s. The `-json` output shows the canary test as failed, but the
+token (`canary-3243524225`) is not in the output. The canary's decision
+logic (rc≠0 + token-in-output) reads this as SUBVERTED.
 
 **Result: the honest canary cannot produce proof without the token
 reaching the process.** This is the key finding of the note. Every channel
@@ -316,7 +324,7 @@ it.
 | 3. Canary in its own binary | **Not forgeable**, but the canary is pointless (it does not detect in-process subversion of the agent's code). | A different check, not a fix. |
 | 4. Base-tree comparison | **Not a channel for the token** (orthogonal to the probe). | Already built (F94a). Does not close the limit. |
 | 5. Exit code only (no token) | **Forgeable (shown).** The agent's `init()` exits 1; the canary cannot distinguish it from the honest canary. | Does not close the limit. |
-| 6. Separate OS user / mount namespace | **Not forgeable** (the agent cannot read the token), but **the honest canary cannot produce proof** (the token is not in the output). | Breaks the honest path. Not a viable channel. |
+| 6. Separate OS user / mount namespace | **Not forgeable (argued)** (the agent cannot read the token), but **the honest canary cannot produce proof** (the token is not in the output). | Breaks the honest path. Not a viable channel. |
 
 **The key finding.** Every in-process channel is forgeable: the agent's
 `init()` can write any bytes to `stdout`, read any file in the package
@@ -337,20 +345,15 @@ negative control that detects the most obvious subversion (the agent
 `os.Exit(0)`s before any test runs), but it cannot detect the #371 probe
 (the agent reads the token, prints it, and exits 1).
 
-What still raises the bar:
-- **The Judge (J1)**: a separate LLM that reads the PR diff and the test
-  results can detect the #371 probe (the agent added a test file that reads
-  the canary file and prints the token). The Judge is advisory (D122), so it
-  does not block the Loop, but it records the subversion and raises the bar
-  for future agents.
-- **The base-tree comparison (F94a)**: already built; detects test removal.
-  It does not detect the #371 probe, but it is a separate check that
-  catches a different class of subversion.
-- **Operator review**: the canary's output (the token, the test name, the
-  exit code) is visible to the operator. A human reviewer can see that the
-  canary's output looks suspicious (e.g. the token is printed by the probe,
-  not by the canary test) and reject the Loop. This is not automated, but
-  it raises the bar for an agent that wants to subvert the canary.
+What might raise the bar (unverified):
+- **The Judge (J1, not built)**: a separate LLM that reads the PR diff would
+  see a probe file if the agent added one; whether it flags it is unshown.
+- **The base-tree comparison (F94a, built)**: detects test removal. It does
+  not detect the #371 probe.
+- **Operator review**: where (if anywhere) a human sees the canary's output
+today is not shown in this note; the canary's token and exit code are
+recorded in the verify Job's log, but whether the operator or reviewer reads
+that log before merging is not demonstrated here.
 
 The canary remains useful as a negative control: it detects the most
 obvious subversion (the agent `os.Exit(0)`s before any test runs) and

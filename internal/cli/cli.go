@@ -23,7 +23,7 @@ import (
 )
 
 // annotationOffline marks a command that CAN read no Kubernetes object (with
-// -f it only reads a local file), so PersistentPreRun must not build the
+// -f it only reads a local file), so PersistentPreRunE must not build the
 // client-go deps whose kubeconfig error would mask the command's own error
 // (R52 finding 11-09). The check skips the deps only when the command's file
 // flag was set (D119 = (b): without -f, suggest reads the learn-summary
@@ -119,25 +119,22 @@ func NewRootCommand(deps Deps) *cobra.Command {
 		// Build the real client-go deps after the persistent flags
 		// (--namespace/--context/--kubeconfig) are parsed, unless the caller
 		// already injected a deps set (tests inject a fake before Execute).
-		PersistentPreRun: func(cmd *cobra.Command, _ []string) {
+		PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
 			// Offline only with -f: the annotation marks a command that is
 			// offline when its file flag is set (suggest without -f reads the
 			// learn-summary ConfigMap and needs the client-go deps).
 			if cmd.Annotations[annotationOffline] == "true" &&
 				cmd.Flags().Changed("file") {
-				return
+				return nil
 			}
 			if currentDeps.Loops == nil {
 				d, err := NewDeps()
 				if err != nil {
-					cmd.SilenceErrors = true
-					if _, ferr := fmt.Fprintln(cmd.ErrOrStderr(), "Error:", err); ferr != nil {
-						return
-					}
-					return
+					return fmt.Errorf("could not load the Kubernetes client config: %w", err)
 				}
 				currentDeps = d
 			}
+			return nil
 		},
 	}
 	root.PersistentFlags().StringVarP(&Namespace, "namespace", "n", "", "the namespace for the coxswain objects (from the kubeconfig context if unset)")

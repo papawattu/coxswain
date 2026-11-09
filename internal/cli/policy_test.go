@@ -61,6 +61,11 @@ func TestPolicySuggestOfflineShowsItsOwnError(t *testing.T) {
 
 	var out, errBuf bytes.Buffer
 	root := NewRootCommand(Deps{})
+	// The persistent flags bind into the package vars (Kubeconfig/Context), so
+	// restore them: they leak into kubectl argv (and the client config) in
+	// other tests in this package.
+	oldKube, oldCtx := Kubeconfig, Context
+	t.Cleanup(func() { Kubeconfig, Context = oldKube, oldCtx })
 	root.SetOut(&out)
 	root.SetErr(&errBuf)
 	root.SetArgs([]string{"policy", "suggest", "l1", "--namespace", "ns", "--kubeconfig", "/nonexistent/kubeconfig", "-f", "/nonexistent/input"})
@@ -88,10 +93,10 @@ func TestPolicySuggestOfflineShowsItsOwnError(t *testing.T) {
 		t.Fatalf("write temp file: %v", err)
 	}
 	var out2, errBuf2 bytes.Buffer
-	root2 := NewRootCommand(Deps{})
+	root2 := NewRootCommand(fakeDeps(nil))
 	root2.SetOut(&out2)
 	root2.SetErr(&errBuf2)
-	root2.SetArgs([]string{"policy", "suggest", "l1", "--namespace", "ns", "--kubeconfig", "/nonexistent/kubeconfig", "-f", f})
+	root2.SetArgs([]string{"policy", "suggest", "l1", "--namespace", "ns", "-f", f})
 	runErr2 := root2.Execute()
 	if runErr2 == nil {
 		t.Fatal("Execute() = nil, want an error")
@@ -144,6 +149,13 @@ func (f *fakeLearnSummaryReader) ReadLearnSummary(_ context.Context, _, _ string
 	return f.records, f.dropped, f.err
 }
 
+// fakeDeps builds a Deps whose Loops is a fake, so the pre-run hook never
+// loads the ambient kubeconfig (NewDeps needs no cluster) in the
+// learn-summary specs.
+func fakeDeps(ls LearnSummaryReader) Deps {
+	return Deps{Loops: &fakeLoopClient{}, LearnSummary: ls}
+}
+
 // D119 = (b), R51 I236: without -f, `policy suggest` reads the learn-summary
 // ConfigMap (via the LearnSummary seam) and shapes the candidate from its
 // records.
@@ -158,7 +170,7 @@ func TestSuggestPolicyFromLearnSummary(t *testing.T) {
 	t.Cleanup(func() { currentDeps = oldDeps })
 
 	var out, errBuf bytes.Buffer
-	root := NewRootCommand(Deps{LearnSummary: currentDeps.LearnSummary})
+	root := NewRootCommand(fakeDeps(currentDeps.LearnSummary))
 	root.SetOut(&out)
 	root.SetErr(&errBuf)
 	root.SetArgs([]string{"policy", "suggest", "l1", "-n", "ns"})
@@ -184,7 +196,7 @@ func TestSuggestPolicyLearnSummaryMissing(t *testing.T) {
 	t.Cleanup(func() { currentDeps = oldDeps })
 
 	var out, errBuf bytes.Buffer
-	root := NewRootCommand(Deps{LearnSummary: currentDeps.LearnSummary})
+	root := NewRootCommand(fakeDeps(currentDeps.LearnSummary))
 	root.SetOut(&out)
 	root.SetErr(&errBuf)
 	root.SetArgs([]string{"policy", "suggest", "l1", "-n", "ns"})
@@ -209,7 +221,7 @@ func TestSuggestPolicyLearnSummaryDropped(t *testing.T) {
 	t.Cleanup(func() { currentDeps = oldDeps })
 
 	var out, errBuf bytes.Buffer
-	root := NewRootCommand(Deps{LearnSummary: currentDeps.LearnSummary})
+	root := NewRootCommand(fakeDeps(currentDeps.LearnSummary))
 	root.SetOut(&out)
 	root.SetErr(&errBuf)
 	root.SetArgs([]string{"policy", "suggest", "l1", "-n", "ns"})

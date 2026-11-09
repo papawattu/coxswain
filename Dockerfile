@@ -28,12 +28,18 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -o ma
 # passes its own image to --memory-writer-image so the Job runs this binary).
 RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -o coxswain-memory-write ./cmd/memory-writer
 
+# The P7 Judge Job (ADR-0011) runs the operator's own binary (the judge
+# entrypoint, cmd/judge). Build it into the SAME image as the manager (the
+# Job's container runs /usr/local/bin/coxswain-judge).
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -o coxswain-judge ./cmd/judge
+
 # Use distroless as minimal base image to package the manager binary
 # Refer to https://github.com/GoogleContainerTools/distroless for more details
 FROM gcr.io/distroless/static:nonroot
 WORKDIR /
 COPY --from=builder /workspace/manager .
 COPY --from=builder /workspace/coxswain-memory-write /usr/local/bin/coxswain-memory-write
+COPY --from=builder /workspace/coxswain-judge /usr/local/bin/coxswain-judge
 USER 65532:65532
 
 ENTRYPOINT ["/manager"]

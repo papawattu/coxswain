@@ -130,7 +130,7 @@ locally with the then-current main (they were cut before #430/#432 landed).
 
   **Acceptance:** a table row `/..2026_01_01/x` → unchanged.
 
-- [ ] **I249: the relay never forgets a deleted Loop's state**
+- [x] **I249: the relay never forgets a deleted Loop's state** (`1d73ff9`, `fcd71ce`)
 
   **Where:** `internal/alerts/relay.go`: `Holder.loops`, and (since #435) `Holder.learn`.
 

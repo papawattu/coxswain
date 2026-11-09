@@ -141,7 +141,7 @@ Ticked by this commit:
 
 ## P3
 
-- [ ] **I219: a stall entry's `jobName` reads `-verify-0` while the failing pod is `-verify-1-…`**
+- [x] **I219: a stall entry's `jobName` reads `-verify-0` while the failing pod is `-verify-1-…`** (`769c6ee`)
 
   **Where:** `.samples/d79b-kind/run.log:19` (pod `d79b-fail-verify-1-2wnlz`) against `:23`
   (`stallHistory[0].jobName=d79b-fail-verify-0`).

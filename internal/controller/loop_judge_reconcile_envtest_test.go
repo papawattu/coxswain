@@ -358,7 +358,7 @@ var _ = Describe("J1c3 the Judge reconcile wiring (ADR-0011)", func() {
 		loop := judgeReconcile(r, ns, "judge-e1")
 		Expect(loop.Status.Judge).NotTo(BeNil())
 		Expect(loop.Status.Judge.Verdict).To(BeNil(), "unavailable is never a pass or a fail (D124)")
-		Expect(loop.Status.Judge.Reason).To(ContainSubstring("model proxy refused the request"),
+		Expect(loop.Status.Judge.Reason).To(Equal("model proxy refused the request"),
 			"the unavailable line records the Judge's own cause, not a 'malformed' marker (P3a)")
 		vc := judgeVerdictCond(loop)
 		Expect(vc).NotTo(BeNil())

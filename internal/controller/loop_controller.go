@@ -299,6 +299,17 @@ type LoopReconciler struct {
 	// cannot count the same write twice. A re-note overwrites (never appends).
 	pendingMemoryMetric sync.Map
 
+	// loopNameTakenSummaryEvents (D119 step 2) holds one entry per Loop UID
+	// that already received a LearnSummaryNameTaken Warning Event (a foreign
+	// ConfigMap owns the <loop>-learn-summary name). sync.Map used as a set:
+	// CompareAndDelete returns true only the FIRST time a UID is seen, so the
+	// Event is emitted at most once per Loop instead of on every reconcile
+	// (the recordAuditOnlyIgnored status-changed pattern cannot fit — nothing
+	// in the Loop's status records the collision). Process-wide in-memory
+	// (lost on an operator restart, which re-emits once; acceptable — the
+	// Event stays visible via kubectl and the log line fires every reconcile).
+	loopNameTakenSummaryEvents sync.Map
+
 	// RESTMapper is the manager's dynamic RESTMapper (SetupWithManager wires
 	// mgr.GetRESTMapper()). It is the source of truth for "is the CRD for
 	// this type installed?" (I88): the VolumeSnapshot watch is registered
@@ -920,6 +931,11 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// record that persists). The CleaningUp work (the snapshot GC + the
 	// finalizer removal) still runs below, unchanged.
 	b2Deleting := !loop.DeletionTimestamp.IsZero()
+	// D119 step 2: capture the learn-mode flag BEFORE applyEffectivePolicyAndConditions
+	// overwrites the PolicyEnforced condition (the condition is set by the
+	// effective-policy step, which runs later; the learn-mode gate reads the
+	// condition as it was on the API server when the Loop was re-fetched).
+	learnMode := isLearnMode(&loop)
 	// B1 (finalizer): every live Loop carries the checkpoint finalizer (added
 	// on the first reconcile; idempotent). It is what keeps the Loop alive
 	// long enough to GC its snapshots when the Loop is deleted (CleaningUp).
@@ -947,6 +963,10 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		// CleaningUp work). The B2 decision is the durable record a deleting
 		// Loop leaves behind (finalizeB2DeleteStep persists it before the
 		// snapshot GC runs).
+		// D119 step 2: forget the deleted Loop's relay state (the learn
+		// summary and the F62 snapshot — R52 I249: neither was ever pruned
+		// before). The call is nil-safe (r.Audit may be nil).
+		r.forgetAuditState(&loop)
 		return r.finalizeB2DeleteStep(ctx, &loop)
 	}
 	if err := r.applyLoopFinalizer(ctx, &loop); err != nil {
@@ -1142,6 +1162,13 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// relay outage writes UNKNOWN and clears the count — never 0 (I32) — and a
 	// block never fails or pauses the Loop (Q5).
 	r.recordBlockedActions(&loop, &changed)
+
+	// D119 step 2: persist the learn-mode Loop's summary to an owned
+	// ConfigMap. No return value: Reconcile is at its gocyclo budget.
+	// The learnMode flag was captured before applyEffectivePolicyAndConditions
+	// overwrote the PolicyEnforced condition (the condition as it was on the
+	// API server when the Loop was re-fetched).
+	r.recordLearnSummary(ctx, &loop, learnMode)
 
 	// S3a (GAP 1): record status.baseCommit from the workspace clone. The init
 	// container's termination message (read via the operator's own APIReader

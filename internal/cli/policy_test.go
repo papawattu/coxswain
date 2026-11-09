@@ -47,6 +47,36 @@ func TestSuggestPolicyFromOperatorLog(t *testing.T) {
 	}
 }
 
+// R52 finding 11-09: with -f the command reads only a local file, so a bad
+// kubeconfig must not be loaded and its error must not mask suggest's own
+// error (the "open" error for a missing input file).
+func TestPolicySuggestOfflineShowsItsOwnError(t *testing.T) {
+	oldDeps := currentDeps
+	currentDeps = Deps{}
+	t.Cleanup(func() { currentDeps = oldDeps })
+
+	var out, errBuf bytes.Buffer
+	root := NewRootCommand(Deps{})
+	root.SetOut(&out)
+	root.SetErr(&errBuf)
+	root.SetArgs([]string{"policy", "suggest", "l1", "--namespace", "ns", "--kubeconfig", "/nonexistent/kubeconfig", "-f", "/nonexistent/input"})
+	runErr := root.Execute()
+	if runErr == nil {
+		t.Fatal("Execute() = nil, want an error")
+	}
+	errOut := runErr.Error() + "\n" + errBuf.String() + "\n" + out.String()
+	for _, want := range []string{"open /nonexistent/input", "no such file or directory"} {
+		if !strings.Contains(errOut, want) {
+			t.Errorf("error output lacks %q:\n%s", want, errOut)
+		}
+	}
+	for _, masked := range []string{"invalid configuration", "/nonexistent/kubeconfig"} {
+		if strings.Contains(errOut, masked) {
+			t.Errorf("kubeconfig error leaked into the output:\n%s", errOut)
+		}
+	}
+}
+
 // P6b-2: the command is registered as `policy suggest`.
 func TestPolicySuggestRegistered(t *testing.T) {
 	root := NewRootCommand(Deps{})

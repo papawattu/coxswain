@@ -18,6 +18,8 @@ package cli
 
 import (
 	"bytes"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -44,6 +46,60 @@ func TestSuggestPolicyFromOperatorLog(t *testing.T) {
 	}
 	if strings.Contains(got, "/bin/sh") {
 		t.Errorf("another Loop's activity leaked into the candidate:\n%s", got)
+	}
+}
+
+// R52 finding 11-09: with -f the command reads only a local file, so a bad
+// kubeconfig must not be loaded and its error must not mask suggest's own
+// error (the "open" error for a missing input file).
+func TestPolicySuggestOfflineShowsItsOwnError(t *testing.T) {
+	oldDeps := currentDeps
+	currentDeps = Deps{}
+	t.Cleanup(func() { currentDeps = oldDeps })
+
+	var out, errBuf bytes.Buffer
+	root := NewRootCommand(Deps{})
+	root.SetOut(&out)
+	root.SetErr(&errBuf)
+	root.SetArgs([]string{"policy", "suggest", "l1", "--namespace", "ns", "--kubeconfig", "/nonexistent/kubeconfig", "-f", "/nonexistent/input"})
+	runErr := root.Execute()
+	if runErr == nil {
+		t.Fatal("Execute() = nil, want an error")
+	}
+	errOut := runErr.Error() + "\n" + errBuf.String() + "\n" + out.String()
+	for _, want := range []string{"open /nonexistent/input", "no such file or directory"} {
+		if !strings.Contains(errOut, want) {
+			t.Errorf("error output lacks %q:\n%s", want, errOut)
+		}
+	}
+	for _, masked := range []string{"invalid configuration", "/nonexistent/kubeconfig"} {
+		if strings.Contains(errOut, masked) {
+			t.Errorf("kubeconfig error leaked into the output:\n%s", errOut)
+		}
+	}
+
+	// An input that holds only another Loop's audit lines must fail with
+	// suggest's own "no audit records for Loop" error, not the kubeconfig's.
+	other := `{"time":"2026-11-06T10:00:00Z","loop":"other","namespace":"ns","iteration":"0","source":"kubearmor","action":"Audit","target":"/bin/sh","verdict":"allowed","detail":"operation=Process, pod=other-sandbox, policy=p"}`
+	f := filepath.Join(t.TempDir(), "audit.log")
+	if err := os.WriteFile(f, []byte(other+"\n"), 0o644); err != nil {
+		t.Fatalf("write temp file: %v", err)
+	}
+	var out2, errBuf2 bytes.Buffer
+	root2 := NewRootCommand(Deps{})
+	root2.SetOut(&out2)
+	root2.SetErr(&errBuf2)
+	root2.SetArgs([]string{"policy", "suggest", "l1", "--namespace", "ns", "--kubeconfig", "/nonexistent/kubeconfig", "-f", f})
+	runErr2 := root2.Execute()
+	if runErr2 == nil {
+		t.Fatal("Execute() = nil, want an error")
+	}
+	errOut2 := runErr2.Error() + "\n" + errBuf2.String() + "\n" + out2.String()
+	if !strings.Contains(errOut2, "no audit records for Loop") {
+		t.Errorf("error output lacks %q:\n%s", "no audit records for Loop", errOut2)
+	}
+	if strings.Contains(errOut2, "invalid configuration") {
+		t.Errorf("kubeconfig error leaked into the output:\n%s", errOut2)
 	}
 }
 

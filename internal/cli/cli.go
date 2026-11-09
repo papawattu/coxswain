@@ -22,6 +22,11 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
+// annotationOffline marks a command that reads no Kubernetes object (it only
+// reads a local file), so PersistentPreRun must not build the client-go deps
+// whose kubeconfig error would mask the command's own error (R52 finding 11-09).
+const annotationOffline = "coxswain.io/offline"
+
 // Namespace is the active namespace (from the -n flag or the kubeconfig
 // context). The CLI resolves it once at command build time so every subcommand
 // shares it.
@@ -101,6 +106,9 @@ func NewRootCommand(deps Deps) *cobra.Command {
 		// (--namespace/--context/--kubeconfig) are parsed, unless the caller
 		// already injected a deps set (tests inject a fake before Execute).
 		PersistentPreRun: func(cmd *cobra.Command, _ []string) {
+			if cmd.Annotations[annotationOffline] == "true" {
+				return
+			}
 			if currentDeps.Loops == nil {
 				d, err := NewDeps()
 				if err != nil {

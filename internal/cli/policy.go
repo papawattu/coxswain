@@ -41,8 +41,11 @@ func newPolicyCommand() *cobra.Command {
 func newPolicySuggestCommand() *cobra.Command {
 	var file, name string
 	cmd := &cobra.Command{
-		Use:   "suggest <loop>",
-		Short: "Print a candidate AgentPolicy from a Loop's recorded activity (the operator's audit lines)",
+		Use: "suggest <loop>",
+		// Offline: -f only reads a local file, so the kubeconfig must not be
+		// loaded and a bad one must not mask this command's own error (R52).
+		Annotations: map[string]string{annotationOffline: "true"},
+		Short:       "Print a candidate AgentPolicy from a Loop's recorded activity (the operator's audit lines)",
 		Long: "Reads the operator's Q4 audit lines (e.g. `kubectl logs -n coxswain-system deploy/coxswain-controller-manager`)\n" +
 			"and prints a candidate AgentPolicy with the allows the Loop's agent used. Review it before applying.",
 		Args: cobra.ExactArgs(1),

@@ -18,6 +18,8 @@ package cli
 
 import (
 	"bytes"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -74,6 +76,48 @@ func TestPolicySuggestOfflineShowsItsOwnError(t *testing.T) {
 		if strings.Contains(errOut, masked) {
 			t.Errorf("kubeconfig error leaked into the output:\n%s", errOut)
 		}
+	}
+
+	// An input that holds only another Loop's audit lines must fail with
+	// suggest's own "no audit records for Loop" error, not the kubeconfig's.
+	other := `{"time":"2026-11-06T10:00:00Z","loop":"other","namespace":"ns","iteration":"0","source":"kubearmor","action":"Audit","target":"/bin/sh","verdict":"allowed","detail":"operation=Process, pod=other-sandbox, policy=p"}`
+	f := filepath.Join(t.TempDir(), "audit.log")
+	if err := os.WriteFile(f, []byte(other+"\n"), 0o644); err != nil {
+		t.Fatalf("write temp file: %v", err)
+	}
+	var out2, errBuf2 bytes.Buffer
+	root2 := NewRootCommand(Deps{})
+	root2.SetOut(&out2)
+	root2.SetErr(&errBuf2)
+	root2.SetArgs([]string{"policy", "suggest", "l1", "--namespace", "ns", "--kubeconfig", "/nonexistent/kubeconfig", "-f", f})
+	runErr2 := root2.Execute()
+	if runErr2 == nil {
+		t.Fatal("Execute() = nil, want an error")
+	}
+	errOut2 := runErr2.Error() + "\n" + errBuf2.String() + "\n" + out2.String()
+	if !strings.Contains(errOut2, "no audit records for Loop") {
+		t.Errorf("error output lacks %q:\n%s", "no audit records for Loop", errOut2)
+	}
+	if strings.Contains(errOut2, "invalid configuration") {
+		t.Errorf("kubeconfig error leaked into the output:\n%s", errOut2)
+	}
+}
+
+// R51 I236(1): input that holds nothing for the Loop's agent (run 12: the
+// operator log since its last rotation had none of this Loop's audit lines)
+// must fail, not print an empty spec.
+func TestSuggestPolicyEmptyInputFails(t *testing.T) {
+	in := strings.Join([]string{
+		`{"time":"2026-11-06T10:00:00Z","loop":"other","namespace":"ns","iteration":"0","source":"kubearmor","action":"Audit","target":"/bin/sh","verdict":"allowed","detail":"operation=Process, pod=other-sandbox, policy=p"}`,
+		`{"time":"2026-11-06T10:00:01Z","loop":"other","namespace":"ns","iteration":"0","source":"egress-proxy","action":"connect","target":"example.com:443","verdict":"blocked","detail":""}`,
+	}, "\n")
+	var out bytes.Buffer
+	err := suggestPolicy(strings.NewReader(in), &out, "l1", "ns", "l1-suggested")
+	if err == nil || !strings.Contains(err.Error(), "no audit records for Loop") {
+		t.Fatalf("want an error containing %q, got: %v", "no audit records for Loop", err)
+	}
+	if out.Len() != 0 {
+		t.Fatalf("output should be empty, got:\n%s", out.String())
 	}
 }
 

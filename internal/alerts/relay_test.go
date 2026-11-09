@@ -422,21 +422,26 @@ func TestRelayGapAfterReattach(t *testing.T) {
 }
 
 // TestRelayReplayedLineIsNotCountedTwice is F62 spec 6's second half: sinceTime
-// is inclusive, so the line at the boundary comes back on a RE-attach — it must
-// not count twice, and a non-Block line must not count at all.
+// is inclusive, so the line at the boundary comes back on a RE-attach — a
+// replayed Block must not count twice.
 //
 // D118: mid-attach the relay keeps every line (KubeArmor timestamps are not
 // monotonic), so the replay the spec means is the re-read after the stream
-// ends, modelled as two scripted attaches: the first delivers Block and
-// Allow, the second re-reads the Allow line at the boundary and ends. A
-// line already accepted at the boundary time is counted once.
+// ends, modelled as two scripted attaches: the first delivers the Allow (t1)
+// and then the Block (t2, the max), the second re-reads the Block at the
+// boundary and ends. The replayed Block is skipped, so the count is 1.
 //
-// Mutation: remove the dedup/replay check → the count is 2.
+// (I243: the spec the review flagged re-read the Allow line, which never
+// changes the count, so it passed with the replay filter disabled. Re-reading
+// the BLOCK line is what the mutation below can see.)
+//
+// Mutation: disable the replay filter (make the three replay continues no-ops)
+// → the count is 2.
 func TestRelayReplayedLineIsNotCountedTwice(t *testing.T) {
 	base := time.Date(2026, 10, 26, 10, 0, 0, 0, time.UTC)
-	line := kubeArmorBlock(base.Add(time.Second), "Block", f62Sandbox, f62SandboxP, "/a")
-	allow := kubeArmorBlock(base.Add(2*time.Second), "Allow", f62Sandbox, f62SandboxP, "api")
-	src := &scriptedSource{attaches: []attachment{{lines: []string{line, allow}}, {lines: []string{allow}}}}
+	allow := kubeArmorBlock(base.Add(time.Second), "Allow", f62Sandbox, f62SandboxP, "api")
+	block := kubeArmorBlock(base.Add(2*time.Second), "Block", f62Sandbox, f62SandboxP, "/a")
+	src := &scriptedSource{attaches: []attachment{{lines: []string{allow, block}}, {lines: []string{block}}}}
 	holder := f62Fixture(t, src)
 
 	waitFor(t, "a count of 1", func() bool {
@@ -446,7 +451,47 @@ func TestRelayReplayedLineIsNotCountedTwice(t *testing.T) {
 	// Give the (single) stream time to finish before asserting it stayed at 1.
 	time.Sleep(20 * time.Millisecond)
 	if s, _ := holder.Snapshot(f62UID); s.Count != 1 {
-		t.Errorf("count = %d after a replayed Block and an Allow line, want 1", s.Count)
+		t.Errorf("count = %d after a replayed Block line, want 1", s.Count)
+	}
+}
+
+// TestRelayBoundaryDedupIgnoresEarlierLines is I242: the max-update else
+// branch adds a line to sinceAtMax ONLY at the max instant. A line strictly
+// earlier than the max (out of order, D118) is not a replay candidate, and a
+// NEW line at the boundary instant is a new alert, not a replay.
+//
+// Attach 1 delivers Block X at t2 and then an earlier Allow at t1 (out of
+// order); attach 2 delivers a DIFFERENT Block Y at t2 (same instant, new
+// text). X is counted once, Y is a new alert at the boundary instant:
+// Count == 2. Per the D118 gap rule, the re-attach's first non-replayed line
+// also trips a gap (Unknown) — this spec pins the count, not the health.
+func TestRelayBoundaryDedupIgnoresEarlierLines(t *testing.T) {
+	base := time.Date(2026, 10, 26, 10, 0, 0, 0, time.UTC)
+	t1, t2 := base.Add(time.Second), base.Add(2*time.Second)
+	blockX := kubeArmorBlock(t2, "Block", f62Sandbox, f62SandboxP, "/a")
+	allow1 := kubeArmorBlock(t1, "Allow", f62Sandbox, f62SandboxP, "api")
+	blockY := kubeArmorBlock(t2, "Block", f62Sandbox, f62SandboxP, "/b")
+	src := &scriptedSource{attaches: []attachment{{lines: []string{blockX, allow1}}, {lines: []string{blockY}}}}
+	holder := f62Fixture(t, src)
+
+	waitFor(t, "a count of 2 (X once, Y a new alert at the boundary instant)", func() bool {
+		s, ok := holder.Snapshot(f62UID)
+		return ok && s.Count == 2
+	})
+	snap, ok := holder.Snapshot(f62UID)
+	if !ok {
+		t.Fatalf("no snapshot for the Loop")
+	}
+	// I242: the earlier Allow line is not in sinceAtMax (it is below the max),
+	// so it cannot be wrongly deduped on a re-read; only the t2 lines are.
+	if since := src.sinceAt(1); since == nil || !since.Equal(t2) {
+		t.Errorf("re-attach since = %v, want the max instant %v", since, t2)
+	}
+	// D118 keeps the gap rule: the re-attach's first line is not a replay, so
+	// the first NON-REPLAYED line trips the gap (Unknown, never a smaller
+	// number). The count still stands at 2 (X once, Y once).
+	if snap.Health != HealthGap || snap.Reason != ReasonStreamGap {
+		t.Errorf("health = %s (%s), want the gap (the first non-replayed line of a re-attach is a gap)", snap.Health, snap.Reason)
 	}
 }
 

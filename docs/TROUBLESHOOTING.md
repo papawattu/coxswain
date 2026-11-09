@@ -280,7 +280,9 @@ ConfigMap <ns>/<loop>-learn-summary is not owned by Loop <ns>/<loop>; refusing t
 **Cause:** the ConfigMap has no controller ownerReference to this Loop (kind
 `Loop`, the same name and uid). It was not written by the operator — the
 operator's summary is always owned by the Loop, so a ConfigMap of that name
-without that owner is foreign.
+without that owner is foreign. Note the check stops stray ConfigMaps but not a
+namespace writer who forges the ownerReference (see OPERATOR.md, "Getting a
+starting policy", **Trust**).
 
 **What to do:** delete the foreign ConfigMap (`kubectl delete cm
 <loop>-learn-summary -n <ns>`) so the operator can create its own, or pass an

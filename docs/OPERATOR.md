@@ -961,6 +961,14 @@ defaults to `<loop>-suggested`; the namespace is the CLI's `--namespace` (the
 policy with `auditOnly: true` added (the candidate is written without it) to
 confirm it covers what the agent needs, then drop `auditOnly` to enforce.
 
+**Trust:** the summary is accepted only when it carries a controller
+ownerReference to this Loop (kind, name, and uid); that stops stray or
+foreign ConfigMaps. It does not stop a deliberate namespace writer, because a
+Loop's uid is readable by anyone who can get Loops — anyone who can create
+ConfigMaps in the namespace can forge that ownerReference. The summary is
+therefore only as trustworthy as the namespace's ConfigMap writers; the
+candidate policy is always reviewed by a human before it is applied.
+
 Alternative: read the operator's Q4 audit lines directly (`-f <file>`, or
 `-f -` to pipe them on stdin):
 

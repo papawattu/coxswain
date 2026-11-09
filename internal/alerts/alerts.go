@@ -35,6 +35,7 @@ package alerts
 import (
 	"encoding/json"
 	"io"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -152,6 +153,31 @@ type Record struct {
 	Target    string `json:"target"`
 	Verdict   string `json:"verdict"`
 	Detail    string `json:"detail"`
+	// Count is the record's occurrences in a learn summary; 0 means 1.
+	Count int64 `json:"count,omitempty"`
+}
+
+// LearnRelevant reports whether a record feeds the relay's per-Loop learn
+// summary (D119 = (b), R51 I236): the distinct allows `cox policy suggest`
+// derives, kept by the operator because its own log rotates away during a
+// learn run. Relevant are the sandbox pod's Process and File records (the
+// allows suggest reads from KubeArmor) and egress-proxy connects (its network
+// allows). Every record needs a Loop and a Target: without either the summary
+// cannot say whose allowance this is or what to allow.
+func LearnRelevant(rec Record) bool {
+	if rec.Loop == "" || rec.Target == "" {
+		return false
+	}
+	switch {
+	case rec.Source == SourceKubeArmor &&
+		(strings.HasPrefix(rec.Detail, "operation=Process") ||
+			strings.HasPrefix(rec.Detail, "operation=File")) &&
+		slices.Contains(strings.Split(rec.Detail, ", "), "pod="+rec.Loop+"-sandbox"):
+		return true
+	case rec.Source == SourceEgress && rec.Action == "connect":
+		return true
+	}
+	return false
 }
 
 // WriteRecord writes the record as one JSON line, newline-terminated (the form

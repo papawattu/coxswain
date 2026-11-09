@@ -167,6 +167,39 @@ func TestJudgeBuildSpec(t *testing.T) {
 	}
 	// The security context (non-root, read-only root, no escalation, caps
 	// dropped).
+	assertJudgeSecurityContext(t, judge)
+	// The termination message path (on the /tmp emptyDir).
+	if judge.TerminationMessagePath != judgeResultPath {
+		t.Fatalf("terminationMessagePath: got %q, want %s", judge.TerminationMessagePath, judgeResultPath)
+	}
+	if !hasMount(judge, termmsgVol, "/tmp") {
+		t.Fatalf("the judge container must mount the termmsg emptyDir at /tmp")
+	}
+	// The diff path (read-only on the /judge emptyDir).
+	if !mountReadOnly(judge, judgeVol, "/judge") {
+		t.Fatalf("the judge container must mount /judge read-only (it writes its verdict to /tmp, never back to the diff)")
+	}
+	// The env (every var, exact values).
+	assertJudgeEnv(t, judge)
+	// The owner reference: the Loop, controller: true (the caller sets it
+	// via ctrl.SetControllerReference \u2014 the builder's job is to NOT set a
+	// foreign owner, and the test asserts the reference is absent before
+	// the caller adds it [the memory-writer pattern: ensureMemoryWriterJobAndNetPolicy
+	// calls SetControllerReference after build]).
+	if len(job.OwnerReferences) != 0 {
+		t.Fatalf("the builder must not stamp an owner reference (the caller does), got %v", job.OwnerReferences)
+	}
+	// The owner reference is settable: the builder's ObjectMeta carries the
+	// Loop's namespace (a controller reference to the Loop is valid).
+	if job.Namespace != loop.Namespace {
+		t.Fatalf("the Job must be in the Loop's namespace (the owner reference is the Loop)")
+	}
+}
+
+// assertJudgeSecurityContext checks the judge container's SecurityContext:
+// non-root, read-only rootfs, no privilege escalation, ALL caps dropped.
+func assertJudgeSecurityContext(t *testing.T, judge corev1.Container) {
+	t.Helper()
 	sc := judge.SecurityContext
 	if sc == nil {
 		t.Fatalf("the judge container must carry a SecurityContext")
@@ -183,18 +216,11 @@ func TestJudgeBuildSpec(t *testing.T) {
 	if sc.Capabilities == nil || len(sc.Capabilities.Drop) != 1 || sc.Capabilities.Drop[0] != "ALL" {
 		t.Fatalf("the judge container must drop ALL capabilities, got %+v", sc.Capabilities)
 	}
-	// The termination message path (on the /tmp emptyDir).
-	if judge.TerminationMessagePath != judgeResultPath {
-		t.Fatalf("terminationMessagePath: got %q, want %s", judge.TerminationMessagePath, judgeResultPath)
-	}
-	if !hasMount(judge, "termmsg", "/tmp") {
-		t.Fatalf("the judge container must mount the termmsg emptyDir at /tmp")
-	}
-	// The diff path (read-only on the /judge emptyDir).
-	if !mountReadOnly(judge, "judge", "/judge") {
-		t.Fatalf("the judge container must mount /judge read-only (it writes its verdict to /tmp, never back to the diff)")
-	}
-	// The env (every var, exact values).
+}
+
+// assertJudgeEnv checks the judge container's env vars (exact values).
+func assertJudgeEnv(t *testing.T, judge corev1.Container) {
+	t.Helper()
 	env := envMap(judge.Env)
 	want := map[string]string{
 		"COX_JUDGE_BASE_URL":    "http://loop-b-proxy.judge-ns.svc.cluster.local:8080",
@@ -212,9 +238,9 @@ func TestJudgeBuildSpec(t *testing.T) {
 	}
 	// COX_JUDGE_CHECKS: the JSON from the last verify's check commands + exit
 	// codes. The NAME is the acceptance check COMMAND (spec.verify
-	// .acceptanceChecks[i]), NOT the container name (check-0, check-1, …) —
+	// .acceptanceChecks[i]), NOT the container name (check-0, check-1, \u2026) \u2014
 	// the Judge needs to know WHAT the check verifies. The exit codes are
-	// status.verify.lastCheckResults (one per acceptance check, in order —
+	// status.verify.lastCheckResults (one per acceptance check, in order \u2014
 	// the -1 sentinel means "did not run / no exit code yet").
 	var checks []struct {
 		Name     string `json:"name"`
@@ -223,10 +249,6 @@ func TestJudgeBuildSpec(t *testing.T) {
 	if err := json.Unmarshal([]byte(env["COX_JUDGE_CHECKS"]), &checks); err != nil {
 		t.Fatalf("COX_JUDGE_CHECKS is not a JSON array: %v (value %q)", err, env["COX_JUDGE_CHECKS"])
 	}
-	// The loop has one acceptance check ("go test ./...") and two exit codes
-	// (0, -1). The first entry's name is the COMMAND (not "check-0"), the
-	// second entry has no command (only one check is defined) so it falls
-	// back to the container name "check-1".
 	if len(checks) != 2 {
 		t.Fatalf("COX_JUDGE_CHECKS: got %d entries, want 2: %v", len(checks), env["COX_JUDGE_CHECKS"])
 	}
@@ -241,20 +263,6 @@ func TestJudgeBuildSpec(t *testing.T) {
 	}
 	if checks[1].ExitCode == nil || *checks[1].ExitCode != -1 {
 		t.Fatalf("COX_JUDGE_CHECKS[1].exitCode: got %v, want -1", checks[1].ExitCode)
-	}
-
-	// The owner reference: the Loop, controller: true (the caller sets it
-	// via ctrl.SetControllerReference — the builder's job is to NOT set a
-	// foreign owner, and the test asserts the reference is absent before
-	// the caller adds it [the memory-writer pattern: ensureMemoryWriterJobAndNetPolicy
-	// calls SetControllerReference after build]).
-	if len(job.OwnerReferences) != 0 {
-		t.Fatalf("the builder must not stamp an owner reference (the caller does), got %v", job.OwnerReferences)
-	}
-	// The owner reference is settable: the builder's ObjectMeta carries the
-	// Loop's namespace (a controller reference to the Loop is valid).
-	if job.Namespace != loop.Namespace {
-		t.Fatalf("the Job must be in the Loop's namespace (the owner reference is the Loop)")
 	}
 }
 

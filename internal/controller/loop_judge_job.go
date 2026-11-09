@@ -71,6 +71,25 @@ const judgeForLabel = "coxswain.io/judge-for"
 // scheme, a distinct component).
 const judgeComponentValue = "judge"
 
+// managedByCoxswain is the managed-by label value (the controller that
+// manages the object). Shared across the Job builders (goconst: it appears
+// in the memory-writer, verify, and Judge Job label sets).
+const managedByCoxswain = "coxswain-controller"
+
+// gitConfigCountKey, gitConfigKey0, gitConfigValue0 are the env var names
+// for git's GIT_CONFIG_* mechanism (the verify Job's verifyGitSafeEnv uses
+// them too — goconst: shared across the Job builders).
+const (
+	gitConfigCountKey  = "GIT_CONFIG_COUNT"
+	gitConfigKey0      = "GIT_CONFIG_KEY_0"
+	gitConfigValue0Key = "GIT_CONFIG_VALUE_0"
+)
+
+// termmsgVol is the termination-message emptyDir volume's name (the
+// memory-writer Job uses the same name — goconst: shared across the Job
+// builders).
+const termmsgVol = "termmsg"
+
 // judgeDiffInit is the diff init container's name.
 const judgeDiffInit = "judge-diff"
 
@@ -192,11 +211,11 @@ func judgeJobName(loop *coxv1alpha1.Loop) string {
 // name unchanged — judgeJobName's unit test pins the exact name so the
 // drift is loud.
 func replaceSuffix(s, old, new string) string {
-	i := strings.Index(s, old)
-	if i < 0 {
+	before, after, found := strings.Cut(s, old)
+	if !found {
 		return s
 	}
-	return s[:i] + new + s[i+len(old):]
+	return before + new + after
 }
 
 // judgeJobLabels are the labels the Judge Job carries (the memory-writer
@@ -209,7 +228,7 @@ func judgeJobLabels(loopName string) map[string]string {
 		verifyLoopLabel:         loopName,
 		judgeForLabel:           loopName,
 		"coxswain.io/component": judgeComponentValue,
-		managedByLabel:          "coxswain-controller",
+		managedByLabel:          managedByCoxswain,
 	}
 }
 
@@ -452,9 +471,9 @@ func (r *LoopReconciler) buildJudgeJob(loop *coxv1alpha1.Loop) (*batchv1.Job, er
 							// container runs non-root; the script also
 							// passes -c safe.directory='*', so the env is
 							// belt-and-braces, not the load-bearing gate).
-							{Name: "GIT_CONFIG_COUNT", Value: "1"},
-							{Name: "GIT_CONFIG_KEY_0", Value: verifySafeDirectory},
-							{Name: "GIT_CONFIG_VALUE_0", Value: "/agent-src"},
+							{Name: gitConfigCountKey, Value: "1"},
+							{Name: gitConfigKey0, Value: verifySafeDirectory},
+							{Name: gitConfigValue0Key, Value: deliverAgentSrc},
 						},
 						VolumeMounts: []corev1.VolumeMount{
 							// The workspace PVC, READ-ONLY (the only
@@ -487,7 +506,7 @@ func (r *LoopReconciler) buildJudgeJob(loop *coxv1alpha1.Loop) (*batchv1.Job, er
 							RunAsGroup:               &memoryWriterNonRootGID,
 							ReadOnlyRootFilesystem:   &memoryWriterTrue,
 							AllowPrivilegeEscalation: &memoryWriterFalse,
-							Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+							Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{allCaps}},
 							SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 						},
 						TerminationMessagePath:   judgeResultPath,
@@ -502,7 +521,7 @@ func (r *LoopReconciler) buildJudgeJob(loop *coxv1alpha1.Loop) (*batchv1.Job, er
 							// An emptyDir for the termination message (the
 							// readOnly rootfs makes / read-only; the
 							// verdict file lives on the emptyDir).
-							{Name: "termmsg", MountPath: "/tmp"},
+							{Name: termmsgVol, MountPath: "/tmp"},
 						},
 					}},
 					Volumes: []corev1.Volume{
@@ -519,7 +538,7 @@ func (r *LoopReconciler) buildJudgeJob(loop *coxv1alpha1.Loop) (*batchv1.Job, er
 						// The /judge emptyDir (the diff patch).
 						{Name: judgeVol, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
 						// The termination message's emptyDir.
-						{Name: "termmsg", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
+						{Name: termmsgVol, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
 					},
 				},
 			},
@@ -576,7 +595,7 @@ func judgeNetworkPolicy(loop *coxv1alpha1.Loop) *networkingv1.NetworkPolicy {
 						MatchLabels: map[string]string{kubeNSLabelKey: loop.Namespace},
 					},
 					PodSelector: &metav1.LabelSelector{
-						MatchLabels: map[string]string{"coxswain.io/proxy-for": loop.Name},
+						MatchLabels: map[string]string{netpolProxyForLabel: loop.Name},
 					},
 				}},
 				Ports: []networkingv1.NetworkPolicyPort{{Port: intstrPtr32(proxyPort)}},

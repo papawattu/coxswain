@@ -484,6 +484,42 @@ spec:
                       else a built-in Go image so `go build` / `go test` checks work out of
                       the box).
                     type: string
+                  judge:
+                    description: |-
+                      judge opts the Loop into the advisory Judge (ADR-0011): after the
+                      acceptance checks pass, a Judge Job is asked whether the change meets
+                      the goal without gaming the acceptance. It is ADVISORY — it is never
+                      the only gate and never changes Succeeded (D122). It is never
+                      defaulted: a Loop without it behaves exactly as before (no Judge Job,
+                      no JudgeVerdict condition, no model call).
+                    properties:
+                      enabled:
+                        description: |-
+                          enabled turns the Judge on for this Loop. Never defaulted — without it
+                          (or with it false) no Judge Job is created and nothing in the phase
+                          machine or the PR draft computation changes (ADR-0011, D122).
+                        type: boolean
+                      maxTokens:
+                        description: |-
+                          maxTokens caps the Judge's model call output: the Judge sets the model
+                          request's max_tokens to this cap (the 256 KiB diff cap bounds the
+                          input, ADR-0011). No default: an enabled Judge without a cap is
+                          incomplete and is rejected at admission (the XValidation above), not
+                          silently capped — enforced by the object-level XValidation on the type
+                          (a field-level rule cannot reference sibling fields: self would be the
+                          scalar). An explicit maxTokens: 0 is never admitted for an enabled
+                          Judge: YAML 0 fails Minimum=1, and a Go zero value is omitted and
+                          fails the XValidation.
+                        format: int64
+                        maximum: 32768
+                        minimum: 1
+                        type: integer
+                    required:
+                    - enabled
+                    type: object
+                    x-kubernetes-validations:
+                    - message: maxTokens is required when the Judge is enabled
+                      rule: '!self.enabled || has(self.maxTokens)'
                   onVerifyFail:
                     default: Implement
                     description: |-
@@ -1139,6 +1175,51 @@ spec:
                   first run; the first verify RETRY is 2 (1 is skipped — the iterate
                   advances to max(iteration+1, 2)), then 3, 4 … (F90).
                 type: integer
+              judge:
+                description: |-
+                  judge is the operator's record of the advisory Judge's verdict
+                  (ADR-0011): the fixed-shape reply the Judge Job reported via its
+                  termination message — a boolean, a 0-100 score, and a one-line reason.
+                  nil until the Judge Job has reported (or the operator has recorded an
+                  unavailable Judge); the JudgeVerdict condition mirrors it (True /
+                  False / Unknown with reason JudgeUnavailable). Written by the operator
+                  only; the agent has no write path (ADR-0004).
+                properties:
+                  at:
+                    description: |-
+                      at is the Judge Job pod's finish time (kubelet-recorded), set when the
+                      verdict is recorded.
+                    format: date-time
+                    type: string
+                  reason:
+                    description: |-
+                      reason is the Judge's one-line reason, at most 200 characters. A
+                      longer reason is a malformed reply (unavailable), not a truncated
+                      record: the operator records the fixed shape, never prose.
+                    maxLength: 200
+                    type: string
+                  score:
+                    description: |-
+                      score is the Judge's confidence score, 0-100 (part of the fixed shape;
+                      recorded as-is, never re-interpreted by the operator).
+                    format: int32
+                    maximum: 100
+                    minimum: 0
+                    type: integer
+                  truncated:
+                    description: |-
+                      truncated is true when the diff handed to the Judge exceeded the 256
+                      KiB cap and was truncated to its first 256 KiB: the verdict is
+                      recorded on that fact (ADR-0011).
+                    type: boolean
+                  verdict:
+                    description: |-
+                      verdict is the Judge's boolean answer: did the change meet the goal
+                      without gaming the acceptance? nil = Unknown (the Judge was not run or
+                      was unavailable) — distinct from the boolean, never read as a pass or
+                      a fail (D122/D124).
+                    type: boolean
+                type: object
               observedGeneration:
                 description: observedGeneration is the spec generation last reconciled.
                 format: int64

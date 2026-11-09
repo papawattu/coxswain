@@ -78,7 +78,7 @@ evidence the owner asked for.
 
   **Rule (for the test norms):** a feature that consumes a third-party component's output is proven by a spec that parses a REAL captured line, and by one kind run that shows a non-empty result, not only RBAC.
 
-- [ ] **I221: KubeArmor alerts that no Loop owns: 797 in run 6, 238 in run 7, 923 in run 8, source not shown**
+- [x] **I221: KubeArmor alerts that no Loop owns: 797 in run 6, 238 in run 7, 923 in run 8, source not shown** (no fix needed: kind-ref run 14, `.samples/run14-kind/lab-run14.log:52` counts 123 = the 123 in-window lines from `samples/gitea-…`, the in-cluster git server, which belongs to no Loop; the 1185 `p6b-learn-verify-1-4lc7d` lines are run 13's pod replayed at attach (04:34Z, before the 06:24Z start) and are not counted, per D117)
 
   **Where:** `run6/p6b3-run6.log:52`, `run7/p6b3-run7.log:56`, `run8/p6b3-run8.log:56` (the `PolicyBlocked` message's "could not be attributed to any Loop").
 

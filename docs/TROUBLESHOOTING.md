@@ -1390,10 +1390,10 @@ and check the agent log's `Final Configuration` line, which shows `LogPath:stdou
 (the `Arguments` line shows only the command-line flag, which stays `none`).
 
 **Lines arrive, but none from the Loop's sandbox (or none at all in learn mode).**
-KubeArmor writes a visibility event for every pod on the node, so with the
-agent logging to stdout the log rotates every few seconds; on kind-ref the
-Loop's own sandbox events were then missing from the operator's stream (the
-cause is not proven). And with `defaultVisibility: none`,
+Two notes here: before D118 (#426), the relay dropped out-of-order KubeArmor
+lines; and cluster-wide visibility makes the agent log a visibility event for
+every pod on the node, so keep it scoped to the Loop namespaces to limit the
+volume. With `defaultVisibility: none`,
 KubeArmor emits no alerts at all — not even the policy-matched Audit ones — so
 learn mode records nothing. Keep cluster-wide visibility off and turn it on
 only for the namespaces that run Loops: patch the KubeArmorConfig to

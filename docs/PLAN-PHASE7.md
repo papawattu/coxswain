@@ -80,7 +80,7 @@ A false verdict iterates the Loop, with the Judge's reason fed forward like a fa
 - **For each candidate,** the note shows a concrete forge, or why none exists, with a harness that runs the real script (the AGENTS.md hack-script norm).
 - **Acceptance:** the note is merged, and D125 is decided on what it shows.
 
-### K1. The canary channel (only if K0 finds one)
+### K1. The canary channel (only if K0 finds one) — DROPPED (D125: K0 found no channel; the limit is accepted permanently)
 - **Fix:** the chosen channel.
 - **Acceptance:** the #371 probe as a fixture ends non-`Succeeded` on kind, and the honest-canary path still passes.
 
@@ -102,7 +102,7 @@ A false verdict iterates the Loop, with the Judge's reason fed forward like a fa
 | D122 | **The Judge's effect:** advisory (a negative verdict keeps the PR a draft and is recorded) or a gate (`Succeeded` also needs a true verdict)? | **Advisory.** It keeps "never the only gate" trivially true, and it bounds what a prompt-injected Judge can do. A gate can come later as J2. | **Advisory** (owner, 2026-11-09). J2 is dropped unless revisited. |
 | D123 | **The Judge's model:** the Loop's model via its model proxy (metered, with its own cap), or a separately configured model? | **The Loop's model proxy.** One metered path (ADR-0009) and no new credential. A separate model can be a later field. | **The Loop's model proxy**, with its own cap (owner, 2026-11-09). |
 | D124 | **The Judge unavailable:** record `Unknown` and proceed, or hold the Loop? | **Record `Unknown` and proceed** (advisory), with an Event per R26 I90. Holding would make an optional check block success. | **Record `Unknown` and proceed**, with an Event (owner, 2026-11-09). |
-| D125 | **After K0:** build the channel the note finds, or accept the limit permanently? | Decide on the note's evidence. Until then, D94's accepted limit stands. | **Decided on K0's evidence**; D94's limit stands until then (owner, 2026-11-09). |
+| D125 | **After K0:** build the channel the note finds, or accept the limit permanently? | Decide on the note's evidence. Until then, D94's accepted limit stands. | **Decided on K0's evidence**; D94's limit stands until then (owner, 2026-11-09). **K0's evidence is in (`docs/CANARY-CHANNEL.md`, #457): the limit is accepted permanently and K1 is dropped (owner, 2026-11-09).** |
 | D126 | **The release version:** v0.2.0, or v0.1.4? | **v0.2.0.** There are new CRD fields (auditOnly, ClusterAgentPolicy) and a new admission policy that rejects writes v0.1.3 allowed. | **v0.2.0** (owner, 2026-11-09). |
 | D127 | **VerifySuspicious:** does the Judge replace ADR-0005's advisory diff scan, or do both land? | Decide in J0. The recommendation leans toward the Judge only, to keep one advisory surface. | **The Judge only**, with ADR-0005's VerifySuspicious superseded by J0 (owner, 2026-11-09). |
 

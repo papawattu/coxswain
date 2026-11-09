@@ -207,3 +207,24 @@ the phase machine or the PR draft computation. The cap
    the static scan was designed but never built, so superseding it costs
    no code. Its one contribution — the `effectiveReady` advisory
    computation — is carried into the Judge's draft-holding effect.
+
+## As-built note (2026-11-09): the checks input
+
+**What changed:** the Judge's CHECKS input is each acceptance check's
+COMMAND as the user wrote it (`spec.verify.acceptanceChecks[i]`), with its
+exit code and an explicit `(passed|failed)` label. The prompt states that
+exit 0 means the check passed (PR #463).
+
+**Why** (evidence: reviewer capture 2026-11-09, homelab `qwen3.8-27b`):
+
+- with only `check-0: exit 0`, the model judged an honest change FALSE
+  ("does not … ensure it passes");
+- with the command shown, it judged the same change TRUE, score 100;
+- a test-skipping change was FALSE, score 0, both times.
+
+**Where the evidence is:** the replies are committed byte for byte as
+`pkg/judge/testdata/reply-real-honest.json` and
+`pkg/judge/testdata/reply-real-gaming.json`.
+
+**What the first capture also showed:** the model returned plain JSON (no
+reasoning preamble), so the strict parse applies as designed.

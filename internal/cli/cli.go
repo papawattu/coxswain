@@ -22,9 +22,12 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
-// annotationOffline marks a command that reads no Kubernetes object (it only
-// reads a local file), so PersistentPreRun must not build the client-go deps
-// whose kubeconfig error would mask the command's own error (R52 finding 11-09).
+// annotationOffline marks a command that CAN read no Kubernetes object (with
+// -f it only reads a local file), so PersistentPreRun must not build the
+// client-go deps whose kubeconfig error would mask the command's own error
+// (R52 finding 11-09). The check skips the deps only when the command's file
+// flag was set (D119 = (b): without -f, suggest reads the learn-summary
+// ConfigMap and needs the deps).
 const annotationOffline = "coxswain.io/offline"
 
 // Namespace is the active namespace (from the -n flag or the kubeconfig
@@ -72,6 +75,14 @@ type WorkspaceReader interface {
 	Read(ctx context.Context, loop, path string) (string, error)
 }
 
+// LearnSummaryReader reads the per-Loop learn-summary ConfigMap the operator
+// keeps for a learn-mode Loop (D119 = (b), R51 I236). It is the default input
+// of `cox policy suggest`; tests stub the returned records. The real impl GETs
+// the ConfigMap with the dynamic client (learnSummaryReader in client.go).
+type LearnSummaryReader interface {
+	ReadLearnSummary(ctx context.Context, namespace, loop string) (records string, dropped int64, err error)
+}
+
 // Deps wires the seams a command needs. Zero values select the real
 // (client-go) implementations; tests set the fake fields.
 type Deps struct {
@@ -85,6 +96,9 @@ type Deps struct {
 	MemoryStore MemoryStore
 	// MemoryAdmin is the `memory delete` boundary (I101); nil = kubectl.
 	MemoryAdmin MemoryAdmin
+	// LearnSummary reads the learn-summary ConfigMap (the `policy suggest`
+	// command's default input; D119 = (b)). nil = the real dynamic client.
+	LearnSummary LearnSummaryReader
 }
 
 // currentDeps is the active seam set. It is set by NewRootCommand/Execute and
@@ -106,7 +120,11 @@ func NewRootCommand(deps Deps) *cobra.Command {
 		// (--namespace/--context/--kubeconfig) are parsed, unless the caller
 		// already injected a deps set (tests inject a fake before Execute).
 		PersistentPreRun: func(cmd *cobra.Command, _ []string) {
-			if cmd.Annotations[annotationOffline] == "true" {
+			// Offline only with -f: the annotation marks a command that is
+			// offline when its file flag is set (suggest without -f reads the
+			// learn-summary ConfigMap and needs the client-go deps).
+			if cmd.Annotations[annotationOffline] == "true" &&
+				cmd.Flags().Changed("file") {
 				return
 			}
 			if currentDeps.Loops == nil {

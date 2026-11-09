@@ -174,7 +174,10 @@ func execAllowable(p string) bool {
 // run, so enforcing it would block the next run):
 //   - a Secret volume's atomic-writer directory: a path segment that starts
 //     with ".." followed by a digit ("..2026_11_07_21_02_45.2174268029") is
-//     rewritten on every mount, so the file under it becomes its directory;
+//     rewritten on every mount, so the file under it becomes its directory —
+//     unless the segment is the FIRST one under "/", where there is no stable
+//     directory to fall back to; such a path is returned unchanged (R52 I248:
+//     mapping it to "/" would be a whole-filesystem recursive allow);
 //   - the operator's memory mount (COX_MEMORY_DIR, "/memory", in
 //     internal/controller/loop_memory_writer_job.go): the lesson files are
 //     named by a content hash, so /memory/<hash>.txt becomes /memory/.
@@ -183,6 +186,9 @@ func execAllowable(p string) bool {
 func stableFilePath(p string) string {
 	for i, seg := range strings.Split(p, "/") {
 		if strings.HasPrefix(seg, "..") && len(seg) > 2 && seg[2] >= '0' && seg[2] <= '9' {
+			if i == 1 { // first segment under "/": no stable dir (I248) — return p unchanged
+				return p
+			}
 			// Everything up to this segment, with a trailing "/".
 			return strings.TrimRight(strings.Join(strings.Split(p, "/")[:i], "/"), "/") + "/"
 		}

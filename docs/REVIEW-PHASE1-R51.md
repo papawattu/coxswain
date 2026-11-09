@@ -77,7 +77,7 @@ owner asked for. #424 merged without the owner's read-through, on the owner's wo
 
   **Acceptance:** (1) a spec with input holding no record for the Loop exits non-zero; (2) per D119.
 
-- [ ] **I237: `suggest` does not collapse a wide, shallow tree (continues R49 I228)**
+- [x] **I237: `suggest` does not collapse a wide, shallow tree (continues R49 I228)** (`4e52203`)
 
   **Where:** `internal/policy/suggest.go`, the files collapse (#411/D112, #420/I228). Evidence:
   `run12-kind/run12-suggest-full.yaml`.
@@ -129,7 +129,7 @@ owner asked for. #424 merged without the owner's read-through, on the owner's wo
 
 ## P3
 
-- [ ] **I240: QUICKSTART blames rotation for the missing sandbox events**
+- [x] **I240: QUICKSTART blames rotation for the missing sandbox events** (`bde941d`)
 
   **Where:** `docs/QUICKSTART.md` ~484-486.
 
@@ -142,7 +142,7 @@ owner asked for. #424 merged without the owner's read-through, on the owner's wo
 
   **Acceptance:** no doc names log rotation as the cause of missing relayed events.
 
-- [ ] **I241: `PolicyBlocked`'s "latest target" is the latest alert of any verdict**
+- [x] **I241: `PolicyBlocked`'s "latest target" is the latest alert of any verdict** (`99fca31`)
 
   **Where:** `internal/alerts/relay.go` ~127-131 and ~194 (`LatestTarget`, set for every accepted
   alert), and `internal/controller/loop_audit.go` ~136-142 (`blockedActionsMessage`).
@@ -158,7 +158,7 @@ owner asked for. #424 merged without the owner's read-through, on the owner's wo
 
   **Acceptance:** a spec with a blocked alert followed by allowed ones reports the blocked target.
 
-- [ ] **I242: the relay's `sinceAtMax` grows with out-of-order lines (from #426's review)**
+- [x] **I242: the relay's `sinceAtMax` grows with out-of-order lines (from #426's review)** (`2478eb8`)
 
   **Where:** `internal/alerts/relay.go`, `follow()`, the `else` branch of the max update.
 
@@ -170,7 +170,7 @@ owner asked for. #424 merged without the owner's read-through, on the owner's wo
 
   **Acceptance:** the two D118 specs still pass, and the D118 mutation still fails them.
 
-- [ ] **I243: `TestRelayReplayedLineIsNotCountedTwice` no longer tests a replayed Block (#426)**
+- [x] **I243: `TestRelayReplayedLineIsNotCountedTwice` no longer tests a replayed Block (#426)** (`2478eb8`)
 
   **Where:** `internal/alerts/relay_test.go`, `TestRelayReplayedLineIsNotCountedTwice` (rewritten by
   #426, `dc388ce`).

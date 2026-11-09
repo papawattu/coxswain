@@ -896,12 +896,28 @@ type judgeVerdict struct {
 // applyJudgeVerdict is the decision table for the Judge Job's completion:
 // a parsable verdict form is recorded (True/False, reason Judged, Normal
 // Event); everything else — the unavailable marker, an unparsable line, a
-// missing boolean, or an over-long reason — is unavailable (D124: Unknown,
-// reason JudgeUnavailable, Warning Event; the Loop proceeds).
+// missing boolean, an out-of-range score, or an over-long reason — is
+// unavailable (D124: Unknown, reason JudgeUnavailable, Warning Event; the
+// Loop proceeds).
 func (r *LoopReconciler) applyJudgeVerdict(loop *coxv1alpha1.Loop, msg string) {
 	var v judgeVerdict
 	if err := json.Unmarshal([]byte(msg), &v); err != nil || v.Verdict == nil {
+		// A line that does not parse (or lacks the boolean verdict) is an
+		// unavailable line: the Judge's own failure marker is recorded with
+		// its cause, any other garbage is recorded as malformed.
+		if err == nil && v.Verdict == nil && v.Unavailable != "" {
+			r.recordJudgeUnavailable(loop, v.Unavailable)
+			return
+		}
 		r.recordJudgeUnavailable(loop, "malformed judge verdict: "+msg)
+		return
+	}
+	if v.Score < 0 || v.Score > 100 {
+		// A score outside 0..100 is a malformed reply (unavailable, not a
+		// clamped record — the CRD's Min=0/Max=100 would reject the status
+		// write otherwise, and clamping would record a confidence the Judge
+		// did not report).
+		r.recordJudgeUnavailable(loop, "malformed judge verdict: score out of range")
 		return
 	}
 	if len(v.Reason) > judgeReasonMaxChars {

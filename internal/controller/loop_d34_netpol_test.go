@@ -182,13 +182,15 @@ var _ = Describe("D34: per-Loop NetworkPolicy", func() {
 		))
 
 		// Ingress: from this Loop's agent AND the memory-writer Job's curator
-		// call on 8080 (per-Loop peers, P1-1; P5c kind finding: the writer's
-		// curator POST rides this same proxy port and its pod's only label is
-		// coxswain.io/memory-write-for=<loop> — agent-only ingress dropped
-		// every lesson with "curator unavailable").
+		// call AND the Judge Job's verdict call on 8080 (per-Loop peers, P1-1;
+		// P5c kind finding: the writer's curator POST rides this same proxy
+		// port and its pod's only label is coxswain.io/memory-write-for=<loop>
+		// — agent-only ingress dropped every lesson with "curator
+		// unavailable"; J1d kind finding, same shape for the Judge:
+		// coxswain.io/judge-for=<loop>).
 		Expect(np.Spec.Ingress).To(HaveLen(1))
-		Expect(np.Spec.Ingress[0].From).To(HaveLen(2))
-		agentFound, writerFound := false, false
+		Expect(np.Spec.Ingress[0].From).To(HaveLen(3))
+		agentFound, writerFound, judgeFound := false, false, false
 		for _, from := range np.Spec.Ingress[0].From {
 			if from.PodSelector == nil {
 				continue
@@ -200,9 +202,13 @@ var _ = Describe("D34: per-Loop NetworkPolicy", func() {
 			if from.PodSelector.MatchLabels["coxswain.io/memory-write-for"] == "proxy-np" {
 				writerFound = true
 			}
+			if from.PodSelector.MatchLabels["coxswain.io/judge-for"] == "proxy-np" {
+				judgeFound = true
+			}
 		}
 		Expect(agentFound).To(BeTrue(), "the agent peer must name this Loop (P1-1)")
 		Expect(writerFound).To(BeTrue(), "the memory-writer peer must name this Loop (P5c)")
+		Expect(judgeFound).To(BeTrue(), "the Judge peer must name this Loop (J1d)")
 		Expect(np.Spec.Ingress[0].Ports).To(ContainElement(networkingv1.NetworkPolicyPort{
 			Protocol: new(corev1.ProtocolTCP),
 			Port:     intstrPtr(8080),

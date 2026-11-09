@@ -358,7 +358,8 @@ var _ = Describe("J1c3 the Judge reconcile wiring (ADR-0011)", func() {
 		loop := judgeReconcile(r, ns, "judge-e1")
 		Expect(loop.Status.Judge).NotTo(BeNil())
 		Expect(loop.Status.Judge.Verdict).To(BeNil(), "unavailable is never a pass or a fail (D124)")
-		Expect(loop.Status.Judge.Reason).To(ContainSubstring("unavailable"))
+		Expect(loop.Status.Judge.Reason).To(ContainSubstring("model proxy refused the request"),
+			"the unavailable line records the Judge's own cause, not a 'malformed' marker (P3a)")
 		vc := judgeVerdictCond(loop)
 		Expect(vc).NotTo(BeNil())
 		Expect(vc.Status).To(Equal(metav1.ConditionUnknown))
@@ -388,6 +389,32 @@ var _ = Describe("J1c3 the Judge reconcile wiring (ADR-0011)", func() {
 		Expect(judgeDrainedEvents(r)).To(ContainElement(And(
 			ContainSubstring(corev1.EventTypeWarning),
 			ContainSubstring("malformed"),
+		)))
+		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseSucceeded))
+	})
+
+	It("(e4) a verdict with a score outside 0..100 is JudgeUnavailable, never a clamped record", func() {
+		ns := freshNS()
+		jobName := judgeDriveToJudging(ns, "judge-e4", false)
+		r := judgeFreshReconciler()
+		job := judgeGetJob(ns, jobName)
+		judgePod(ctx, ns, "judge-e4", job,
+			corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+				ExitCode: 0,
+				Message:  `{"verdict":true,"score":140,"reason":"confidence out of range"}`,
+			}},
+			corev1.PodSucceeded)
+		judgeCompleteJob(ctx, job)
+		loop := judgeReconcile(r, ns, "judge-e4")
+		Expect(loop.Status.Judge).NotTo(BeNil())
+		Expect(loop.Status.Judge.Verdict).To(BeNil(), "a bad score is never a clamped record")
+		Expect(loop.Status.Judge.Reason).To(ContainSubstring("score out of range"))
+		vc := judgeVerdictCond(loop)
+		Expect(vc.Status).To(Equal(metav1.ConditionUnknown))
+		Expect(vc.Reason).To(Equal(coxv1alpha1.ReasonJudgeUnavailable))
+		Expect(judgeDrainedEvents(r)).To(ContainElement(And(
+			ContainSubstring(corev1.EventTypeWarning),
+			ContainSubstring("score out of range"),
 		)))
 		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseSucceeded))
 	})

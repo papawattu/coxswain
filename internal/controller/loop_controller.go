@@ -5084,6 +5084,19 @@ func (r *LoopReconciler) ensureNetworkPolicy(ctx context.Context, loop *coxv1alp
 	memoryWriterPeer := networkingv1.NetworkPolicyPeer{
 		PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{memoryWriteForLabelKey: loopName}},
 	}
+	// J1d (#467 kind proof): the Judge Job's verdict call goes to this SAME
+	// model proxy pod (its egress netpol allows the proxy pod,
+	// loop_judge_job.go), so the proxy's INGRESS must admit the judge pod
+	// too — the P5c defect for the memory writer, same shape. The judge pod
+	// carries coxswain.io/judge-for=<loop> (judgeJobLabels), which matches
+	// neither the agent peer (app.kubernetes.io/component=agent) nor the
+	// memory-writer peer. Without this peer the judge call times out at the
+	// proxy and every verdict is recorded JudgeUnavailable (the kind
+	// evidence: the termmsg "call failed: Post … context deadline
+	// exceeded").
+	judgePeer := networkingv1.NetworkPolicyPeer{
+		PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{judgeForLabel: loopName}},
+	}
 	// I42c: the agent's egress to the egress proxy is expected only when the
 	// egress proxy is expected (network allows present); with no network
 	// allows the agent's egress stays model-proxy + DNS (D34).
@@ -5217,11 +5230,12 @@ func (r *LoopReconciler) ensureNetworkPolicy(ctx context.Context, loop *coxv1alp
 			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress, networkingv1.PolicyTypeEgress},
 			Ingress: []networkingv1.NetworkPolicyIngressRule{
 				{
-					// The model proxy admits the Loop's agent AND the memory-writer
-					// Job's curator call on 8080 (the writer's only network call
-					// is the curator POST to this proxy; F8 admits the verify +
-					// deliver pods to the egress proxy above, not this proxy).
-					From:  []networkingv1.NetworkPolicyPeer{agentPeer, memoryWriterPeer},
+					// The model proxy admits the Loop's agent, the memory-writer
+					// Job's curator call, AND the Judge Job's verdict call on
+					// 8080 (each of their only network calls is a POST to this
+					// proxy; F8 admits the verify + deliver pods to the egress
+					// proxy above, not this proxy).
+					From:  []networkingv1.NetworkPolicyPeer{agentPeer, memoryWriterPeer, judgePeer},
 					Ports: []networkingv1.NetworkPolicyPort{{Port: intstrPtr32(8080), Protocol: new(corev1.ProtocolTCP)}},
 				},
 			},

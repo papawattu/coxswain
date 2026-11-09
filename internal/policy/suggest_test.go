@@ -154,13 +154,15 @@ func TestSuggestFromRecordsDropsEntriesUnderACollapsedDir(t *testing.T) {
 	if want := []string{"/a/", "/z.txt"}; !slices.Equal(s.Files, want) {
 		t.Errorf("files = %v, want %v", s.Files, want)
 	}
-	// /a/ must carry the sum of the entries it covers (6 collapsed files +
-	// 1 /a/b/c.txt + 1 /a/d/): the collapsed map keeps exactly the sum.
+	// /a/ must carry the sum of the distinct entries it covers (the 6
+	// collapsed files + 1 /a/b/c.txt): the collapsed map keeps exactly the
+	// sum, counted once (R51 I237 fix-up: the /a/d/ entry's count is
+	// covered by the /a/ entry itself, so it is not added a second time).
 	if got := collapseFileDirs(map[string]int{
 		"/a/fa": 1, "/a/fb": 1, "/a/fc": 1, "/a/fd": 1, "/a/fe": 1, "/a/ff": 1,
 		"/a/b/c.txt": 1, "/a/d/": 1,
-	}); len(got) != 1 || got["/a/"] != 8 {
-		t.Errorf("collapsed = %v, want {/a/: 8} (sum of covered entries)", got)
+	}); len(got) != 1 || got["/a/"] != 7 {
+		t.Errorf("collapsed = %v, want {/a/: 7} (sum of distinct covered entries, counted once)", got)
 	}
 
 	// A collapsed directory UNDER another collapsed directory is subsumed by
@@ -185,6 +187,69 @@ func TestSuggestFromRecordsDropsEntriesUnderACollapsedDir(t *testing.T) {
 	// three counts.
 	if got := collapseFileDirs(map[string]int{"/a/": 1, "/a/b/": 1, "/a/b/c.txt": 1, "/z.txt": 1}); len(got) != 2 || got["/a/"] != 3 || got["/z.txt"] != 1 {
 		t.Errorf("collapsed = %v, want {/a/: 3, /z.txt: 1} (nested dir/ and its file roll into the outermost ancestor)", got)
+	}
+}
+
+// R51 I237: a wide, shallow tree — 10 subdirectories with 2 files each —
+// collapses to the parent directory, because the parent has more than 5
+// distinct immediate children (the subdirectories themselves); the
+// unrelated file survives and nothing overflows.
+func TestSuggestFromRecordsCollapsesWideShallowTree(t *testing.T) {
+	recs := make([]alerts.Record, 0, 21)
+	for i := range 10 {
+		dir := fmt.Sprintf("/scratch/.cache/go-build/%c", '0'+i)
+		for j := range 2 {
+			recs = append(recs, alerts.Record{Loop: "l1", Namespace: "ns", Source: alerts.SourceKubeArmor, Action: "Audit", Target: dir + "/f" + string(rune('a'+j)), Verdict: "allowed", Detail: "operation=File, pod=l1-sandbox"})
+		}
+	}
+	recs = append(recs, alerts.Record{Loop: "l1", Namespace: "ns", Source: alerts.SourceKubeArmor, Action: "Audit", Target: "/etc/hosts", Verdict: "allowed", Detail: "operation=File, pod=l1-sandbox"})
+	s := SuggestFromRecords(recs, "l1", "ns")
+	if want := []string{"/etc/hosts", "/scratch/.cache/go-build/"}; !slices.Equal(s.Files, want) {
+		t.Errorf("files = %v, want %v", s.Files, want)
+	}
+	if len(s.FilesOverflow) != 0 {
+		t.Errorf("files overflow = %v, want none", s.FilesOverflow)
+	}
+}
+
+// R51 I237 fix-up: a collapsed directory's count is the sum of its entries,
+// counted once. 14 files under /s/c/{7 dirs}/{x,y} give /s/c/ = 14, not 28
+// (the double-count: the second loop set /s/c/ to the sum of the deeper
+// entries still in out, and the outermost-ancestor drop then rolled them in
+// again).
+func TestSuggestFromRecordsCollapsedCountIsExact(t *testing.T) {
+	in := map[string]int{"/etc/hosts": 1}
+	for _, d := range []string{"0a", "0b", "0c", "0d", "0e", "0f", "0g"} {
+		in["/s/c/"+d+"/x"] = 1
+		in["/s/c/"+d+"/y"] = 1
+	}
+	if got := collapseFileDirs(in); len(got) != 2 || got["/etc/hosts"] != 1 || got["/s/c/"] != 14 {
+		t.Errorf("collapsed = %v, want {/etc/hosts: 1, /s/c/: 14}", got)
+	}
+}
+
+// R51 I237: a narrow tree — 3 subdirectories with 2 files each — does NOT
+// collapse: 3 immediate children is under the 5-children threshold, so all
+// 6 files are listed.
+func TestSuggestFromRecordsKeepsANarrowTree(t *testing.T) {
+	recs := make([]alerts.Record, 0, 6)
+	for i := range 3 {
+		dir := fmt.Sprintf("/srv/a/d%d", i)
+		for j := range 2 {
+			recs = append(recs, alerts.Record{Loop: "l1", Namespace: "ns", Source: alerts.SourceKubeArmor, Action: "Audit", Target: dir + "/f" + string(rune('a'+j)), Verdict: "allowed", Detail: "operation=File, pod=l1-sandbox"})
+		}
+	}
+	s := SuggestFromRecords(recs, "l1", "ns")
+	want := []string{
+		"/srv/a/d0/fa", "/srv/a/d0/fb",
+		"/srv/a/d1/fa", "/srv/a/d1/fb",
+		"/srv/a/d2/fa", "/srv/a/d2/fb",
+	}
+	if !slices.Equal(s.Files, want) {
+		t.Errorf("files = %v, want %v (narrow tree must not collapse)", s.Files, want)
+	}
+	if len(s.FilesOverflow) != 0 {
+		t.Errorf("files overflow = %v, want none", s.FilesOverflow)
 	}
 }
 

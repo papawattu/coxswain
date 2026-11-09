@@ -146,7 +146,9 @@ type learnSummaryReader struct {
 // (the records.jsonl data key) and the dropped count (the dropped data key;
 // 0 when the key is absent or unparsable). A missing ConfigMap returns an
 // error explaining what writes the ConfigMap and how to pass an operator log
-// instead.
+// instead. The ConfigMap must carry a controller ownerReference to the Loop
+// itself (the operator sets it, D119 step 2) so a ConfigMap planted by
+// someone else in the namespace is refused (I251).
 func (l *learnSummaryReader) ReadLearnSummary(ctx context.Context, namespace, loop string) (string, int64, error) {
 	cm, err := l.c.Resource(configMapGVR).Namespace(namespace).Get(ctx, loop+"-learn-summary", metav1.GetOptions{})
 	if err != nil {
@@ -154,6 +156,14 @@ func (l *learnSummaryReader) ReadLearnSummary(ctx context.Context, namespace, lo
 			return "", 0, fmt.Errorf("no learn summary for Loop %s/%s (ConfigMap %s-learn-summary not found): the operator writes it only for a learn-mode Loop (every referenced AgentPolicy auditOnly) once its sandbox has run; or pass -f <operator log>", namespace, loop, loop)
 		}
 		return "", 0, err
+	}
+	loopObj, err := l.c.Resource(loopGVR).Namespace(namespace).Get(ctx, loop, metav1.GetOptions{})
+	if err != nil {
+		return "", 0, fmt.Errorf("could not verify the owner of ConfigMap %s/%s-learn-summary: %w", namespace, loop, err)
+	}
+	loopUID, _, _ := unstructured.NestedString(loopObj.Object, "metadata", "uid")
+	if !learnSummaryOwnedBy(cm, loopUID, loop) {
+		return "", 0, fmt.Errorf("ConfigMap %s/%s-learn-summary is not owned by Loop %s/%s; refusing to use it (it was not written by the operator)", namespace, loop, namespace, loop)
 	}
 	obj := cm
 	records, _, _ := unstructured.NestedString(obj.Object, "data", "records.jsonl")
@@ -164,6 +174,35 @@ func (l *learnSummaryReader) ReadLearnSummary(ctx context.Context, namespace, lo
 		}
 	}
 	return records, dropped, nil
+}
+
+// learnSummaryOwnedBy reports whether the ConfigMap (unstructured) carries an
+// ownerReference with controller: true, kind "Loop", name == loopName and a
+// uid matching the Loop's uid. Every field must match — the name alone does
+// not prove the operator wrote the map (I251).
+func learnSummaryOwnedBy(cm runtime.Object, loopUID, loopName string) bool {
+	u, ok := cm.(*unstructured.Unstructured)
+	if !ok {
+		return false
+	}
+	refs, found, _ := unstructured.NestedSlice(u.Object, "metadata", "ownerReferences")
+	if !found {
+		return false
+	}
+	for _, r := range refs {
+		ref, ok := r.(map[string]any)
+		if !ok {
+			continue
+		}
+		kind, _ := ref["kind"].(string)
+		name, _ := ref["name"].(string)
+		uid, _ := ref["uid"].(string)
+		ctl, _ := ref["controller"].(bool)
+		if ctl && kind == "Loop" && name == loopName && uid == loopUID {
+			return true
+		}
+	}
+	return false
 }
 
 // NewDeps builds the real client-go dependencies from the CLI's --namespace /

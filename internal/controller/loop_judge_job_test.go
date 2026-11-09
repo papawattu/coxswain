@@ -210,8 +210,12 @@ func TestJudgeBuildSpec(t *testing.T) {
 			t.Errorf("env %s: got %q, want %q", k, env[k], v)
 		}
 	}
-	// COX_JUDGE_CHECKS: the JSON from the last verify's check names + exit
-	// codes (check-0 exit 0, check-1 exit -1 [did not run]).
+	// COX_JUDGE_CHECKS: the JSON from the last verify's check commands + exit
+	// codes. The NAME is the acceptance check COMMAND (spec.verify
+	// .acceptanceChecks[i]), NOT the container name (check-0, check-1, …) —
+	// the Judge needs to know WHAT the check verifies. The exit codes are
+	// status.verify.lastCheckResults (one per acceptance check, in order —
+	// the -1 sentinel means "did not run / no exit code yet").
 	var checks []struct {
 		Name     string `json:"name"`
 		ExitCode *int32 `json:"exitCode,omitempty"`
@@ -219,9 +223,24 @@ func TestJudgeBuildSpec(t *testing.T) {
 	if err := json.Unmarshal([]byte(env["COX_JUDGE_CHECKS"]), &checks); err != nil {
 		t.Fatalf("COX_JUDGE_CHECKS is not a JSON array: %v (value %q)", err, env["COX_JUDGE_CHECKS"])
 	}
-	if len(checks) != 2 || checks[0].Name != "check-0" || checks[0].ExitCode == nil || *checks[0].ExitCode != 0 ||
-		checks[1].Name != "check-1" || checks[1].ExitCode == nil || *checks[1].ExitCode != -1 {
-		t.Fatalf("COX_JUDGE_CHECKS: got %v, want [check-0: 0, check-1: -1]", env["COX_JUDGE_CHECKS"])
+	// The loop has one acceptance check ("go test ./...") and two exit codes
+	// (0, -1). The first entry's name is the COMMAND (not "check-0"), the
+	// second entry has no command (only one check is defined) so it falls
+	// back to the container name "check-1".
+	if len(checks) != 2 {
+		t.Fatalf("COX_JUDGE_CHECKS: got %d entries, want 2: %v", len(checks), env["COX_JUDGE_CHECKS"])
+	}
+	if checks[0].Name != "go test ./..." {
+		t.Fatalf("COX_JUDGE_CHECKS[0].name: got %q, want the acceptance check command %q (NOT the container name check-0)", checks[0].Name, "go test ./...")
+	}
+	if checks[0].ExitCode == nil || *checks[0].ExitCode != 0 {
+		t.Fatalf("COX_JUDGE_CHECKS[0].exitCode: got %v, want 0", checks[0].ExitCode)
+	}
+	if checks[1].Name != "check-1" {
+		t.Fatalf("COX_JUDGE_CHECKS[1].name: got %q, want the container name fallback (no acceptance check defined at index 1)", checks[1].Name)
+	}
+	if checks[1].ExitCode == nil || *checks[1].ExitCode != -1 {
+		t.Fatalf("COX_JUDGE_CHECKS[1].exitCode: got %v, want -1", checks[1].ExitCode)
 	}
 
 	// The owner reference: the Loop, controller: true (the caller sets it

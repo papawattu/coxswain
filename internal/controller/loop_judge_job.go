@@ -283,10 +283,20 @@ func planSummary(loop *coxv1alpha1.Loop) string {
 // judgeChecksJSON builds the COX_JUDGE_CHECKS env value: a JSON array of
 // the last verify's check names + exit codes (ADR-0011 "Input": "the check
 // names and their exit codes (the D14 gate values the operator already
-// read, one per check container)"). The names are the verify Job's init
-// container names (check-0, check-1, …) and the codes are
-// status.verify.lastCheckResults (one per acceptance check, in order —
-// the -1 sentinel means "did not run / no exit code yet", recordCheckResults).
+// read, one per check container)"). The names are the ACCEPTANCE CHECK
+// COMMANDS — spec.verify.acceptanceChecks[i] (the user's own shell command,
+// e.g. "go test ./...") — NOT the container names (check-0, check-1, …).
+// The exit codes are status.verify.lastCheckResults (one per acceptance
+// check, in order — the -1 sentinel means "did not run / no exit code yet",
+// recordCheckResults) matched by index to the check container.
+//
+// The command (not the container name) is what the Judge needs: the model
+// reads the command to know WHAT the check actually verifies. A real
+// homelab model reply judged an honest change false when it saw only
+// "check-0: exit 0" and true when it saw the command (the reviewer's
+// scratchpad judge-capture evidence: reply-honest.json vs reply2-honest.json).
+// The container name is opaque to the Judge — it carries no information
+// about what the check does; the command is the check's own identity.
 //
 // An empty array "[]" when no verify has been recorded (the Judge runs
 // after the checks pass, so a real call always has the codes; the empty
@@ -300,7 +310,11 @@ func judgeChecksJSON(loop *coxv1alpha1.Loop) string {
 	checks := []judgeCheck{}
 	if loop.Status.Verify != nil {
 		for i, code := range loop.Status.Verify.LastCheckResults {
-			checks = append(checks, judgeCheck{Name: fmt.Sprintf("check-%d", i), ExitCode: code})
+			name := fmt.Sprintf("check-%d", i) // fallback: container name
+			if i < len(loop.Spec.Verify.AcceptanceChecks) {
+				name = loop.Spec.Verify.AcceptanceChecks[i] // the command
+			}
+			checks = append(checks, judgeCheck{Name: name, ExitCode: code})
 		}
 	}
 	b, err := json.Marshal(checks)

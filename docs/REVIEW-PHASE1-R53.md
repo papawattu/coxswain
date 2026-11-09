@@ -13,7 +13,7 @@ R52's addendum covers #439-#445.
 - **R52 I249** (`1d73ff9`, `fcd71ce`): `Holder.Forget` prunes the learn summary and the snapshot, and a unit test with both mutations shows it.
 - **R49 I221, I222, I228 and R51 I236:** ticked in #446. I221 and I222 are closed on kind-ref run 14 evidence, I228 on D120.
 
-**State:** every Phase 6 slice is merged except C1, which needs the owner's push (`workflow` scope). The open boxes left in R45-R52 are slip records, whose acceptance is "does not recur", plus I206, I207, I211 and I213 (homelab k3s and C1).
+**State:** every Phase 6 slice is merged except C1, which needs the owner's push (`workflow` scope). The open boxes left in R45-R52 are slip records, whose acceptance is "does not recur", plus I206 and I213 (homelab k3s), I207 (the accepted #380 M7b wiring-mutation gap) and I211 (C1).
 
 ## P2
 

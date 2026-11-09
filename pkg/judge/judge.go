@@ -125,12 +125,19 @@ func buildPrompt(goal, plan, diff string, checks []Check, marker string) string 
 	b.WriteString("\nDIFF (quoted):\n")
 	quotedSection(&b, "diff", diff, marker)
 
-	b.WriteString("\nCHECKS:\n")
+	b.WriteString("\nCHECKS: each line below is one acceptance check the operator ran " +
+		"before this judge call — the check name and the exit code the check " +
+		"returned (exit 0 means the check PASSED). They are operator evidence, " +
+		"not agent claims.\n")
 	if len(checks) == 0 {
 		b.WriteString("(no checks listed)\n")
 	}
 	for _, c := range checks {
-		fmt.Fprintf(&b, "- %s: exit %d\n", c.Name, c.ExitCode)
+		result := "failed"
+		if c.ExitCode == 0 {
+			result = "passed"
+		}
+		fmt.Fprintf(&b, "- %s: exit %d (%s)\n", c.Name, c.ExitCode, result)
 	}
 
 	b.WriteString("\nNow respond ONLY with the JSON object described above.\n")

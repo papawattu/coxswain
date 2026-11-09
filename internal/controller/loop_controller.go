@@ -920,6 +920,11 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// record that persists). The CleaningUp work (the snapshot GC + the
 	// finalizer removal) still runs below, unchanged.
 	b2Deleting := !loop.DeletionTimestamp.IsZero()
+	// D119 step 2: capture the learn-mode flag BEFORE applyEffectivePolicyAndConditions
+	// overwrites the PolicyEnforced condition (the condition is set by the
+	// effective-policy step, which runs later; the learn-mode gate reads the
+	// condition as it was on the API server when the Loop was re-fetched).
+	learnMode := isLearnMode(&loop)
 	// B1 (finalizer): every live Loop carries the checkpoint finalizer (added
 	// on the first reconcile; idempotent). It is what keeps the Loop alive
 	// long enough to GC its snapshots when the Loop is deleted (CleaningUp).
@@ -947,6 +952,10 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		// CleaningUp work). The B2 decision is the durable record a deleting
 		// Loop leaves behind (finalizeB2DeleteStep persists it before the
 		// snapshot GC runs).
+		// D119 step 2: forget the deleted Loop's relay state (the learn
+		// summary and the F62 snapshot — R52 I249: neither was ever pruned
+		// before). The call is nil-safe (r.Audit may be nil).
+		r.forgetAuditState(&loop)
 		return r.finalizeB2DeleteStep(ctx, &loop)
 	}
 	if err := r.applyLoopFinalizer(ctx, &loop); err != nil {
@@ -1142,6 +1151,13 @@ func (r *LoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// relay outage writes UNKNOWN and clears the count — never 0 (I32) — and a
 	// block never fails or pauses the Loop (Q5).
 	r.recordBlockedActions(&loop, &changed)
+
+	// D119 step 2: persist the learn-mode Loop's summary to an owned
+	// ConfigMap. No return value: Reconcile is at its gocyclo budget.
+	// The learnMode flag was captured before applyEffectivePolicyAndConditions
+	// overwrote the PolicyEnforced condition (the condition as it was on the
+	// API server when the Loop was re-fetched).
+	r.recordLearnSummary(ctx, &loop, learnMode)
 
 	// S3a (GAP 1): record status.baseCommit from the workspace clone. The init
 	// container's termination message (read via the operator's own APIReader

@@ -265,11 +265,11 @@ func (h *Holder) noteUnattributed() {
 	h.unattributed++
 }
 
-// learnKey is the summary key for one record: the identity `suggest` needs to
+// LearnKey is the summary key for one record: the identity `suggest` needs to
 // deduplicate (source, action, the first detail field — KubeArmor's
 // "operation=..." — and target). The Record's Time and Count are the summary's
 // own bookkeeping, not part of the key.
-func learnKey(rec Record) string {
+func LearnKey(rec Record) string {
 	return rec.Source + "\x00" + rec.Action + "\x00" + firstDetailField(rec.Detail) + "\x00" + rec.Target
 }
 
@@ -296,7 +296,7 @@ func (h *Holder) addLearn(uid types.UID, rec Record) {
 		s = &learnSummary{recs: map[string]Record{}}
 		h.learn[uid] = s
 	}
-	key := learnKey(rec)
+	key := LearnKey(rec)
 	if prev, ok := s.recs[key]; ok {
 		rec.Count = prev.Count + 1
 		// Keep the later of the two times (the envelope's RFC3339Nano strings
@@ -334,9 +334,23 @@ func (h *Holder) LearnSummary(uid types.UID) (recs []Record, dropped int64, ok b
 		recs = append(recs, r)
 	}
 	slices.SortFunc(recs, func(a, b Record) int {
-		return strings.Compare(learnKey(a), learnKey(b))
+		return strings.Compare(LearnKey(a), LearnKey(b))
 	})
 	return recs, s.dropped, true
+}
+
+// Forget deletes BOTH the Loop's learn summary (D119) and its Snapshot
+// (F62) (R52 I249: neither was ever pruned before; a deleted Loop's in-memory
+// state lived on until the operator restarted). It is a no-op when the UID
+// was never recorded.
+func (h *Holder) Forget(uid types.UID) {
+	if h == nil || uid == "" {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	delete(h.learn, uid)
+	delete(h.loops, uid)
 }
 
 // podAttr is one pod's resolved Loop attribution, cached for the pod's life.

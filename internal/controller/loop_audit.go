@@ -59,6 +59,15 @@ const policyBlocksObservedReason = "BlocksObserved"
 // (never 0).
 type AuditReader interface {
 	Snapshot(uid types.UID) (alerts.Snapshot, bool)
+	// LearnSummary returns the Loop's bounded set of learns-relevant records
+	// (D119 step 1, R51 I236), the dropped count, and ok — false when nothing
+	// learns-relevant has been observed for the Loop.
+	LearnSummary(uid types.UID) ([]alerts.Record, int64, bool)
+	// Forget deletes BOTH the Loop's learn summary and its F62 snapshot from
+	// the relay's in-memory state (R52 I249: neither was ever pruned; D119
+	// step 2 calls it on a deleting Loop so the state does not leak past the
+	// Loop's deletion). No-op when the UID was never recorded.
+	Forget(uid types.UID)
 }
 
 // recordBlockedActions writes status.policy.blockedCount and the PolicyBlocked

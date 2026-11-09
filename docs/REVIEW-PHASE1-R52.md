@@ -142,6 +142,78 @@ locally with the then-current main (they were cut before #430/#432 landed).
 
   **Acceptance:** an envtest spec deletes a Loop and asserts its summary and snapshot are gone.
 
+## Addendum (11-09 ~06:45Z): D119 step 2 lands; two more fixes
+
+**Merged after the round was written:**
+- #440 (I250, 7edb4e8), #441 (I251, 991373b), #439 (D119 step 2, 1d73ff9).
+- I249 is addressed by #439: `Holder.Forget(uid)` runs on the deleting path (`internal/controller/loop_learn_summary.go:513`). It is ticked in R53.
+
+**D119 step 2 on kind:**
+- **Run 13** (`.samples/run13-kind/lab-run13.log`, head faa4571): the ConfigMap mechanics held (owner, GC, can-i, forbidden 0). But the 900 KiB bound kept 2684 records and dropped 2771. Lowest-count-first eviction dropped the one egress connect (`proxy.golang.org:443`) and `/bin/base64`, so the ConfigMap candidate differed from the full-log candidate. CHANGES.
+- **Fix:** compact the File records the way `suggest` does, then evict by class (file, process, connect).
+- **Run 14** (`.samples/run14-kind/lab-run14.log`, head ef0f153, CLI 991373b):
+  - 13007 relayed records → 359 summary records, dropped 0 (:81, :86);
+  - **the exec 19/19, files 26/26 and network 1/1 sets are equal** (:97-99);
+  - the dry-run was created (:100), and the ConfigMap is gone after the Loop is deleted (:103).
+  - The eviction order was **not** exercised on kind (dropped 0). Unit specs and mutations m1/m4 prove it.
+
+### P2
+
+- [ ] **I250: the chart wiring check flaked on SIGPIPE (fixed in #440)**
+
+  **Where:** `hack/chart-drift-check-test.sh`, the F87 wiring check.
+
+  **Problem:** `make -n | grep -q` under `pipefail`: grep exits at its first match, make gets SIGPIPE (rc 141), and the check prints a false FAIL. Repro 1/30. It failed one `make test` (#437).
+
+  **Fix:** read `make -n` once into a variable. Under 6 CPU burners it went from 43/200 FAIL to 0/200.
+
+  **Acceptance:** met in #440.
+
+- [ ] **I251: `suggest` trusted any ConfigMap named `<loop>-learn-summary` (fixed in #441)**
+
+  **Where:** `internal/cli/client.go`, `ReadLearnSummary`.
+
+  **Problem:** a planted ConfigMap would become a candidate AgentPolicy handed to a human.
+
+  **Fix:** require a controller ownerReference to the Loop (kind, name, uid). Otherwise refuse:
+  "… is not owned by Loop …; refusing to use it (it was not written by the operator)".
+
+  **Acceptance:** met in #441 (table test plus the uid mutation; run 13 and run 14 accepted the real ConfigMap).
+
+- [ ] **I252: the builders' slips after the round (continues I246)**
+  - **(a) pi3, #439 d119-2c:** the brief said "Count = the summed count", but the code counted records (`targets[t]++`). A stored count of 300 plus one new path became 2 on the next write. Process records and connects also shared a rank, so a count-1 connect was evicted before count-5 Process records. Both were shown by a reviewer probe that calls the functions directly, and fixed in ef0f153 (mutations m3/m4).
+  - **(b)** The brief's spec for (a) had no test for the stored-count path, and the builder added none. A test fixture must include a record whose `Count` is not 1.
+
+  **Acceptance:** none recurs in R53's window.
+
+- [ ] **I253: the reviewer's slips after the round (I247 recurred)**
+  - **(a) A mutation that did not compile, again (I247(b)):** my m2 for #439 (`if !changed`) left `changed` unused. VET/BUILD FAIL, not a spec failure. Redone with `|| true`.
+  - **(b) A focus that ran zero specs:** my `-ginkgo.focus "UPDATE"` did not match (the focus is case-sensitive). Re-run with "updates it on the second". Rule: a focused mutation's output must show `Ran 1 of`, not `Ran 0 of`.
+  - **(c) A brief command with the wrong base:** the d119-2c brief said `git worktree add /tmp/wt-d1192c HEAD` without a `cd`. Run from the shared tree, HEAD was main. pi3 caught it and re-ran it from the PR worktree. Briefs now `cd` into the PR worktree first.
+
+  **Acceptance:** none of (a)-(c) recurs in R53's window.
+
+### P3
+
+- [ ] **I254: an ownerReference is forgeable by anyone who can write ConfigMaps in the namespace**
+
+  **Where:** `internal/cli/client.go`, `learnSummaryOwnedBy` (I251).
+
+  **Problem:** a Loop's uid is readable by anyone who can get Loops. A namespace writer can create `<loop>-learn-summary` with a matching controller ownerReference, and the check accepts it. I251 stops stray and foreign ConfigMaps, not a deliberate namespace writer.
+
+  **Fix:** document the trust boundary (OPERATOR.md and TROUBLESHOOTING.md): the summary is as trustworthy as the namespace's ConfigMap writers, and the candidate is always reviewed by a human before it is applied.
+
+  **Acceptance:** the docs name the boundary.
+
+- [ ] **I255: #439's small leftovers**
+  - `loop_controller.go:305` says CompareAndDelete; the code uses `Load`/`Store` (`loop_learn_summary.go:476-477`).
+  - `loopNameTakenSummaryEvents` is keyed by UID and never pruned on delete: a small leak per deleted Loop that hit `LearnSummaryNameTaken`.
+  - `compactLearnFileRecords`' `rawByEntry` loop is O(raw × compacted) per write.
+
+  **Fix:** correct the comment, delete the UID in the Forget path, and build `rawByEntry` by walking each raw path's ancestors.
+
+  **Acceptance:** a spec deletes a Loop that hit `LearnSummaryNameTaken` and asserts its UID is gone from the map.
+
 ## Owner decisions
 
 **Decided in this window:**
@@ -164,5 +236,5 @@ locally with the then-current main (they were cut before #430/#432 landed).
 - **Whether KubeArmor's `matchDirectories {dir: X/, recursive: true}` also covers the directory `X`
   itself.** `suggest` lists both `/workspace` and `/workspace/` (and `…/telemetry/local` with
   `…/local/`). If it does, the exact entry is redundant.
-- **D119's ConfigMap (steps 2-4):** not built yet.
+- **D119's eviction order on kind:** run 14 never hit the bound (dropped 0). Only unit specs and mutations show it.
 - **The C1 images on arm64.**

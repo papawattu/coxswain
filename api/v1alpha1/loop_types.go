@@ -366,7 +366,13 @@ type VerifyConfig struct {
 // JudgeConfig declares the opt-in advisory Judge (ADR-0011). The Judge runs
 // after the acceptance checks pass, through the Loop's model proxy (D123),
 // and its verdict is advisory: a false verdict holds the delivered PR to a
-// draft, nothing more.
+// draft, nothing more. The XValidation on the type enforces the ADR's
+// "no default" line: an enabled Judge must carry its cap — {enabled: true}
+// without maxTokens is rejected at admission. The rule is attached to the
+// TYPE (not a field): a field-level rule would set self to the scalar field
+// (the CEL compiler rejects field selection on a bool or int), while on the
+// type self is the JudgeConfig object.
+// +kubebuilder:validation:XValidation:rule="!self.enabled || has(self.maxTokens)",message="maxTokens is required when the Judge is enabled"
 type JudgeConfig struct {
 	// enabled turns the Judge on for this Loop. Never defaulted — without it
 	// (or with it false) no Judge Job is created and nothing in the phase
@@ -376,7 +382,12 @@ type JudgeConfig struct {
 	// maxTokens caps the Judge's model call output: the Judge sets the model
 	// request's max_tokens to this cap (the 256 KiB diff cap bounds the
 	// input, ADR-0011). No default: an enabled Judge without a cap is
-	// incomplete and is rejected at the request, not silently capped.
+	// incomplete and is rejected at admission (the XValidation above), not
+	// silently capped — enforced by the object-level XValidation on the type
+	// (a field-level rule cannot reference sibling fields: self would be the
+	// scalar). Note an explicit maxTokens: 0 is dropped by omitempty and
+	// admitted as "no cap": the bound is enforced on the negative values,
+	// which are not the zero value.
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=32768
 	// +optional

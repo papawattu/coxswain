@@ -79,6 +79,35 @@ var _ = Describe("Judge API", func() {
 		}
 	})
 
+	It("rejects an enabled Judge without a maxTokens cap (XValidation)", func() {
+		ns := freshNS("j1a-nocap")
+		loop := &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "judge-nocap"},
+			Spec: coxv1alpha1.LoopSpec{
+				Goal:      "Judge API",
+				Workspace: testWorkspace(),
+				Agent:     coxv1alpha1.AgentConfig{Image: runnerImage, Model: testModel},
+				Verify: coxv1alpha1.VerifyConfig{
+					AcceptanceChecks: []string{"go build ./..."},
+					Judge:            &coxv1alpha1.JudgeConfig{Enabled: true},
+				},
+			},
+		}
+		if err := k8sClient.Create(ctx, loop); err == nil {
+			Fail("the API server must reject an enabled Judge without maxTokens")
+		} else {
+			Expect(err.Error()).To(MatchRegexp(`maxTokens`), "the API server must reject an enabled Judge without maxTokens (the XValidation message names it)")
+		}
+	})
+
+	It("accepts a disabled Judge without a maxTokens cap (XValidation is opt-in only)", func() {
+		ns := freshNS("j1a-disabled")
+		got := newLoop(ns, "judge-disabled", &coxv1alpha1.JudgeConfig{Enabled: false})
+		Expect(got.Spec.Verify.Judge).ToNot(BeNil())
+		Expect(got.Spec.Verify.Judge.Enabled).To(BeFalse())
+		Expect(got.Spec.Verify.Judge.MaxTokens).To(BeZero())
+	})
+
 	It("rejects a Loop with verify.judge.maxTokens = 40000 (maximum is 32768)", func() {
 		ns := freshNS("j1a-big")
 		loop := &coxv1alpha1.Loop{

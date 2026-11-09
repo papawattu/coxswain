@@ -1,7 +1,6 @@
 # Next phase: Phase 7 — the Judge, the canary's out-of-band channel, and the v0.2.0 release
 
-**Status:** DRAFT for the owner (reviewer, 2026-11-09). Nothing here is
-approved. The open questions are D122–D127 under Owner decisions.
+**Status:** approved by the owner, 2026-11-09. D122–D127 are decided as recommended; see Owner decisions.
 
 **What carries in:**
 - **D95** (owner, 2026-11-04): the Judge sidecar (`docs/PLAN.md:90`, D60) is deferred to Phase 7.
@@ -98,14 +97,14 @@ A false verdict iterates the Loop, with the Judge's reason fed forward like a fa
 
 ## Owner decisions
 
-| ID | Question | Recommendation |
-|---|---|---|
-| D122 | **The Judge's effect:** advisory (a negative verdict keeps the PR a draft and is recorded) or a gate (`Succeeded` also needs a true verdict)? | **Advisory.** It keeps "never the only gate" trivially true, and it bounds what a prompt-injected Judge can do. A gate can come later as J2. |
-| D123 | **The Judge's model:** the Loop's model via its model proxy (metered, with its own cap), or a separately configured model? | **The Loop's model proxy.** One metered path (ADR-0009) and no new credential. A separate model can be a later field. |
-| D124 | **The Judge unavailable:** record `Unknown` and proceed, or hold the Loop? | **Record `Unknown` and proceed** (advisory), with an Event per R26 I90. Holding would make an optional check block success. |
-| D125 | **After K0:** build the channel the note finds, or accept the limit permanently? | Decide on the note's evidence. Until then, D94's accepted limit stands. |
-| D126 | **The release version:** v0.2.0, or v0.1.4? | **v0.2.0.** There are new CRD fields (auditOnly, ClusterAgentPolicy) and a new admission policy that rejects writes v0.1.3 allowed. |
-| D127 | **VerifySuspicious:** does the Judge replace ADR-0005's advisory diff scan, or do both land? | Decide in J0. The recommendation leans toward the Judge only, to keep one advisory surface. |
+| ID | Question | Recommendation | Decision |
+|---|---|---|---|
+| D122 | **The Judge's effect:** advisory (a negative verdict keeps the PR a draft and is recorded) or a gate (`Succeeded` also needs a true verdict)? | **Advisory.** It keeps "never the only gate" trivially true, and it bounds what a prompt-injected Judge can do. A gate can come later as J2. | **Advisory** (owner, 2026-11-09). J2 is dropped unless revisited. |
+| D123 | **The Judge's model:** the Loop's model via its model proxy (metered, with its own cap), or a separately configured model? | **The Loop's model proxy.** One metered path (ADR-0009) and no new credential. A separate model can be a later field. | **The Loop's model proxy**, with its own cap (owner, 2026-11-09). |
+| D124 | **The Judge unavailable:** record `Unknown` and proceed, or hold the Loop? | **Record `Unknown` and proceed** (advisory), with an Event per R26 I90. Holding would make an optional check block success. | **Record `Unknown` and proceed**, with an Event (owner, 2026-11-09). |
+| D125 | **After K0:** build the channel the note finds, or accept the limit permanently? | Decide on the note's evidence. Until then, D94's accepted limit stands. | **Decided on K0's evidence**; D94's limit stands until then (owner, 2026-11-09). |
+| D126 | **The release version:** v0.2.0, or v0.1.4? | **v0.2.0.** There are new CRD fields (auditOnly, ClusterAgentPolicy) and a new admission policy that rejects writes v0.1.3 allowed. | **v0.2.0** (owner, 2026-11-09). |
+| D127 | **VerifySuspicious:** does the Judge replace ADR-0005's advisory diff scan, or do both land? | Decide in J0. The recommendation leans toward the Judge only, to keep one advisory surface. | **The Judge only**, with ADR-0005's VerifySuspicious superseded by J0 (owner, 2026-11-09). |
 
 ## Estimate
 - R1 is about a day of release work, plus the owner's C1 push and tag.

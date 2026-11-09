@@ -20,6 +20,7 @@
 package controller
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
 	"testing"
@@ -28,6 +29,7 @@ import (
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
 	"github.com/papawattu/coxswain/internal/alerts"
+	"github.com/papawattu/coxswain/internal/policy"
 )
 
 // learnSummaryTestRecord returns a distinct record with the given key fields
@@ -213,6 +215,128 @@ func TestLearnSummarySizeBoundTiesByKey(t *testing.T) {
 			t.Errorf("the bound kept %q, want %q (the larger-key record — ties by key, smaller key dropped first)", kept[0].Target, recA.Target)
 		}
 	}
+}
+
+// TestLearnSummaryBoundKeepsRareConnectAndExec covers the class-ordered
+// eviction (D119 step 2c, run 13: the lowest-count-first bound dropped the
+// one egress connect and a rare exec in favor of a thousand file paths): a
+// summary over the bound keeps the count-1 egress connect and the count-1
+// Process record while evicting File records first (and, if still over, then
+// Process records — never connects while File or Process records remain).
+//
+// Mutation m1 (evict by count only, ignoring the class): the connect and/or
+// the exec are dropped → this spec fails.
+func TestLearnSummaryBoundKeepsRareConnectAndExec(t *testing.T) {
+	recs := make([]alerts.Record, 0, 3002)
+	for i := range 3000 {
+		j := i * 7 % 13
+		// 300-byte targets in distinct, non-busy dirs so compaction cannot
+		// collapse them (/f/<i>/<j>, at most 13 entries per dir < the
+		// collapse threshold).
+		target := "/f/" + strconv.Itoa(i) + "/" + strconv.Itoa(j) + strings.Repeat("x", 300)
+		recs = append(recs, alerts.Record{
+			Time:   "2026-11-12T10:00:00Z",
+			Loop:   "l1",
+			Source: alerts.SourceKubeArmor,
+			Action: "Audit",
+			Target: target,
+			Detail: "operation=File, pod=l1-sandbox",
+			Count:  1,
+		})
+	}
+	// The one egress connect (count 1) and the rare exec (count 1).
+	recs = append(recs,
+		alerts.Record{Time: "2026-11-12T11:00:00Z", Loop: "l1", Source: alerts.SourceEgress, Action: "connect", Target: "proxy.golang.org:443", Count: 1},
+		alerts.Record{Time: "2026-11-12T11:30:00Z", Loop: "l1", Source: alerts.SourceKubeArmor, Action: "Audit", Target: "/bin/base64", Detail: "operation=Process, pod=l1-sandbox", Count: 1},
+	)
+	bound := 400 * 1024 // well under the 3002 records' rendered size
+	unbounded := renderLearnRecordsJSONL(recs)
+	if len(unbounded) < bound {
+		t.Fatalf("the unbounded body is %d bytes, below the %d bound; the fixture must force eviction", len(unbounded), bound)
+	}
+	kept, dropped := boundLearnRecords(recs, bound)
+	if dropped == 0 {
+		t.Fatalf("the bound dropped 0 records; the body exceeds the bound so some must be dropped")
+	}
+	found := map[string]bool{}
+	for _, r := range kept {
+		found[r.Target] = true
+	}
+	if !found["proxy.golang.org:443"] {
+		t.Fatalf("the bound dropped the egress connect (kept %d records, dropped %d); connects are evicted LAST — only when nothing else is left", len(kept), dropped)
+	}
+	if !found["/bin/base64"] {
+		t.Fatalf("the bound dropped the rare exec /bin/base64 (kept %d records, dropped %d); Process records are evicted after File records", len(kept), dropped)
+	}
+	if len(renderLearnRecordsJSONL(kept)) > bound {
+		t.Fatalf("the kept body is %d bytes, over the %d bound", len(renderLearnRecordsJSONL(kept)), bound)
+	}
+}
+
+// TestLearnSummaryCompactsWideTree covers the compaction step (D119 step 2c,
+// run 13: 669 of the 2684 kept records were go-build cache files, and the
+// ConfigMap candidate differed from the full-log candidate because of them):
+// 300 File records under /scratch/.cache/go-build/<xx>/<hash> (100 dirs × 3)
+// become ONE record for /scratch/.cache/go-build/ with the summed count 300.
+//
+// Mutation m2 (skip the compaction): the 300 raw paths are not merged →
+// this spec fails.
+func TestLearnSummaryCompactsWideTree(t *testing.T) {
+	recs := make([]alerts.Record, 0, 300)
+	for i := range 300 {
+		xx := strconv.FormatInt(int64(i/3)%100, 10) // 100 dirs, 3 files each
+		// Padded minute (i%60): the RFC3339Nano strings compare
+		// lexicographically, which is chronological only when the layout is
+		// fixed-width.
+		recs = append(recs, alerts.Record{
+			Time:   "2026-11-12T10:" + fmt.Sprintf("%02d", i%60) + ":00Z",
+			Loop:   "l1",
+			Source: alerts.SourceKubeArmor,
+			Action: "Audit",
+			Target: "/scratch/.cache/go-build/" + xx + "/" + strconv.Itoa(i),
+			Detail: "operation=File, pod=l1-sandbox",
+			Count:  1,
+		})
+	}
+	compacted := compactLearnFileRecords(recs, "l1")
+	if len(compacted) != 1 {
+		t.Fatalf("compaction kept %d records, want 1 (the wide go-build tree collapses to one dir entry); got targets: %v", len(compacted), targetsOf(compacted))
+	}
+	rec := compacted[0]
+	if rec.Target != "/scratch/.cache/go-build/" {
+		t.Fatalf("compacted target = %q, want %q", rec.Target, "/scratch/.cache/go-build/")
+	}
+	if rec.Count != 300 {
+		t.Errorf("compacted count = %d, want 300 (the sum of the 300 file records)", rec.Count)
+	}
+	if rec.Detail != "operation=File, pod=l1-sandbox" {
+		t.Errorf("compacted detail = %q, want %q", rec.Detail, "operation=File, pod=l1-sandbox")
+	}
+	if rec.Loop != "l1" || rec.Source != alerts.SourceKubeArmor {
+		t.Errorf("compacted loop/source = %q/%q, want l1/kubearmor (copied from an original record)", rec.Loop, rec.Source)
+	}
+	// The Time is the LATEST of the originals (i=59 → 10:59:00Z).
+	if rec.Time != "2026-11-12T10:59:00Z" {
+		t.Errorf("compacted time = %q, want the latest of the originals (10:59:00Z)", rec.Time)
+	}
+	// Cross-check the exported compaction matches what the controller applied
+	// (the same target→count map, the same result).
+	targets := map[string]int{}
+	for _, r := range recs {
+		targets[r.Target]++
+	}
+	if got := policy.CompactFileTargets(targets); len(got) != 1 || got["/scratch/.cache/go-build/"] != 300 {
+		t.Errorf("policy.CompactFileTargets = %v, want the single entry /scratch/.cache/go-build/ = 300", got)
+	}
+}
+
+// targetsOf returns the targets of the records (for failure messages).
+func targetsOf(recs []alerts.Record) []string {
+	out := make([]string, 0, len(recs))
+	for _, r := range recs {
+		out = append(out, r.Target)
+	}
+	return out
 }
 
 // TestIsLearnModeGatesOnPolicyEnforcedCondition covers the learn-mode gate:

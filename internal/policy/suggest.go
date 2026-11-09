@@ -199,6 +199,21 @@ func stableFilePath(p string) string {
 	return p
 }
 
+// CompactFileTargets is the exported form of the file-target compaction that
+// SuggestFromRecords applies to a Loop's File records (D119 step 2c: the
+// learn-summary ConfigMap stores ONE record per stable, collapsed target
+// instead of every raw path, so the 900 KiB bound does not drop the rare,
+// valuable allows in favor of a thousand go-build cache files). It maps each
+// target through stableFilePath (summing the counts of the targets that map
+// together) and then collapses busy directory trees with collapseFileDirs.
+func CompactFileTargets(files map[string]int) map[string]int {
+	compacted := make(map[string]int, len(files))
+	for target, count := range files {
+		compacted[stableFilePath(target)] += count
+	}
+	return collapseFileDirs(compacted)
+}
+
 // collapseFileDirs turns busy directory trees into one "dir/" entry,
 // recursively (R49 I228, R51 I237): a directory (never "/") with more
 // than suggestDirCollapse distinct IMMEDIATE children is replaced by its

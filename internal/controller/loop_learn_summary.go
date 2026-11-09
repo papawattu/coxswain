@@ -50,6 +50,7 @@ import (
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
 	"github.com/papawattu/coxswain/internal/alerts"
+	"github.com/papawattu/coxswain/internal/policy"
 )
 
 // learnSummaryCMName is the ConfigMap name for one Loop's learn summary.
@@ -99,7 +100,7 @@ func (r *LoopReconciler) recordLearnSummary(ctx context.Context, loop *coxv1alph
 	}
 	existingCM, existing := r.readExistingLearnSummary(ctx, loop, cmName)
 	existingDropped := existingDroppedField(existingCM)
-	merged := mergeLearnRecords(existing, recs)
+	merged := compactLearnFileRecords(mergeLearnRecords(existing, recs), loop.Name)
 	boundRecs, boundDropped := boundLearnRecords(merged, learnSummarySizeBoundBytes)
 	dropped := maxDroppedInt64(existingDropped, maxDroppedInt64(newDropped, boundDropped))
 	data := map[string]string{
@@ -221,9 +222,89 @@ func mergeLearnRecords(existing, new_ []alerts.Record) []alerts.Record {
 	return out
 }
 
+// compactLearnFileRecords compacts the kubearmor operation=File records the
+// way `cox policy suggest` compacts them (D119 step 2c: run 13's ConfigMap
+// candidate differed from the full-log candidate because 669 raw go-build
+// cache paths crowded out the one egress connect and a rare exec at the
+// 900 KiB bound): the targets are mapped through stableFilePath and the
+// busy-directory collapse (policy.CompactFileTargets) and replaced by ONE
+// record per resulting target (the Loop, Namespace and Source are copied
+// from an original record, the Detail is operation=File, pod=<loop>-sandbox,
+// the Count is the summed count and the Time the latest of the originals).
+// Process and egress records pass through unchanged. If the records carry no
+// File records, the input is returned as-is.
+func compactLearnFileRecords(recs []alerts.Record, loopName string) []alerts.Record {
+	targets := map[string]int{}
+	// latestRaw[target] is the latest Time of the original records with that
+	// target, so the Time of a collapsed entry is the latest of the originals
+	// that contributed to it (the same set the collapse sums counts from).
+	latestRaw := map[string]string{}
+	var fileRecs []alerts.Record
+	for _, rec := range recs {
+		if rec.Source == alerts.SourceKubeArmor && strings.HasPrefix(rec.Detail, "operation=File") {
+			targets[rec.Target]++
+			if rec.Time > latestRaw[rec.Target] {
+				latestRaw[rec.Target] = rec.Time
+			}
+			fileRecs = append(fileRecs, rec)
+		}
+	}
+	if len(fileRecs) == 0 {
+		return recs
+	}
+	compacted := policy.CompactFileTargets(targets)
+	// Walk the collapsed tree down to the raw targets the way the collapse
+	// walks up: an entry's Time is the latest of the raw records that are the
+	// entry itself or sit under it.
+	latest := map[string]string{}
+	rawByEntry := map[string][]string{}
+	for raw := range targets {
+		for entry, c := range compacted {
+			_ = c
+			if raw == entry || strings.HasPrefix(raw, entry) {
+				rawByEntry[entry] = append(rawByEntry[entry], raw)
+			}
+		}
+	}
+	for entry, raws := range rawByEntry {
+		for _, raw := range raws {
+			if latestRaw[raw] > latest[entry] {
+				latest[entry] = latestRaw[raw]
+			}
+		}
+	}
+	out := make([]alerts.Record, 0, len(recs)-len(fileRecs)+len(compacted))
+	for target, count := range compacted {
+		base := fileRecs[0]
+		out = append(out, alerts.Record{
+			Time:      latest[target],
+			Loop:      base.Loop,
+			Namespace: base.Namespace,
+			Source:    alerts.SourceKubeArmor,
+			Action:    base.Action,
+			Target:    target,
+			Detail:    "operation=File, pod=" + loopName + "-sandbox",
+			Count:     int64(count),
+		})
+	}
+	for _, rec := range recs {
+		if rec.Source == alerts.SourceKubeArmor && strings.HasPrefix(rec.Detail, "operation=File") {
+			continue
+		}
+		out = append(out, rec)
+	}
+	sortByLearnKey(out)
+	return out
+}
+
 // boundLearnRecords trims the records so the rendered records.jsonl fits the
-// size bound. Candidates are dropped in lowest-count-first order (ties by
-// key); the number dropped is returned. The kept records stay in key order.
+// size bound. Eviction is class-ordered (D119 step 2c: run 13's
+// lowest-count-first eviction dropped exactly the allows `suggest` exists to
+// find — the one egress connect and a rare exec — while keeping a thousand
+// go-build cache paths): kubearmor operation=File records first (lowest
+// count, ties by key), then Process records, and egress-proxy connects LAST
+// (only when nothing else is left). `dropped` counts every evicted record.
+// The kept records stay in key order.
 func boundLearnRecords(recs []alerts.Record, bound int) ([]alerts.Record, int64) {
 	if bound <= 0 {
 		return nil, int64(len(recs))
@@ -247,6 +328,7 @@ func boundLearnRecords(recs []alerts.Record, bound int) ([]alerts.Record, int64)
 		cnt  int64
 		key  string
 		size int
+		rank int
 	}
 	cands := make([]cand, 0, len(recs))
 	for i, rec := range recs {
@@ -254,9 +336,17 @@ func boundLearnRecords(recs []alerts.Record, bound int) ([]alerts.Record, int64)
 		if cnt == 0 {
 			cnt = 1
 		}
-		cands = append(cands, cand{idx: i, cnt: cnt, key: alerts.LearnKey(rec), size: sizes[i]})
+		// Class rank: File records evicted first, then Process, connects last.
+		rank := 1
+		if rec.Source == alerts.SourceKubeArmor && strings.HasPrefix(rec.Detail, "operation=File") {
+			rank = 0
+		}
+		cands = append(cands, cand{idx: i, cnt: cnt, key: alerts.LearnKey(rec), size: sizes[i], rank: rank})
 	}
 	slices.SortFunc(cands, func(a, b cand) int {
+		if a.rank != b.rank {
+			return a.rank - b.rank
+		}
 		if a.cnt != b.cnt {
 			if a.cnt < b.cnt {
 				return -1

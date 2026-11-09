@@ -50,17 +50,21 @@ means enforcing, as before.
 
 ### P6b-2: cox policy suggest — #406
 
-**What it is:** `kubectl cox policy suggest <loop> -f <file|->` reads the
-operator's Q4 audit lines (e.g. `kubectl logs -n coxswain-system
-deploy/coxswain-controller-manager | kubectl cox policy suggest <loop> -f -`)
-and prints a candidate `AgentPolicy` built from what the agent actually used
-in learn mode. `--name` defaults to `<loop>-suggested`; the namespace is the
-CLI's `--namespace`. Lines that are not audit records, and other Loops'
+**What it is:** `kubectl cox policy suggest <loop>` reads the Loop's learn
+summary — the `<loop>-learn-summary` ConfigMap the operator keeps for a
+learn-mode Loop (D119 = (b)) — and prints a candidate `AgentPolicy` built
+from what the agent actually used in learn mode. It warns on stderr when the
+summary's `dropped` count is above 0. With `-f <file|->` it reads the
+operator's Q4 audit lines from a log instead (e.g. `kubectl logs
+-n coxswain-system deploy/coxswain-controller-manager | kubectl cox policy
+suggest <loop> -f -`). `--name` defaults to `<loop>-suggested`; the namespace
+is the CLI's `--namespace`. Lines that are not audit records, and other Loops'
 records, are skipped.
 
-**How to use it:** run the Loop in learn mode, capture the audit lines, pipe
-them to `cox policy suggest`, review the printed candidate, apply it (still in
-learn mode to confirm), then drop `auditOnly` to enforce. The candidate holds
+**How to use it:** run the Loop in learn mode, run `cox policy suggest` once
+it has the learn summary (the `-f <file|->` form works on a captured log
+too), review the printed candidate, apply it (still in learn mode to
+confirm), then drop `auditOnly` to enforce. The candidate holds
 only the allows the agent used — deduplicated and sorted — and never a deny:
 KubeArmor process records with an absolute path become `exec`, KubeArmor file
 records become `files`, egress-proxy connects (`host:port`) become `network`,
@@ -122,6 +126,18 @@ before.
 **What changed:** `cox policy suggest` now counts only the agent sandbox pod's records (init containers still count), keeps only the executable's absolute path for `exec`, collapses directories with more than 5 distinct file paths into one recursive `dir/` entry, and caps each list at 64 most-used entries with the rest printed as a comment.
 
 **On upgrade:** a KubeArmor audit line's `detail` now has `pod=<pod>` after `operation=…`.
+
+### D119: the learn summary — `<loop>-learn-summary` ConfigMap (D119 = (b)) — #435, #439
+
+**What it is:** for a learn-mode Loop, the operator keeps a bounded summary of the distinct allows the Loop's agent recorded (sandbox process/file, egress connects) in the ConfigMap `<loop>-learn-summary`, in the Loop's namespace. Data keys: `records.jsonl` (one record per distinct allow, each with its `count`) and `dropped` (a count, monotonically non-decreasing). It is owned by the Loop (controller owner reference) and is garbage-collected with it. The operator needs no new RBAC: configmaps `create;get;update` are already in the operator's role.
+
+**Bound:** before the size check, the file records are compacted the way `suggest` compacts them: per-run atomic-writer paths become their directory, and a busy directory tree (more than 5 immediate children) becomes one `dir/` entry, with the counts summed. If `records.jsonl` is still over 900 KiB, records are evicted by class: file records first (lowest count first), then process records, and egress connects last. Each evicted record is added to `dropped`. Evidence: kind-ref run 14, 13007 relayed records → 359 summary records, dropped 0; the ConfigMap candidate's exec/files/network sets equal the full-log candidate's.
+
+**Events:** a write error emits a Warning Event `LearnSummaryWriteFailed` on the Loop. If a ConfigMap of the name exists that the Loop does not own, the operator leaves it alone and emits a Warning Event `LearnSummaryNameTaken` on the Loop instead of overwriting it.
+
+**How to use it:** `kubectl cox policy suggest <loop>` reads it by default (P6b-2 above); the operator log is still available via `-f <file|->`. `kubectl get cm <loop>-learn-summary -n <ns>` shows the object.
+
+**On upgrade:** no migration; existing learn-mode Loops get their summary on their next recorded record. A ConfigMap named `<loop>-learn-summary` that the Loop does not own is never touched (see `LearnSummaryNameTaken`).
 
 ## Security fixes
 

@@ -239,6 +239,53 @@ it would run with the network fence unpoliced there. A per-node probe (one
 probe pod per node, each sandbox gated on its own node's result) is
 deliberately deferred until multi-node clusters are a support target (D80(b)).
 
+## `suggest` says no learn summary
+
+**What you see:** `kubectl cox policy suggest <loop> -n <ns>` (D119 = (b):
+the learn summary is the default input) comes back with no records for the
+Loop.
+
+**Cause:** the `<loop>-learn-summary` ConfigMap is written only for a
+**learn-mode** Loop — every policy it references `auditOnly: true`
+(`PolicyEnforced=False`, audit-only) — and only once its sandbox has produced
+records. An enforcing Loop, or a learn-mode Loop that has not done anything
+recordable yet, has none.
+
+**What to do:**
+
+1. `kubectl get cm <loop>-learn-summary -n <ns>` — if it exists, the summary
+   is there; the suggest error then names the input and usually means the run
+   produced no records for this Loop.
+2. If it does not exist, check the Loop's Events for
+   `LearnSummaryWriteFailed` (a ConfigMap write error) or
+   `LearnSummaryNameTaken` (a ConfigMap of that name exists that the Loop
+does not own; the operator leaves it alone and will not record the summary):
+
+   ```bash
+   kubectl get events -n <ns> --field-selector involvedObject.kind=Loop,involvedObject.name=<loop>
+   ```
+
+3. Otherwise run the Loop in learn mode until its sandbox produces activity,
+   then retry. A captured operator log works too: `kubectl cox policy suggest
+   <loop> -n <ns> -f <file|->`.
+
+## `suggest` refuses the learn summary: `is not owned by Loop …; refusing to use it`
+
+**What you see:** `kubectl cox policy suggest <loop> -n <ns>` fails with:
+
+```
+ConfigMap <ns>/<loop>-learn-summary is not owned by Loop <ns>/<loop>; refusing to use it (it was not written by the operator)
+```
+
+**Cause:** the ConfigMap has no controller ownerReference to this Loop (kind
+`Loop`, the same name and uid). It was not written by the operator — the
+operator's summary is always owned by the Loop, so a ConfigMap of that name
+without that owner is foreign.
+
+**What to do:** delete the foreign ConfigMap (`kubectl delete cm
+<loop>-learn-summary -n <ns>`) so the operator can create its own, or pass an
+operator log instead: `kubectl cox policy suggest <loop> -n <ns> -f <file|->`.
+
 ## Reading the memory write outcome
 
 Source: the memory-writer changes F31 (#229), F32 (#233), F33 (#234),

@@ -946,17 +946,33 @@ references `auditOnly: true`) for a while, then build a candidate from what
 the agent actually used:
 
 ```bash
+kubectl cox policy suggest <loop> -n <ns>
+```
+
+By default the command reads the Loop's **learn summary**: the operator keeps
+one per learn-mode Loop in the ConfigMap `<loop>-learn-summary`, in the Loop's
+namespace and owned by the Loop (data `records.jsonl`, one record per distinct
+allow, plus a `dropped` count). It survives operator restarts and log
+rotation — every distinct allow recorded during the run is there, not only
+what happens to be in the current log. When the summary is at its size bound
+and dropped records (`dropped > 0`), the command warns on stderr. `--name`
+defaults to `<loop>-suggested`; the namespace is the CLI's `--namespace` (the
+`-n` flag). It prints a candidate `AgentPolicy`. Review it, apply it as a new
+policy with `auditOnly: true` added (the candidate is written without it) to
+confirm it covers what the agent needs, then drop `auditOnly` to enforce.
+
+Alternative: read the operator's Q4 audit lines directly (`-f <file>`, or
+`-f -` to pipe them on stdin):
+
+```bash
 kubectl logs -n coxswain-system deploy/coxswain-controller-manager \
   | kubectl cox policy suggest <loop> -f -
 ```
 
-The command reads the operator's Q4 audit lines (pipe them on stdin, or pass
-a file with `-f <file>`; lines that are not audit records, and other Loops'
-records, are skipped). `--name` defaults to `<loop>-suggested`; the namespace
-is the CLI's `--namespace`. It prints a candidate `AgentPolicy`. Review it,
-apply it as a new policy with `auditOnly: true` added (the candidate is
-written without it) to confirm it covers what the agent needs, then drop
-`auditOnly` to enforce.
+Lines that are not audit records, and other Loops' records, are skipped.
+Warning: `kubectl logs` holds only the lines since the operator's last log
+rotation (a learn run rotates it within minutes — kind-ref run 12), so a log
+capture may miss most of the run's activity; prefer the summary.
 
 What the candidate holds is only the allows the agent **used** —
 deduplicated and sorted — and it never contains a deny:

@@ -40,7 +40,11 @@ const (
 	// Seeded history JobNames for the gate-level unit tests (a DIFFERENT-Job
 	// entry that makes the just-appended verify Job a NEW Job — the per-Job
 	// sticky rule fires only on a different-JobName trailing entry).
-	p2eStallSeededJob0 = "lp-verify-0"
+	// I219: Job names follow the ONE naming rule (verifyJobName, F90: iteration
+	// ≤ 0 maps to 1), so no -verify-0 Job can exist: the seeded entry names a
+	// Job from a PRIOR iteration (0), and the just-appended entry at iteration
+	// 0 names the -verify-1 Job.
+	p2eStallSeededJob0 = "lp-verify-0" // a prior-iteration Job (distinct name, not -verify-1)
 	p2eStallSeededJob1 = "lp-verify-1"
 )
 
@@ -342,9 +346,9 @@ func TestApplyStallGateContinueLeavesPhaseUnchanged(t *testing.T) {
 	loop.Status.Iteration = 1
 	loop.Spec.Loop.StallAfter = &n
 	loop.Spec.Loop.StallAction = coxv1alpha1.StallActionContinue
-	// Seed the history with a DIFFERENT JobName (verify-0) carrying the same
-	// hash — the 1st consecutive identical failure. The just-appended entry is
-	// verify-1 (a NEW Job), k=2 == N=2 → fires.
+	// Seed the history with a DIFFERENT JobName (a prior-iteration Job) carrying
+	// the same hash — the 1st consecutive identical failure. The just-appended
+	// entry is verify-1 (a NEW Job), k=2 == N=2 → fires.
 	loop.Status.StallHistory = append(loop.Status.StallHistory,
 		coxv1alpha1.StallEntry{JobName: p2eStallSeededJob0, Hash: h, NormalisationVersion: "v1"})
 	pod := &corev1.Pod{
@@ -566,5 +570,36 @@ func TestApplyStallGateNoRealDiff(t *testing.T) {
 	other := mk()
 	if r.applyStallGate(context.Background(), other, podWith(strings.Repeat("e", 64)), s5aCheck0) {
 		t.Fatalf("a different agent diff on the third failure must not fire")
+	}
+}
+
+// TestStallEntryJobNameMatchesVerifyJob: the StallEntry's jobName must name
+// the Job the way the Job is CREATED (the package verifyJobName,
+// loop_verify_job.go) — I219: at iteration 0 the method named -verify-0 but
+// the Job is -verify-1 (F90 maps iteration ≤ 0 to 1).
+func TestStallEntryJobNameMatchesVerifyJob(t *testing.T) {
+	cases := []struct {
+		name      string
+		iteration int
+		want      string
+	}{
+		{name: "iteration 0 names the first-run Job", iteration: 0, want: "lp-verify-1"},
+		{name: "iteration 2", iteration: 2, want: "lp-verify-2"},
+		{name: "iteration 5", iteration: 5, want: "lp-verify-5"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			loop := &coxv1alpha1.Loop{}
+			loop.Name = "lp"
+			loop.Status.Iteration = tc.iteration
+			r := &LoopReconciler{}
+			got := r.verifyJobName(loop)
+			if got != verifyJobName(loop) {
+				t.Fatalf("the method must equal the package naming rule: got %q want %q", got, verifyJobName(loop))
+			}
+			if got != tc.want {
+				t.Fatalf("got %q want %q", got, tc.want)
+			}
+		})
 	}
 }

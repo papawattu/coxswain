@@ -47,6 +47,24 @@ func TestSuggestPolicyFromOperatorLog(t *testing.T) {
 	}
 }
 
+// R51 I236(1): input that holds nothing for the Loop's agent (run 12: the
+// operator log since its last rotation had none of this Loop's audit lines)
+// must fail, not print an empty spec.
+func TestSuggestPolicyEmptyInputFails(t *testing.T) {
+	in := strings.Join([]string{
+		`{"time":"2026-11-06T10:00:00Z","loop":"other","namespace":"ns","iteration":"0","source":"kubearmor","action":"Audit","target":"/bin/sh","verdict":"allowed","detail":"operation=Process, pod=other-sandbox, policy=p"}`,
+		`{"time":"2026-11-06T10:00:01Z","loop":"other","namespace":"ns","iteration":"0","source":"egress-proxy","action":"connect","target":"example.com:443","verdict":"blocked","detail":""}`,
+	}, "\n")
+	var out bytes.Buffer
+	err := suggestPolicy(strings.NewReader(in), &out, "l1", "ns", "l1-suggested")
+	if err == nil || !strings.Contains(err.Error(), "no audit records for Loop") {
+		t.Fatalf("want an error containing %q, got: %v", "no audit records for Loop", err)
+	}
+	if out.Len() != 0 {
+		t.Fatalf("output should be empty, got:\n%s", out.String())
+	}
+}
+
 // P6b-2: the command is registered as `policy suggest`.
 func TestPolicySuggestRegistered(t *testing.T) {
 	root := NewRootCommand(Deps{})

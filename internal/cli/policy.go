@@ -84,6 +84,10 @@ func suggestPolicy(in io.Reader, out io.Writer, loop, ns, name string) error {
 	if err := sc.Err(); err != nil {
 		return fmt.Errorf("read audit lines: %w", err)
 	}
-	_, err := io.WriteString(out, policy.RenderSuggestion(policy.SuggestFromRecords(recs, loop, ns), name, ns))
+	s := policy.SuggestFromRecords(recs, loop, ns)
+	if len(s.Exec)+len(s.Files)+len(s.Network)+len(s.ExecOverflow)+len(s.FilesOverflow)+len(s.NetworkOverflow)+len(s.ExecRejected) == 0 {
+		return fmt.Errorf("no audit records for Loop %s/%s's agent in the input; if it came from kubectl logs, lines before the operator's last log rotation are not included", ns, loop)
+	}
+	_, err := io.WriteString(out, policy.RenderSuggestion(s, name, ns))
 	return err
 }

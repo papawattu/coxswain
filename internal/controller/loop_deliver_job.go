@@ -439,8 +439,16 @@ func deliverBranchPrefix(loop *coxv1alpha1.Loop) string {
 	return "coxswain/"
 }
 
-// deliverDraft resolves spec.delivery.draft (default true).
+// deliverDraft resolves spec.delivery.draft (default true). A FALSE Judge
+// verdict (status.judge.verdict == false) forces a draft whatever
+// spec.delivery.draft says (ADR-0011 "Effect (D122, advisory)": "A false
+// verdict delivers the PR as a draft whatever spec.delivery.draft says");
+// a true verdict, a nil verdict (Unknown), or no status.judge leaves
+// spec.delivery.draft exactly as it is.
 func deliverDraft(loop *coxv1alpha1.Loop) bool {
+	if loop.Status.Judge != nil && loop.Status.Judge.Verdict != nil && !*loop.Status.Judge.Verdict {
+		return true
+	}
 	if loop.Spec.Delivery != nil && loop.Spec.Delivery.Draft != nil {
 		return *loop.Spec.Delivery.Draft
 	}

@@ -402,6 +402,111 @@ func TestDeliverDescriptionVerifyHistoryPerIteration(t *testing.T) {
 	}
 }
 
+// j1eGoldenBody is the byte-exact facts body main renders for a4FactsLoop()
+// (captured from main's renderer before the J1e change: run
+// `go test ./internal/controller/ -run TestZZJ1eGoldenCapture -v` on a
+// checkout of main). It is the golden for the "no judge -> byte-identical
+// body" assertion below.
+const j1eGoldenBody = `# coxswain delivery
+
+Delivered by the coxswain operator from the verified commit
+
+- **Loop:** a4ns/a4task1
+- **Goal:** Add a rounding function
+- **Iterations:** 2 of 5 max
+- **Verified commit:** ` + "`c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4`" + `
+- **Tamper check:** clean (no protected path changed)
+- **Last verify:** the acceptance checks passed
+
+## Verify results per iteration
+- iteration 1: FAILED (TestRound) at 2026-10-11 08:30:00Z
+- iteration 2: passed (verified commit ` + "`c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4`" + `)
+
+## Budget
+- **Budget (tokens):** 1500 of 1000000 cap
+- **Budget (requests):** 7
+- **Budget (cost):** $0.05 (no cap)
+- **Budget (active time):** 5m0s (no cap)
+`
+
+// TestDeliverDescriptionJudgeLine (J1e, ADR-0011 D122) asserts the Judge
+// facts render as ONE line in the PR body, built from status only
+// (status.judge: the boolean, the score, the one-line reason, the truncated
+// flag — the fixed shape the operator recorded from the Judge Job's
+// termination message). The test covers all three lines (pass, FAIL, and the
+// nil-verdict "unavailable" case D124) plus the truncated suffix, and
+// asserts that with status.judge == nil the body is BYTE-IDENTICAL to the
+// body main renders for the same Loop (the golden above).
+func TestDeliverDescriptionJudgeLine(t *testing.T) {
+	render := func(l *coxv1alpha1.Loop) string {
+		return renderDeliverDescriptionBody(deliverDescriptionForLoop(l))
+	}
+
+	// 1. No judge: the body is byte-identical to main's body for the same Loop
+	// (the golden captured before the J1e change).
+	if got := render(a4FactsLoop()); got != j1eGoldenBody {
+		t.Errorf("with status.judge nil the body must be byte-identical to main's body:\n\ngot:\n%s\n\ngolden:\n%s", got, j1eGoldenBody)
+	}
+
+	// 2. Verdict true: the pass line (score, reason), no draft note.
+	l1 := a4FactsLoop()
+	tv := true
+	l1.Status.Judge = &coxv1alpha1.JudgeStatus{Verdict: &tv, Score: 87, Reason: "meets the goal without gaming"}
+	got1 := render(l1)
+	if want := "- **Judge (advisory):** pass, score 87 — meets the goal without gaming"; !strings.Contains(got1, want) {
+		t.Errorf("a true verdict must render the pass line (want %q):\n%s", want, got1)
+	}
+	if strings.Contains(got1, "the PR is held as a draft") {
+		t.Errorf("a true verdict must not carry the draft note:\n%s", got1)
+	}
+	if strings.Contains(got1, "(diff truncated)") {
+		t.Errorf("an untruncated verdict must not carry the truncated suffix:\n%s", got1)
+	}
+
+	// 3. Verdict false: the FAIL line with the draft note (D122's advisory
+	// effect on the body text; the draft effect itself is deliverDraft).
+	l2 := a4FactsLoop()
+	fv := false
+	l2.Status.Judge = &coxv1alpha1.JudgeStatus{Verdict: &fv, Score: 12, Reason: "the test was weakened to pass"}
+	got2 := render(l2)
+	if want := "- **Judge (advisory):** FAIL, score 12 — the test was weakened to pass (the PR is held as a draft)"; !strings.Contains(got2, want) {
+		t.Errorf("a false verdict must render the FAIL line with the draft note (want %q):\n%s", want, got2)
+	}
+
+	// 4. Verdict nil (the Judge was unavailable, D124): the unavailable line.
+	l3 := a4FactsLoop()
+	l3.Status.Judge = &coxv1alpha1.JudgeStatus{Score: 0}
+	got3 := render(l3)
+	if want := "- **Judge (advisory):** unavailable"; !strings.Contains(got3, want) {
+		t.Errorf("a nil verdict must render the unavailable line (want %q):\n%s", want, got3)
+	}
+	if strings.Contains(got3, "the PR is held as a draft") {
+		t.Errorf("an unavailable judge must not carry the draft note:\n%s", got3)
+	}
+
+	// 5. Truncated: the suffix is appended to each of the three lines.
+	for name, tc := range map[string]*coxv1alpha1.JudgeStatus{
+		"pass":          {Verdict: &tv, Score: 87, Reason: "ok", Truncated: true},
+		"fail":          {Verdict: &fv, Score: 12, Reason: "no", Truncated: true},
+		"unavailable":   {Truncated: true},
+	} {
+		l := a4FactsLoop()
+		l.Status.Judge = tc
+		if got := render(l); !strings.Contains(got, "(diff truncated)") {
+			t.Errorf("the %s line must carry the truncated suffix:\n%s", name, got)
+		}
+	}
+
+	// 6. The line is a pure function of status.judge: a second occurrence of
+	// the same facts (a re-delivery with the same judge record) renders the
+	// same single line — the body carries exactly one Judge line.
+	l4 := a4FactsLoop()
+	l4.Status.Judge = &coxv1alpha1.JudgeStatus{Verdict: &tv, Score: 87, Reason: "meets the goal without gaming"}
+	if got := render(l4); strings.Count(got, "- **Judge (advisory):**") != 1 {
+		t.Errorf("the body must carry exactly one Judge line (got %d):\n%s", strings.Count(got, "- **Judge (advisory):**"), got)
+	}
+}
+
 // TestDeliverDescriptionDoesNotReadTheClaim (A4) is the mutation test that
 // "the facts section is built from status fields only (a mutation that
 // sources a fact from result.json fails) + the test fails if the body used

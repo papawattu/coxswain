@@ -48,7 +48,12 @@
 //     pod's exit codes), never from status.progress.lastResultStatus (F69 —
 //     see below);
 //   - status.budget (the accumulated consumption the operator derives from
-//     the metering proxy endpoint, P2c/P2d) + spec.budget (the caps).
+//     the metering proxy endpoint, P2c/P2d) + spec.budget (the caps);
+//   - status.judge (the advisory Judge's verdict, ADR-0011: the boolean,
+//     score, reason, and truncated flag the operator recorded from the Judge
+//     Job's termination message — operator-recorded, never a runner claim).
+//     The Judge line renders ONLY when status.judge != nil; with status.judge
+//     nil the body is byte-identical to the pre-Judge body.
 //
 // Nothing read from result.json (the runner's claim) feeds the body: the
 // claim's observedPhase/status fields are not referenced here at all.
@@ -182,6 +187,29 @@ type deliverDescription struct {
 	// Budget carries the used-vs-limit facts (nil when status.budget is
 	// nil: the body prints "budget not yet read").
 	Budget *deliverBudgetFacts
+	// Judge carries the advisory Judge's verdict facts (nil when status.judge
+	// is nil: the body carries no Judge line at all — with status.judge nil
+	// the body must be byte-identical to the pre-Judge body). A non-nil
+	// judge with a nil Verdict is the "unavailable" case (D124).
+	Judge *judgeFacts
+}
+
+// judgeFacts is the operator's record of the advisory Judge's verdict (J1e,
+// ADR-0011 D122): the fixed shape the operator recorded from the Judge Job's
+// termination message (the boolean verdict — nil = Unknown — the 0-100
+// score, the one-line reason, and the truncated flag). Rendered as ONE line
+// in the PR body; with the judge nil the line is absent.
+type judgeFacts struct {
+	// Verdict is status.judge.verdict (nil = Unknown; the Judge was not run
+	// or was unavailable — D124).
+	Verdict *bool
+	// Score is status.judge.score (0-100, recorded as-is).
+	Score int32
+	// Reason is status.judge.reason (the one-line reason, at most 200 chars).
+	Reason string
+	// Truncated is status.judge.truncated (the diff exceeded the 256 KiB cap
+	// and was truncated; the verdict is recorded on that fact).
+	Truncated bool
 }
 
 // verifyHistoryEntry is one line of the facts body's per-iteration verify
@@ -347,6 +375,23 @@ func deliverDescriptionForLoop(loop *coxv1alpha1.Loop) deliverDescription {
 		TamperClean:    tamper,
 		VerifyHistory:  verifyHistory,
 		Budget:         budget,
+		Judge:          judgeFactsFromLoop(loop),
+	}
+}
+
+// judgeFactsFromLoop copies status.judge into the facts struct (nil when
+// status.judge is nil — the body then carries no Judge line). It reads only
+// the operator's own record: the fixed shape the operator recorded from the
+// Judge Job's termination message (ADR-0011). Never a runner claim.
+func judgeFactsFromLoop(loop *coxv1alpha1.Loop) *judgeFacts {
+	if loop.Status.Judge == nil {
+		return nil
+	}
+	return &judgeFacts{
+		Verdict:   loop.Status.Judge.Verdict,
+		Score:     loop.Status.Judge.Score,
+		Reason:    loop.Status.Judge.Reason,
+		Truncated: loop.Status.Judge.Truncated,
 	}
 }
 
@@ -464,7 +509,33 @@ func renderDeliverDescriptionBody(d deliverDescription) string {
 	if d.Budget != nil && d.Budget.Exceeded {
 		fmt.Fprintf(&b, "- **Budget gate:** the operator gated delivery (budget %s)\n", d.Budget.ExceededReason)
 	}
+	b.WriteString(judgeLine(d.Judge))
 	return b.String()
+}
+
+// judgeLine renders the ONE Judge line of the PR body (J1e, ADR-0011 D122).
+// It renders only when j is non-nil (status.judge != nil); with j nil the
+// line is absent (the body is byte-identical to the pre-Judge body). The
+// line is operator-recorded: the fixed shape the operator recorded from the
+// Judge Job's termination message (the boolean, the score, the one-line
+// reason, the truncated flag). A false verdict notes the PR is held as a
+// draft (the advisory's only effect on delivery, D122).
+func judgeLine(j *judgeFacts) string {
+	if j == nil {
+		return ""
+	}
+	trunc := ""
+	if j.Truncated {
+		trunc = " (diff truncated)"
+	}
+	switch {
+	case j.Verdict != nil && *j.Verdict:
+		return fmt.Sprintf("- **Judge (advisory):** pass, score %d — %s%s\n", j.Score, oneLine(j.Reason), trunc)
+	case j.Verdict != nil && !*j.Verdict:
+		return fmt.Sprintf("- **Judge (advisory):** FAIL, score %d — %s%s (the PR is held as a draft)\n", j.Score, oneLine(j.Reason), trunc)
+	default:
+		return "- **Judge (advisory):** unavailable" + trunc + "\n"
+	}
 }
 
 // budgetLines renders the budget used-vs-limit facts under their own

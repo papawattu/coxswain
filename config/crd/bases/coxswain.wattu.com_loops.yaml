@@ -507,9 +507,9 @@ spec:
                           incomplete and is rejected at admission (the XValidation above), not
                           silently capped — enforced by the object-level XValidation on the type
                           (a field-level rule cannot reference sibling fields: self would be the
-                          scalar). Note an explicit maxTokens: 0 is dropped by omitempty and
-                          admitted as "no cap": the bound is enforced on the negative values,
-                          which are not the zero value.
+                          scalar). An explicit maxTokens: 0 is never admitted for an enabled
+                          Judge: YAML 0 fails Minimum=1, and a Go zero value is omitted and
+                          fails the XValidation.
                         format: int64
                         maximum: 32768
                         minimum: 1

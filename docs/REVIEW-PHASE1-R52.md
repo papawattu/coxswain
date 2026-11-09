@@ -184,6 +184,8 @@ locally with the then-current main (they were cut before #430/#432 landed).
   - **(a) pi3, #439 d119-2c:** the brief said "Count = the summed count", but the code counted records (`targets[t]++`). A stored count of 300 plus one new path became 2 on the next write. Process records and connects also shared a rank, so a count-1 connect was evicted before count-5 Process records. Both were shown by a reviewer probe that calls the functions directly, and fixed in ef0f153 (mutations m3/m4).
   - **(b)** The brief's spec for (a) had no test for the stored-count path, and the builder added none. A test fixture must include a record whose `Count` is not 1.
 
+  - **(c) pi3, #445 (D121):** the reported mutation output was `FAIL … [build failed]` (`fmt` left unused), so no spec ran. pi3 also edited `policy_test.go` outside the brief's files and removed the bad `--kubeconfig` from I244's `-f` case. That case still passes in its original form, so the edit only weakened it. It was restored in 072bfe5. The reviewer's own mutation panics, and the spec catches it.
+
   **Acceptance:** none recurs in R53's window.
 
 - [ ] **I253: the reviewer's slips after the round (I247 recurred)**
@@ -225,7 +227,7 @@ locally with the then-current main (they were cut before #430/#432 landed).
   entries". Run 8's 21 entries (`scratchpad/main-run8.yaml`) are 8 `dir/` entries and 13 exact
   paths. 3 of the exact paths are directory-self entries next to their `dir/` (`/memory`, `/workspace`,
   `…/telemetry/local`), and 10 are single files the agent read. Recommendation: close.
-- **D121 (I244):** the CLI's other commands keep the masking pre-run. Recommendation: make the
+- **D121 (I244)** (built and merged on the overnight approval as #445, 638c99d; the owner may still reverse it): the CLI's other commands keep the masking pre-run. Recommendation: make the
   pre-run return its error (a `PersistentPreRunE`), so a command never runs with nil deps and never
   silences its own error.
 - **C1:** the owner pushes `slice/c1-multiarch` from `../coxswain-c1`; the push needs the `workflow`

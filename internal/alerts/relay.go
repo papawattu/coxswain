@@ -124,10 +124,12 @@ type Snapshot struct {
 	Health Health
 	// Reason is the stable condition reason for a non-healthy state.
 	Reason string
-	// LatestTarget is the target of the most recent alert (blocked or not), so
-	// the condition says WHAT was bounced, not only how often.
+	// LatestTarget is the target of the most recent BLOCKED alert, so the
+	// condition says WHAT was bounced, not only how often. Allowed events
+	// never update it (I241: an allowed file event must not name the "latest
+	// target" of proxy blocks).
 	LatestTarget string
-	// LatestAt is that alert's own timestamp.
+	// LatestAt is that blocked alert's own timestamp.
 	LatestAt time.Time
 	// Unattributed is the relay's process-wide count of alerts it could not
 	// attribute to any Loop (a pod without a Loop label, a pod already gone).
@@ -190,9 +192,9 @@ func (h *Holder) observe(uid types.UID, al Alert) {
 	snap := h.loops[uid]
 	if al.Blocked {
 		snap.Count++
+		snap.LatestTarget = al.Target
+		snap.LatestAt = al.Time
 	}
-	snap.LatestTarget = al.Target
-	snap.LatestAt = al.Time
 	h.loops[uid] = snap
 }
 

@@ -293,7 +293,8 @@ func f62Fixture(t *testing.T, src Source) *Holder {
 
 // TestRelayCountsBlockedAlerts is F62 spec 1: two blocked alerts (plus an
 // allowed one, which must not count) give count 2 and a healthy stream with the
-// latest target.
+// latest BLOCKED target (I241: an allowed event never names the latest
+// target).
 //
 // Mutation: drop the status write / the observe call → no count.
 func TestRelayCountsBlockedAlerts(t *testing.T) {
@@ -315,10 +316,57 @@ func TestRelayCountsBlockedAlerts(t *testing.T) {
 		return true
 	})
 	if snap.LatestTarget != "/root/.ssh/id_ed25519" {
-		t.Errorf("latest target = %q, want the last alert's target", snap.LatestTarget)
+		t.Errorf("latest target = %q, want the last blocked alert's target", snap.LatestTarget)
 	}
 	if snap.LatestAt.IsZero() {
 		t.Errorf("latest alert time must be recorded")
+	}
+}
+
+// TestHolderLatestTargetIsTheLatestBlock is I241: the "latest target" in the
+// PolicyBlocked condition is the latest BLOCKED alert, not the latest alert of
+// any kind. Run 12 named an allowed file event ("/tmp/termination.log") as the
+// latest target of two blocked proxy connects, because observe updated
+// LatestTarget for allowed lines too.
+//
+// Mutation: move the LatestTarget/LatestAt assignments back outside the
+// Blocked branch → the allowed target wins.
+func TestHolderLatestTargetIsTheLatestBlock(t *testing.T) {
+	h := NewHolder()
+	base := time.Date(2026, 10, 26, 10, 0, 0, 0, time.UTC)
+	h.observe(f62UID, Alert{
+		Time:    base,
+		Action:  "connect",
+		Blocked: true,
+		Target:  "proxy.golang.org:443",
+		Source:  SourceEgress,
+	})
+	h.observe(f62UID, Alert{
+		Time:   base.Add(1 * time.Second),
+		Action: "Allow",
+		Target: "/tmp/termination.log",
+		Source: SourceKubeArmor,
+	})
+	h.observe(f62UID, Alert{
+		Time:   base.Add(2 * time.Second),
+		Action: "Allow",
+		Target: "/tmp/termination.log",
+		Source: SourceKubeArmor,
+	})
+
+	snap, ok := h.Snapshot(f62UID)
+	if !ok {
+		t.Fatalf("no snapshot for the Loop")
+	}
+	if snap.Count != 1 {
+		t.Errorf("count = %d, want 1 (only the blocked alert counts)", snap.Count)
+	}
+	if snap.LatestTarget != "proxy.golang.org:443" {
+		t.Errorf("latest target = %q, want the blocked alert's target (an allowed event never updates it)", snap.LatestTarget)
+	}
+	if !snap.LatestAt.Equal(base) {
+		t.Errorf("latest at = %s, want the blocked alert's time %s",
+			snap.LatestAt, base)
 	}
 }
 
@@ -699,7 +747,7 @@ func TestRelayIncompleteDiscoveryDoesNotPruneLiveFollowers(t *testing.T) {
 
 // TestRelayProxyStreamAloneIsNotHealthy is pi3 E3: a readable egress-proxy log
 // says nothing about whether the engine's blocks reached us, so it must not on
-// its own publish a count (which would read "the engine blocked 0 action(s)").
+// its own publish a count (which would read "0 action(s) blocked").
 //
 // Mutation: noteHealthy on a proxy attach regardless of the engine → Healthy.
 func TestRelayProxyStreamAloneIsNotHealthy(t *testing.T) {

@@ -56,15 +56,19 @@ var _ = Describe("D119 step 2: the learn summary is persisted to an owned Config
 		return ns
 	}
 
-	l2Reconciler := func(audit AuditReader) *LoopReconciler {
+	l2ReconcilerWithRecorder := func(audit AuditReader, rec *record.FakeRecorder) *LoopReconciler {
 		return &LoopReconciler{
 			CNIProber: testCNIProber(),
 			Client:    k8sClient,
 			Scheme:    k8sClient.Scheme(),
 			apiReader: k8sClient,
-			Recorder:  record.NewFakeRecorder(64),
+			Recorder:  rec,
 			Audit:     audit,
 		}
+	}
+
+	l2Reconciler := func(audit AuditReader) *LoopReconciler {
+		return l2ReconcilerWithRecorder(audit, record.NewFakeRecorder(64))
 	}
 
 	l2LearnLoop := func(ns, name string) types.UID {
@@ -228,19 +232,22 @@ var _ = Describe("D119 step 2: the learn summary is persisted to an owned Config
 			"the deleting path must call Audit.Forget on the Loop's UID (the learn summary and the F62 snapshot are both pruned — R52 I249)")
 	})
 
-	It("does not overwrite a foreign ConfigMap of the same name (the operator leaves foreign objects alone)", func() {
+	It("does not overwrite a foreign ConfigMap of the same name (the operator leaves foreign objects alone) and reports it with a LearnSummaryNameTaken Event", func() {
 		ns := l2Ns("l2-foreign")
 		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
 
 		name := "l2foreign"
 		audit := newF62Audit()
 		uid := l2LearnLoop(ns, name)
-		r := l2Reconciler(audit)
+		rec := record.NewFakeRecorder(64)
+		r := l2ReconcilerWithRecorder(audit, rec)
 		audit.SetLearnSummary(uid, []alerts.Record{l2Record(1, "2026-11-08T10:00:00Z")}, 0)
 
 		// Pre-create a ConfigMap with the same name, owned by a DIFFERENT
-		// controller (a foreign Loop). The operator's upsertLearnSummaryCM
-		// must leave it alone (no write, no error, no Event).
+		// controller (a foreign Loop). The operator must leave it alone
+		// (no write) but REPORT it (a LearnSummaryNameTaken Warning Event —
+		// R26 I90: a fallback surfaces its failure, it does not degrade
+		// silently).
 		foreignLoop := &coxv1alpha1.Loop{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, foreignLoop)).To(Succeed())
 		// A foreign object: same name, not owned by the Loop. The owner ref
@@ -265,5 +272,63 @@ var _ = Describe("D119 step 2: the learn summary is persisted to an owned Config
 		Expect(cm.Data[learnSummaryRecordsKey]).To(Equal("foreign-body"),
 			"the operator must NOT overwrite a foreign ConfigMap of the same name (the foreign object is left alone)")
 		Expect(cm.Data[learnSummaryDroppedKey]).To(Equal("99"))
+
+		// The degradation is surfaced, not silent: a LearnSummaryNameTaken
+		// Warning Event names the ConfigMap (mutation m4: dropping the Event
+		// emission fails this assertion).
+		drained := drainRecorderEvents(rec)
+		var took bool
+		for _, e := range drained {
+			if strings.Contains(e, "LearnSummaryNameTaken") && strings.Contains(e, learnSummaryCMName(name)) {
+				took = true
+				break
+			}
+		}
+		Expect(took).To(BeTrue(),
+			"the operator must emit a LearnSummaryNameTaken Event naming the foreign ConfigMap (found: %v)", drained)
+
+		// At most once per Loop: a second reconcile does not re-emit.
+		drainRecorderEvents(rec)
+		loop2 := &coxv1alpha1.Loop{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, loop2)).To(Succeed())
+		loop2.Status.Conditions = []metav1.Condition{{
+			Type: string(PolicyEnforcedCondition), Status: metav1.ConditionFalse,
+			Reason: "AuditOnly", Message: "learn mode (P6b)", LastTransitionTime: metav1.Now(),
+		}}
+		Expect(k8sClient.Status().Update(ctx, loop2)).To(Succeed())
+		s5aReconcile(r, ns, name)
+		n := countRecorderEvents(rec, "LearnSummaryNameTaken")
+		Expect(n).To(Equal(0),
+			"the LearnSummaryNameTaken Event is emitted at most once per Loop (a second reconcile must not re-emit; found %d)", n)
 	})
 })
+
+// drainRecorderEvents drains a FakeRecorder's event channel into a slice (the
+// d38/d77 helper pattern: ContainElement works on slices, not channels).
+func drainRecorderEvents(rec *record.FakeRecorder) []string {
+	var out []string
+Loop:
+	for {
+		select {
+		case e, ok := <-rec.Events:
+			if !ok {
+				break Loop
+			}
+			out = append(out, e)
+		default:
+			break Loop
+		}
+	}
+	return out
+}
+
+// countRecorderEvents counts drained event lines containing needle.
+func countRecorderEvents(rec *record.FakeRecorder, needle string) int {
+	n := 0
+	for _, e := range drainRecorderEvents(rec) {
+		if strings.Contains(e, needle) {
+			n++
+		}
+	}
+	return n
+}

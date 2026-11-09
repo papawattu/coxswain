@@ -299,6 +299,17 @@ type LoopReconciler struct {
 	// cannot count the same write twice. A re-note overwrites (never appends).
 	pendingMemoryMetric sync.Map
 
+	// loopNameTakenSummaryEvents (D119 step 2) holds one entry per Loop UID
+	// that already received a LearnSummaryNameTaken Warning Event (a foreign
+	// ConfigMap owns the <loop>-learn-summary name). sync.Map used as a set:
+	// CompareAndDelete returns true only the FIRST time a UID is seen, so the
+	// Event is emitted at most once per Loop instead of on every reconcile
+	// (the recordAuditOnlyIgnored status-changed pattern cannot fit — nothing
+	// in the Loop's status records the collision). Process-wide in-memory
+	// (lost on an operator restart, which re-emits once; acceptable — the
+	// Event stays visible via kubectl and the log line fires every reconcile).
+	loopNameTakenSummaryEvents sync.Map
+
 	// RESTMapper is the manager's dynamic RESTMapper (SetupWithManager wires
 	// mgr.GetRESTMapper()). It is the source of truth for "is the CRD for
 	// this type installed?" (I88): the VolumeSnapshot watch is registered

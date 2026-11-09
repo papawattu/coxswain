@@ -91,6 +91,12 @@ func (r *LoopReconciler) recordLearnSummary(ctx context.Context, loop *coxv1alph
 		return
 	}
 	cmName := learnSummaryCMName(loop.Name)
+	if r.learnSummaryNameTaken(ctx, loop, cmName) {
+		// A foreign object owns the name: keep not writing and surface it
+		// (at most one Event per Loop, plus a log) instead of degrading
+		// silently (R26 I90: a fallback surfaces its failure).
+		return
+	}
 	existingCM, existing := r.readExistingLearnSummary(ctx, loop, cmName)
 	existingDropped := existingDroppedField(existingCM)
 	merged := mergeLearnRecords(existing, recs)
@@ -342,6 +348,38 @@ func (r *LoopReconciler) upsertLearnSummaryCM(ctx context.Context, loop *coxv1al
 		return fmt.Errorf("update learn-summary ConfigMap %s: %w", name, err)
 	}
 	return nil
+}
+
+// learnSummaryNameTaken reports whether the learn-summary name is already
+// taken by a ConfigMap the Loop does NOT control (a foreign object). When it
+// is, the operator logs it and emits a Warning Event LearnSummaryNameTaken —
+// at most once per Loop (loopNameTakenSummaryEvents, keyed by Loop UID; the
+// recordAuditOnlyIgnored "status changed" pattern cannot fit here because
+// nothing in the Loop's status records the collision, and the AGENTS test
+// norm is that a fallback surfaces its failure). It is checked BEFORE any
+// write, so the foreign object is never touched.
+func (r *LoopReconciler) learnSummaryNameTaken(ctx context.Context, loop *coxv1alpha1.Loop, name string) bool {
+	cm := &corev1.ConfigMap{}
+	err := r.Get(ctx, types.NamespacedName{Namespace: loop.Namespace, Name: name}, cm)
+	if err != nil {
+		return false // absent or unreadable: the upsert step reports it
+	}
+	if metav1.IsControlledBy(cm, loop) {
+		return false // ours: normal create/update path
+	}
+	logf.FromContext(ctx).Info("Learn summary name is taken by a foreign ConfigMap; the operator will not write the summary there",
+		"loop", loop.Name, "configmap", name)
+	// At most one Event per Loop (R26 I90: surface once, not every reconcile).
+	// Load-then-Store: the Store succeeds on every reconcile (re-arming is
+	// harmless because the Event already went out), and Load reports whether
+	// this reconcile is the first to see the UID.
+	firstSeen, _ := r.loopNameTakenSummaryEvents.Load(loop.UID)
+	r.loopNameTakenSummaryEvents.Store(loop.UID, struct{}{})
+	if r.Recorder != nil && firstSeen == nil {
+		r.Recorder.Eventf(loop, corev1.EventTypeWarning, "LearnSummaryNameTaken",
+			"ConfigMap %s/%s already exists and is not controlled by this Loop; the operator will not write the learn summary there", loop.Namespace, name)
+	}
+	return true
 }
 
 // emitLearnSummaryEvent emits a Warning Event LearnSummaryWriteFailed with the

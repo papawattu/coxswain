@@ -26,12 +26,11 @@
 // Flow:
 //
 //  1. init container `judge-diff` (the verify base image, workspace PVC
-//     READ-ONLY): writes
-//     `git -c safe.directory='*' -C /agent-src diff <baseCommit>
-//     <verifiedCommit> | head -c 262145 > /judge/diff.patch` (the 256 KiB
-//     diff cap, ADR-0011 "Input") onto the /judge emptyDir. It fails
-//     closed: `set -o pipefail` plus an explicit refusal on a non-zero git
-//     exit (a failing git diff is never read as an empty diff).
+//     READ-ONLY): writes the uncapped diff to /judge/full.patch, checks the
+//     git exit status explicitly (a failing git diff exits 2 — the tamper
+//     script's fail-closed pattern), caps the file to judgeDiffCapBytes+1
+//     bytes (262145, the truncation marker cmd/judge's MaxDiffBytes+1 read
+//     detects) into /judge/diff.patch, and removes the uncapped file.
 //  2. container `judge` (the operator's own image,
 //     /usr/local/bin/coxswain-judge): reads the env (goal, plan, checks,
 //     diff path, result path), calls the Loop's model proxy with its own
@@ -90,69 +89,77 @@ const judgeAgentVol = "agent-workspace"
 // (ADR-0011 "Input": baseCommit..verifiedCommit, capped at 256 KiB).
 const judgeDiffPath = "/judge/diff.patch"
 
-// judgeDiffCapBytes is the diff cap: 256 KiB = 262144 bytes. When the diff
-// is larger, head -c keeps the first 256 KiB of the unified diff (the
-// Judge input is marked truncated by the reader, ADR-0011). It is its own
-// constant (the verify/memory-writer siblings use no head -c cap, so the
-// literal is defined once here).
+// judgeDiffCapBytes is the diff cap: 256 KiB = 262144 bytes. The init
+// writes a file of at most judgeDiffCapBytes+1 (262145) bytes: the extra
+// byte is the truncation marker that cmd/judge's MaxDiffBytes+1 read
+// detects (a file of exactly 262145 bytes is truncated; a file of 262144
+// is the full diff). It is its own constant (the verify/memory-writer
+// siblings use no head -c cap, so the literal is defined once here).
 const judgeDiffCapBytes = 262144
 
+// judgeDiffFullPath is where the init writes the UNCAPPED diff before capping
+// (a temp file on the /judge emptyDir). It is removed after the cap is
+// written so only the capped patch is left for the judge container.
+const judgeDiffFullPath = "/judge/full.patch"
+
 // judgeDiffScript builds the judge-diff init's sh script. It writes the
-// baseCommit..verifiedCommit unified diff (capped at 256 KiB) to
-// judgeDiffPath on the /judge emptyDir.
+// baseCommit..verifiedCommit unified diff to judgeDiffFullPath on the /judge
+// emptyDir (the UNCAPPED diff), checks the git exit status EXPLICITLY (a
+// failing git diff exits 2 — the tamper script's pattern, fail closed),
+// then caps the file to judgeDiffCapBytes+1 bytes (262145) into judgeDiffPath,
+// and removes the uncapped file. The cap is judgeDiffCapBytes+1 (262145) —
+// NOT 262144 — because cmd/judge reads MaxDiffBytes+1 (one byte more than
+// 256 KiB) as the truncation marker: a file of exactly 262145 bytes is
+// detected as truncated by cmd/judge's io.LimitReader + len check; a file
+// of 262144 bytes is NOT (it is exactly MaxDiffBytes, which cmd/judge reads
+// as "the full diff fit").
 //
 // Fail closed (the tamper script's pattern, loop_verify_job.go
-// tamperCheckScript): the diff is capped with `head -c` in a PIPE, and the
-// image's /bin/sh is busybox sh (alpine/git — the verify base image), whose
-// `set` has no `pipefail` option (a bashism — the tamper script avoids the
-// pipe itself instead, and so does this one): without an explicit check, a
-// failing git diff would take head's status 0 and leave an EMPTY patch the
-// Judge would read as "no changes — the goal is met". The script therefore
-// captures the diff into a shell variable and checks the git exit status
-// BEFORE writing the file, EXITS NON-ZERO refusing to report a diff on a
-// git failure (a distinct code, 2, the tamper script's tamperGitErrorExit,
-// so the operator can tell a git failure from any other error), and writes
-// only the first 256 KiB of a SUCCESSFUL diff (the ADR-0011 cap; the
-// variable is the diff text, so truncating it with a parameter slice is
-// POSIX-portable).
+// tamperCheckScript): the diff is written to a FILE (not a pipe), so a
+// failing git diff takes its OWN exit status (checked explicitly) — the
+// redirect is on the git command, not on head. A failing git diff exits 2
+// (distinct from any other non-zero: the operator can tell a git failure
+// from a write error) and the /judge/diff.patch file is never written
+// (the redirect is inside the if-branch, so a git failure leaves no patch).
 //
-// POSIX sh only (the image's /bin/sh is busybox sh): no bashisms (no
-// pipefail, no associative arrays). The diff text is large (the cap is
-// 256 KiB) — a shell variable is fine at that size (busybox sh holds
-// arguments well past it), and the file is written by the script, not
-// passed as an argument.
+// POSIX sh only (the image's /bin/sh is busybox sh on alpine/git): no
+// pipefail (a bashism — the file-based approach makes it unnecessary), no
+// associative arrays. The diff is written to a file on the /judge emptyDir
+// (writable: the readOnly rootfs makes / read-only), and head -c reads from
+// that file (no pipe, no variable — the file is the buffer).
 func judgeDiffScript(baseCommit, verifyCommit string) string {
+	// The cap is judgeDiffCapBytes+1 (262145): one byte more than 256 KiB,
+	// the truncation marker cmd/judge's MaxDiffBytes+1 read detects.
+	cap := judgeDiffCapBytes + 1
 	return fmt.Sprintf(`
 set -e
 # The Judge's input: the unified diff baseCommit..verifiedCommit, capped at
-# %d bytes (256 KiB, ADR-0011). The workspace is mounted read-only at
-# /agent-src (the verify Job's tamper init operates on the same repo path).
-# safe.directory: the workspace is root-owned while the container runs
-# non-root (the verify Job's verifyGitSafeEnv covers the same bug).
-if ! DIFF=$(git -c safe.directory='*' -C /agent-src diff --no-ext-diff --no-color --binary %s %s); then
+# %d bytes (judgeDiffCapBytes+1 = 262145, the truncation marker cmd/judge's
+# MaxDiffBytes+1 read detects, ADR-0011 "Input"). The workspace is mounted
+# read-only at /agent-src (the verify Job's tamper init operates on the same
+# repo path). safe.directory: the workspace is root-owned while the container
+# runs non-root (the verify Job's verifyGitSafeEnv covers the same bug).
+# The diff is written to a FILE (not a pipe): a failing git diff takes its
+# own exit status (checked explicitly, exit %d — the tamper script's pattern),
+# and the redirect is inside the if-branch so a git failure leaves no patch.
+git -c safe.directory='*' -C /agent-src diff --no-ext-diff --no-color --binary %s %s > %s || {
   echo "judge-diff: git diff failed; refusing to hand the Judge a diff"
   exit %d
-fi
-# Cap the diff at %d bytes (the ADR-0011 diff cap): head -c on the SUCCESSFUL
-# diff text (a pipe to head is fine here — the git failure was already caught
-# above, and head's own failure is a write error the set -e surfaces).
-printf '%%s' "$DIFF" | head -c %d > %s
-# Truncation flag (ADR-0011 "Input": the Judge input is marked truncated when
-# the diff exceeded the cap; the flag is the pre-cap size vs the cap, written
-# next to the patch so the reader can set the field without re-reading the
-# workspace).
-PRE=$(printf '%%s' "$DIFF" | wc -c)
-if [ "$PRE" -ge %d ]; then
-  echo "truncated: true" > %s.truncated
-else
-  echo "truncated: false" > %s.truncated
-fi
-echo "judge-diff ok: $(wc -c < %s) bytes (pre-cap $PRE)"
+}
+# Cap the diff at %d bytes: head -c on the UNCAPPED file (a file read, not a
+# pipe — no pipefail needed, no bashism). The extra byte (judgeDiffCapBytes+1
+# = %d) is the truncation marker cmd/judge's MaxDiffBytes+1 read detects.
+head -c %d %s > %s
+# Remove the uncapped file: only the capped patch is left for the judge
+# container (the /judge emptyDir is shared between the init and the judge
+# container; a leftover full.patch would be read by the judge container if
+# it looked for it — it doesn't, but rm -f is cheap insurance).
+rm -f %s
+echo "judge-diff ok: $(wc -c < %s) bytes (capped)"
 exit 0
-`, judgeDiffCapBytes, shellQuote(baseCommit), shellQuote(verifyCommit), judgeGitErrorExit,
-		judgeDiffCapBytes, judgeDiffCapBytes, judgeDiffPath,
-		judgeDiffCapBytes, judgeDiffPath, judgeDiffPath,
-		judgeDiffPath)
+`, cap, judgeGitErrorExit, shellQuote(baseCommit), shellQuote(verifyCommit), judgeDiffFullPath, judgeGitErrorExit,
+		cap, cap, cap, judgeDiffFullPath, judgeDiffPath,
+		judgeDiffFullPath, judgeDiffPath)
 }
 
 // judgeGitErrorExit is the judge-diff init's exit status when git itself

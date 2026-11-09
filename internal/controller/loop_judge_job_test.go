@@ -145,8 +145,8 @@ func TestJudgeBuildSpec(t *testing.T) {
 	if len(diffInit.Command) != 3 || diffInit.Command[0] != "/bin/sh" || diffInit.Command[1] != "-c" {
 		t.Fatalf("init command: got %v, want [sh -c <script>]", diffInit.Command)
 	}
-	if !strings.Contains(diffInit.Command[2], "head -c 262144") {
-		t.Fatalf("init script must carry the 256 KiB diff cap (head -c 262144), got:\n%s", diffInit.Command[2])
+	if !strings.Contains(diffInit.Command[2], "head -c 262145") {
+		t.Fatalf("init script must carry the 256 KiB+1 diff cap (head -c 262145, the truncation marker), got:\n%s", diffInit.Command[2])
 	}
 
 	// The judge container.
@@ -386,9 +386,9 @@ func TestJudgeNetworkPolicy(t *testing.T) {
 // failing git diff is never read as an empty diff).
 //
 // Mutation m1 (the mount is read-write) is a spec-level mutation (the Job's
-// spec, not the script); m2 (drop set -o pipefail / the fail-closed check)
-// is tested here: the unknown-commit case must FAIL (the script exits 0 and
-// writes an empty patch) when the fail-closed check is absent.
+// spec, not the script); m2 (drop the fail-closed git exit check) is tested
+// here: the unknown-commit case must FAIL (the script exits 0 and writes an
+// empty patch) when the fail-closed check is absent.
 func TestJudgeDiffScriptExecutes(t *testing.T) {
 	// Build a scratch repo with a base commit + an agent commit (the same
 	// shape as the tamper script's execution test, loop_f39_tamper_exec_test.go).
@@ -433,8 +433,8 @@ func TestJudgeDiffScriptExecutes(t *testing.T) {
 	// REAL script with only the two production paths substituted: /agent-src
 	// -> dir (the repo's root), /judge -> the temp dir (the diff.patch lands
 	// in dir/diff.patch). Everything else (the git command, the head -c
-	// cap, the set -o pipefail, the fail-closed check) is the production
-	// script, byte for byte.
+	// cap, the fail-closed git exit check) is the production script, byte for
+	// byte.
 	script := judgeDiffScript(baseSHA, verifySHA)
 	judgeRoot := t.TempDir()
 	script = strings.ReplaceAll(script, "/agent-src", dir)
@@ -477,9 +477,8 @@ func TestJudgeDiffScriptExecutes(t *testing.T) {
 
 	// The unknown-commit case: a SHA the repo does not have. The script must
 	// exit non-zero (fail closed: a failing git diff is never read as an
-	// empty diff). Mutation m2 (drop set -o pipefail / the fail-closed check)
-	// makes this exit 0 and write an empty patch — the mutation must FAIL
-	// this case.
+	// empty diff). Mutation m2 (drop the fail-closed git exit check) makes
+	// this exit 0 and write an empty patch — the mutation must FAIL this case.
 	unknownSHA := "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
 	badScript := strings.ReplaceAll(judgeDiffScript(baseSHA, unknownSHA), "/agent-src", dir)
 	badScript = strings.ReplaceAll(badScript, "/judge", judgeRoot)
@@ -493,5 +492,80 @@ func TestJudgeDiffScriptExecutes(t *testing.T) {
 	}
 	if ee, ok := err.(*exec.ExitError); ok && ee.ExitCode() != judgeGitErrorExit {
 		t.Fatalf("the unknown-commit case must exit %d (git error), got %d: %s", judgeGitErrorExit, ee.ExitCode(), badOut.String())
+	}
+
+	// The over-cap case: an agent commit that adds a file > 300000 bytes
+	// (well over the 262145-byte cap). The script must write a diff.patch of
+	// EXACTLY 262145 bytes (judgeDiffCapBytes+1, the truncation marker
+	// cmd/judge's MaxDiffBytes+1 read detects), and the uncapped
+	// full.patch must NOT exist afterwards (rm -f removes it).
+	//
+	// Build a second scratch repo for this case (the base repo's diff is too
+	// small to exceed the cap).
+	bigDir := t.TempDir()
+	gitBig := func(args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = bigDir
+		cmd.Env = append(os.Environ(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null")
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("gitBig %v: %v\n%s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	gitBig("init", "-q")
+	gitBig("config", "user.email", "t@example.com")
+	gitBig("config", "user.name", "t")
+	writeBig := func(rel string, content []byte) {
+		t.Helper()
+		p := filepath.Join(bigDir, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, content, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeBig("go.mod", []byte("module m\n"))
+	gitBig("add", "-A")
+	gitBig("commit", "-q", "-m", "base")
+	bigBaseSHA := gitBig("rev-parse", "HEAD")
+	// The agent's change: add a 310000-byte file (well over the 262145 cap).
+	bigContent := make([]byte, 310000)
+	for i := range bigContent {
+		bigContent[i] = byte('x')
+	}
+	writeBig("big.bin", bigContent)
+	gitBig("add", "-A")
+	gitBig("commit", "-q", "-m", "agent-big")
+	bigVerifySHA := gitBig("rev-parse", "HEAD")
+
+	// Run the production script against the big repo (only the production
+	// paths substituted: /agent-src -> bigDir, /judge -> a fresh temp dir).
+	bigScript := strings.ReplaceAll(judgeDiffScript(bigBaseSHA, bigVerifySHA), "/agent-src", bigDir)
+	bigJudgeRoot := t.TempDir()
+	bigScript = strings.ReplaceAll(bigScript, "/judge", bigJudgeRoot)
+	var bigOut bytes.Buffer
+	bigCmd := exec.Command("sh", "-c", bigScript)
+	bigCmd.Stdout, bigCmd.Stderr = &bigOut, &bigOut
+	bigCmd.Env = append(os.Environ(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null")
+	err = bigCmd.Run()
+	if err != nil {
+		t.Fatalf("the over-cap case must exit 0, got: %v\n%s", err, bigOut.String())
+	}
+	// diff.patch must be EXACTLY 262145 bytes (judgeDiffCapBytes+1).
+	bigDiffPath := filepath.Join(bigJudgeRoot, "diff.patch")
+	bigDiff, err := os.ReadFile(bigDiffPath)
+	if err != nil {
+		t.Fatalf("the over-cap diff.patch must exist at %s: %v", bigDiffPath, err)
+	}
+	if len(bigDiff) != judgeDiffCapBytes+1 {
+		t.Fatalf("the over-cap diff.patch must be EXACTLY %d bytes (judgeDiffCapBytes+1), got %d", judgeDiffCapBytes+1, len(bigDiff))
+	}
+	// full.patch must NOT exist (rm -f removed it).
+	fullPatchPath := filepath.Join(bigJudgeRoot, "full.patch")
+	if _, err := os.Stat(fullPatchPath); !os.IsNotExist(err) {
+		t.Fatalf("full.patch must NOT exist after the script (rm -f removed it), but it does: %v", err)
 	}
 }

@@ -154,13 +154,15 @@ func TestSuggestFromRecordsDropsEntriesUnderACollapsedDir(t *testing.T) {
 	if want := []string{"/a/", "/z.txt"}; !slices.Equal(s.Files, want) {
 		t.Errorf("files = %v, want %v", s.Files, want)
 	}
-	// /a/ must carry the sum of the entries it covers (6 collapsed files +
-	// 1 /a/b/c.txt + 1 /a/d/): the collapsed map keeps exactly the sum.
+	// /a/ must carry the sum of the distinct entries it covers (the 6
+	// collapsed files + 1 /a/b/c.txt): the collapsed map keeps exactly the
+	// sum, counted once (R51 I237 fix-up: the /a/d/ entry's count is
+	// covered by the /a/ entry itself, so it is not added a second time).
 	if got := collapseFileDirs(map[string]int{
 		"/a/fa": 1, "/a/fb": 1, "/a/fc": 1, "/a/fd": 1, "/a/fe": 1, "/a/ff": 1,
 		"/a/b/c.txt": 1, "/a/d/": 1,
-	}); len(got) != 1 || got["/a/"] != 8 {
-		t.Errorf("collapsed = %v, want {/a/: 8} (sum of covered entries)", got)
+	}); len(got) != 1 || got["/a/"] != 7 {
+		t.Errorf("collapsed = %v, want {/a/: 7} (sum of distinct covered entries, counted once)", got)
 	}
 
 	// A collapsed directory UNDER another collapsed directory is subsumed by
@@ -207,6 +209,22 @@ func TestSuggestFromRecordsCollapsesWideShallowTree(t *testing.T) {
 	}
 	if len(s.FilesOverflow) != 0 {
 		t.Errorf("files overflow = %v, want none", s.FilesOverflow)
+	}
+}
+
+// R51 I237 fix-up: a collapsed directory's count is the sum of its entries,
+// counted once. 14 files under /s/c/{7 dirs}/{x,y} give /s/c/ = 14, not 28
+// (the double-count: the second loop set /s/c/ to the sum of the deeper
+// entries still in out, and the outermost-ancestor drop then rolled them in
+// again).
+func TestSuggestFromRecordsCollapsedCountIsExact(t *testing.T) {
+	in := map[string]int{"/etc/hosts": 1}
+	for _, d := range []string{"0a", "0b", "0c", "0d", "0e", "0f", "0g"} {
+		in["/s/c/"+d+"/x"] = 1
+		in["/s/c/"+d+"/y"] = 1
+	}
+	if got := collapseFileDirs(in); len(got) != 2 || got["/etc/hosts"] != 1 || got["/s/c/"] != 14 {
+		t.Errorf("collapsed = %v, want {/etc/hosts: 1, /s/c/: 14}", got)
 	}
 }
 

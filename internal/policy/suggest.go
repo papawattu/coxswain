@@ -246,13 +246,7 @@ func collapseFileDirs(files map[string]int) map[string]int {
 			if parent != "/" && len(children[parent]) > suggestDirCollapse {
 				continue
 			}
-			collapsedCount := 0
-			for e, c := range out {
-				if strings.HasPrefix(e, dir+"/") {
-					collapsedCount += c
-				}
-			}
-			out[dir+"/"] = collapsedCount
+			deleteCovered(out, dir)
 		}
 		entries = out
 		if !changed {
@@ -287,6 +281,26 @@ func collapseFileDirs(files map[string]int) map[string]int {
 		}
 	}
 	return entries
+}
+
+// deleteCovered emits the busy directory's collapsed "dir/" entry and deletes
+// every entry under dir/ from out in the same step (R51 I237 fix-up): they
+// are covered by dir/, and leaving them lets the later outermost-ancestor
+// drop roll their counts into dir/ a second time.
+func deleteCovered(out map[string]int, dir string) {
+	prefix := dir + "/"
+	collapsedCount := 0
+	for e, c := range out {
+		if strings.HasPrefix(e, prefix) {
+			collapsedCount += c
+		}
+	}
+	out[prefix] = collapsedCount
+	for e := range out {
+		if e != prefix && strings.HasPrefix(e, prefix) {
+			delete(out, e)
+		}
+	}
 }
 
 // capList keeps the suggestLimit entries with the highest counts (ties broken

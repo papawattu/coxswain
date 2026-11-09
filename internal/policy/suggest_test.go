@@ -253,6 +253,55 @@ func TestSuggestFromRecordsKeepsANarrowTree(t *testing.T) {
 	}
 }
 
+// D119 = (b) step 1: a record's weight is max(1, r.Count). The learn summary
+// carries one record per distinct key with its occurrence count; a one-off
+// line from the log has no count (Count=0, weight 1). The cap keeps the
+// highest-weight entries.
+//
+// Mutation m3: SuggestFromRecords adds 1 and ignores Count → /a (weight 50)
+// is treated as weight 1 and falls into the overflow.
+func TestSuggestFromRecordsUsesCount(t *testing.T) {
+	// Two exec records: /a with Count 50, /b with no count (weight 1).
+	// Pad with 70 other distinct paths (each weight 1) so the total exceeds
+	// the 64-entry cap. /a must be kept (its weight 50 beats every weight-1
+	// entry); /bin/zzz-b (weight 1, tied with the others) is dropped by the
+	// name tie-break.
+	var recs = make([]alerts.Record, 0, 72)
+	recs = append(recs, alerts.Record{
+		Loop: "l1", Namespace: "ns", Source: alerts.SourceKubeArmor, Action: "Audit",
+		Target: "/bin/zzz-a", Verdict: "allowed", Detail: "operation=Process, pod=l1-sandbox",
+		Count: 50,
+	})
+	recs = append(recs, alerts.Record{
+		Loop: "l1", Namespace: "ns", Source: alerts.SourceKubeArmor, Action: "Audit",
+		Target: "/bin/zzz-b", Verdict: "allowed", Detail: "operation=Process, pod=l1-sandbox",
+	})
+	// 70 more distinct paths, each one record (weight 1).
+	for i := range 70 {
+		recs = append(recs, alerts.Record{
+			Loop: "l1", Namespace: "ns", Source: alerts.SourceKubeArmor, Action: "Audit",
+			Target: fmt.Sprintf("/bin/ta%02d", i), Verdict: "allowed",
+			Detail: "operation=Process, pod=l1-sandbox",
+		})
+	}
+	s := SuggestFromRecords(recs, "l1", "ns")
+	// /a must be in the kept list (weight 50 > every weight-1 entry).
+	if !slices.Contains(s.Exec, "/bin/zzz-a") {
+		t.Errorf("/bin/zzz-a (Count 50) is not in the kept exec list; the cap ignored the count. kept=%v", s.Exec)
+	}
+	// /bin/zzz-a must NOT be in the overflow.
+	if slices.Contains(s.ExecOverflow, "/bin/zzz-a") {
+		t.Errorf("/bin/zzz-a (Count 50) is in the exec overflow; the cap ignored the count. overflow=%v", s.ExecOverflow)
+	}
+	// 72 distinct paths total, 64 kept, 8 overflow.
+	if len(s.Exec) != 64 {
+		t.Errorf("kept exec = %d entries, want 64", len(s.Exec))
+	}
+	if len(s.ExecOverflow) != 8 {
+		t.Errorf("exec overflow = %d entries, want 8 (72 distinct - 64 kept): %v", len(s.ExecOverflow), s.ExecOverflow)
+	}
+}
+
 // D112: 70 distinct exec paths overflow the 64-entry cap; the kept 64 are
 // the highest-count entries (ties broken by name), the rest go to
 // ExecOverflow.

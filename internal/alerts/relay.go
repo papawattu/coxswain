@@ -19,6 +19,8 @@ import (
 	"context"
 	"errors"
 	"io"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -144,11 +146,25 @@ type Holder struct {
 	mu           sync.RWMutex
 	loops        map[types.UID]Snapshot
 	unattributed int64
+	// learn is the bounded per-Loop summary of distinct learns-relevant records
+	// (D119 = (b), R51 I236): one entry per distinct record key, so `cox policy
+	// suggest` can read the whole learn run without depending on log retention.
+	learn map[types.UID]*learnSummary
+}
+
+// learnSummaryMax bounds the distinct records one Loop's learn summary keeps.
+const learnSummaryMax = 20000
+
+// learnSummary is one Loop's bounded set of distinct learns-relevant records,
+// keyed by the record key. dropped counts the records refused at the bound.
+type learnSummary struct {
+	recs    map[string]Record
+	dropped int64
 }
 
 // NewHolder returns an empty holder.
 func NewHolder() *Holder {
-	return &Holder{loops: map[types.UID]Snapshot{}}
+	return &Holder{loops: map[types.UID]Snapshot{}, learn: map[types.UID]*learnSummary{}}
 }
 
 // Snapshot returns the Loop's view. The second result is false when the relay
@@ -247,6 +263,80 @@ func (h *Holder) noteUnattributed() {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.unattributed++
+}
+
+// learnKey is the summary key for one record: the identity `suggest` needs to
+// deduplicate (source, action, the first detail field — KubeArmor's
+// "operation=..." — and target). The Record's Time and Count are the summary's
+// own bookkeeping, not part of the key.
+func learnKey(rec Record) string {
+	return rec.Source + "\x00" + rec.Action + "\x00" + firstDetailField(rec.Detail) + "\x00" + rec.Target
+}
+
+// firstDetailField is the record's first ", "-separated detail field ("" for
+// an empty detail).
+func firstDetailField(detail string) string {
+	field, _, _ := strings.Cut(detail, ",")
+	return field
+}
+
+// addLearn records one learns-relevant record in the Loop's summary. An
+// existing key bumps its Count and keeps the later Time; a new key is stored
+// with Count 1 until the bound is reached, after which it is counted as
+// dropped (D119 = (b): the summary is bounded, and the bound is honoured
+// rather than overflowed).
+func (h *Holder) addLearn(uid types.UID, rec Record) {
+	if h == nil || uid == "" {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	s, ok := h.learn[uid]
+	if !ok {
+		s = &learnSummary{recs: map[string]Record{}}
+		h.learn[uid] = s
+	}
+	key := learnKey(rec)
+	if prev, ok := s.recs[key]; ok {
+		rec.Count = prev.Count + 1
+		// Keep the later of the two times (the envelope's RFC3339Nano strings
+		// compare lexicographically, which is chronological for the same layout).
+		if rec.Time < prev.Time {
+			rec.Time = prev.Time
+		}
+		s.recs[key] = rec
+		return
+	}
+	if len(s.recs) >= learnSummaryMax {
+		s.dropped++
+		return
+	}
+	rec.Count = 1
+	s.recs[key] = rec
+}
+
+// LearnSummary returns the Loop's learns-relevant records, sorted by key, as a
+// COPY (the caller may keep it; the relay keeps mutating the original), the
+// number of records dropped at the bound, and ok — false when the Loop has no
+// summary at all (nothing learns-relevant was observed for it).
+func (h *Holder) LearnSummary(uid types.UID) (recs []Record, dropped int64, ok bool) {
+	if h == nil || uid == "" {
+		return nil, 0, false
+	}
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	s, ok := h.learn[uid]
+	if !ok || len(s.recs) == 0 {
+		return nil, 0, false
+	}
+	recs = make([]Record, 0, len(s.recs))
+	for _, r := range s.recs {
+		recs = append(recs, r)
+	}
+	slices.SortFunc(recs, func(a, b Record) int {
+		return strings.Compare(learnKey(a), learnKey(b))
+	})
+	return recs, s.dropped, true
 }
 
 // podAttr is one pod's resolved Loop attribution, cached for the pod's life.
@@ -726,6 +816,13 @@ func (r *Relay) accept(ctx context.Context, peer Peer, al Alert) {
 		return
 	}
 	r.Holder.observe(uid, al)
+	// D119 = (b) (R51 I236): the learns-relevant records (the sandbox pod's
+	// Process/File and the egress connects) are kept in the bounded per-Loop
+	// learn summary, so `cox policy suggest` does not depend on log retention.
+	rec := r.buildRecord(al, loopName, loopNS, al.Detail)
+	if LearnRelevant(rec) {
+		r.Holder.addLearn(uid, rec)
+	}
 	r.emit(al, loopName, loopNS, al.Detail)
 }
 
@@ -752,13 +849,24 @@ func (r *Relay) emit(al Alert, loopName, loopNS, detail string) {
 	if r.Emit == nil {
 		return
 	}
+	rec := r.buildRecord(al, loopName, loopNS, detail)
+	if err := WriteRecord(r.Emit, rec); err != nil {
+		r.log().V(1).Info("alert relay: could not write the audit line", "error", err.Error())
+	}
+}
+
+// buildRecord builds the Q4 envelope for one alert exactly as emit writes it:
+// the same fields, so the learn summary's records and the emitted lines agree.
+// (D119 = (b) step 1 factors the construction out of emit without changing
+// emit's output.)
+func (r *Relay) buildRecord(al Alert, loopName, loopNS, detail string) Record {
 	iteration := "unknown"
 	if loopName != "" && r.Iteration != nil {
 		if it := r.Iteration(loopNS, loopName); it != "" {
 			iteration = it
 		}
 	}
-	rec := Record{
+	return Record{
 		Time:      al.Time.UTC().Format(time.RFC3339Nano),
 		Loop:      loopName,
 		Namespace: firstNonEmpty(loopNS, al.Namespace),
@@ -769,10 +877,10 @@ func (r *Relay) emit(al Alert, loopName, loopNS, detail string) {
 		Verdict:   al.Verdict(),
 		Detail:    detail,
 	}
-	if err := WriteRecord(r.Emit, rec); err != nil {
-		r.log().V(1).Info("alert relay: could not write the audit line", "error", err.Error())
-	}
 }
+
+// unattributedDetail renders the F63 detail for an alert the relay could not
+// attribute: the line is still emitted (every alert is), with the reason.
 
 // attachedNow records a successful attach: the engine stream's state for the
 // sandbox pods on its node, or one proxy pod's Loop.

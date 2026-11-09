@@ -78,13 +78,21 @@ func suggestPodItem(r alerts.Record, loop string) bool {
 // blocked records count: in learn mode KubeArmor's Audit verdict reads as
 // allowed, and a blocked connect is exactly what the policy is missing. Each
 // list is capped at suggestLimit (the CRD's MaxItems): the most observed
-// entries are kept, the rest go to the Suggestion's Overflow fields.
+// entries are kept, the rest go to the Suggestion's Overflow fields. A
+// record's weight is max(1, r.Count): the learn summary (D119 = (b)) carries
+// one record per distinct key with its occurrence count, and a one-off line
+// from the log has no count.
 func SuggestFromRecords(records []alerts.Record, loop, namespace string) Suggestion {
 	exec, files, network := map[string]int{}, map[string]int{}, map[string]int{}
 	var execRejected map[string]bool
 	for _, r := range records {
 		if r.Loop != loop || r.Namespace != namespace || r.Target == "" {
 			continue
+		}
+		// The summary's occurrence count (0 means one line of the log).
+		w := 1
+		if r.Count > 1 {
+			w = int(r.Count)
 		}
 		switch r.Source {
 		case alerts.SourceKubeArmor:
@@ -104,7 +112,7 @@ func SuggestFromRecords(records []alerts.Record, loop, namespace string) Suggest
 				}
 				bin := fields[0]
 				if path.IsAbs(bin) && execAllowable(bin) {
-					exec[bin]++
+					exec[bin] += w
 				} else if path.IsAbs(bin) {
 					// R15: a binary the agent can write cannot be allowed by
 					// path; paths the CRD's exec rule rejects go to
@@ -115,11 +123,11 @@ func SuggestFromRecords(records []alerts.Record, loop, namespace string) Suggest
 					execRejected[bin] = true
 				}
 			case strings.HasPrefix(r.Detail, "operation=File"):
-				files[r.Target]++
+				files[r.Target] += w
 			}
 		case alerts.SourceEgress:
 			if r.Action == "connect" {
-				network[r.Target]++
+				network[r.Target] += w
 			}
 		}
 	}

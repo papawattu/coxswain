@@ -26,6 +26,7 @@ import (
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
 	"github.com/papawattu/coxswain/internal/alerts"
@@ -499,3 +500,54 @@ func (b *bytesBuffer) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 func (b *bytesBuffer) Len() int { return len(b.buf) }
+
+// TestLearnSummaryCompactTimeIsPerEntry covers the string-prefix defect in
+// the compact-time walk (D119 step 2 leftovers, #439): a raw target and a
+// sibling that only shares a string prefix (/a/b vs /a/bc) must each keep
+// ITS OWN time — the old O(raw x compacted) HasPrefix scan let /a/b match
+// the entry /a/bc and copy its time across.
+//
+// Mutation m2 (walk the ancestors but match compacted entries by plain
+// strings.HasPrefix instead of the "/"-terminated ancestor): the two
+// uncollapsed siblings cross-match and the times smear → this spec fails.
+func TestLearnSummaryCompactTimeIsPerEntry(t *testing.T) {
+	recs := []alerts.Record{
+		{Time: "2026-11-14T10:00:00Z", Loop: "l1", Source: alerts.SourceKubeArmor,
+			Action: "Audit", Target: "/a/b", Detail: "operation=File, pod=l1-sandbox", Count: 1},
+		{Time: "2026-11-14T11:00:00Z", Loop: "l1", Source: alerts.SourceKubeArmor,
+			Action: "Audit", Target: "/a/bc", Detail: "operation=File, pod=l1-sandbox", Count: 1},
+	}
+	compacted := compactLearnFileRecords(recs, "l1")
+	times := map[string]string{}
+	for _, r := range compacted {
+		times[r.Target] = r.Time
+	}
+	if len(compacted) != 2 {
+		t.Fatalf("compaction kept %d records, want 2 (distinct, unbusy paths are not collapsed); targets: %v", len(compacted), targetsOf(compacted))
+	}
+	if times["/a/b"] != "2026-11-14T10:00:00Z" {
+		t.Errorf("time for /a/b = %q, want its own 10:00:00Z (it must not take /a/bc's time via a string-prefix match)", times["/a/b"])
+	}
+	if times["/a/bc"] != "2026-11-14T11:00:00Z" {
+		t.Errorf("time for /a/bc = %q, want its own 11:00:00Z (the old prefix walk could not match /a/bc to anything and could smear /a/b's time here)", times["/a/bc"])
+	}
+}
+
+// TestLearnSummaryForgetClearsNameTaken covers the #439 leftover: a deleted
+// Loop's name-taken UID must leave loopNameTakenSummaryEvents, or a NEW Loop
+// that reuses... (UIDs never reuse, so the real cost is the map living on —
+// one entry per deleted Loop until the operator restarts, exactly the leak
+// R52 I249 flagged for the relay state).
+//
+// Mutation m1 (delete the Delete loop.UID line): the map keeps the UID and
+// this spec fails.
+func TestLearnSummaryForgetClearsNameTaken(t *testing.T) {
+	r := &LoopReconciler{}
+	uid := types.UID("i255-uid")
+	loop := &coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{UID: uid, Name: "l1", Namespace: "ns"}}
+	r.loopNameTakenSummaryEvents.Store(uid, struct{}{})
+	r.forgetAuditState(loop)
+	if _, ok := r.loopNameTakenSummaryEvents.Load(uid); ok {
+		t.Errorf("loopNameTakenSummaryEvents still holds the deleted Loop's UID after forgetAuditState; the name-taken set must be pruned like the relay state")
+	}
+}

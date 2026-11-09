@@ -302,7 +302,7 @@ type LoopReconciler struct {
 	// loopNameTakenSummaryEvents (D119 step 2) holds one entry per Loop UID
 	// that already received a LearnSummaryNameTaken Warning Event (a foreign
 	// ConfigMap owns the <loop>-learn-summary name). sync.Map used as a set:
-	// CompareAndDelete returns true only the FIRST time a UID is seen, so the
+	// LoadOrStore reports true only the FIRST time a UID is seen, so the
 	// Event is emitted at most once per Loop instead of on every reconcile
 	// (the recordAuditOnlyIgnored status-changed pattern cannot fit — nothing
 	// in the Loop's status records the collision). Process-wide in-memory

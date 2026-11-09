@@ -37,6 +37,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"path"
 	"slices"
 	"strconv"
 	"strings"
@@ -233,9 +234,12 @@ func mergeLearnRecords(existing, new_ []alerts.Record) []alerts.Record {
 // the Count is the SUM of the originals' counts (not the number of originals:
 // the merged input holds the ConfigMap's existing records whose counts are
 // already summed, and counting records would reset them to 1 on every write),
-// and the Time the latest of the originals).
-// Process and egress records pass through unchanged. If the records carry no
-// File records, the input is returned as-is.
+// and the Time the latest of the originals that compacted into it: a raw
+// target either IS an entry or compacts into the nearest ancestor entry on
+// its path.Dir walk (a compacted entry always ends in "/"), so /a/b never
+// matches the sibling entry /a/bc. Process and egress records pass through
+// unchanged. If the records carry no File records, the input is returned
+// as-is.
 func compactLearnFileRecords(recs []alerts.Record, loopName string) []alerts.Record {
 	targets := map[string]int{}
 	// latestRaw[target] is the latest Time of the original records with that
@@ -257,23 +261,24 @@ func compactLearnFileRecords(recs []alerts.Record, loopName string) []alerts.Rec
 		return recs
 	}
 	compacted := policy.CompactFileTargets(targets)
-	// Walk the collapsed tree down to the raw targets the way the collapse
-	// walks up: an entry's Time is the latest of the raw records that are the
-	// entry itself or sit under it.
+	// Map each raw target to the entry it compacts into, without an O(raw x
+	// compacted) scan: the raw is the entry itself, or — walking its
+	// ancestors with path.Dir — the first "/"-terminated ancestor the
+	// collapse produced. Walking per-raw also keeps /a/b from matching the
+	// sibling entry /a/bc (the old string-prefix rule did).
 	latest := map[string]string{}
-	rawByEntry := map[string][]string{}
 	for raw := range targets {
-		for entry := range compacted {
-			if raw == entry || strings.HasPrefix(raw, entry) {
-				rawByEntry[entry] = append(rawByEntry[entry], raw)
+		entry := raw
+		if _, ok := compacted[raw]; !ok {
+			for d := path.Dir(strings.TrimSuffix(raw, "/")); d != "/"; d = path.Dir(d) {
+				if _, ok := compacted[d+"/"]; ok {
+					entry = d + "/"
+					break
+				}
 			}
 		}
-	}
-	for entry, raws := range rawByEntry {
-		for _, raw := range raws {
-			if latestRaw[raw] > latest[entry] {
-				latest[entry] = latestRaw[raw]
-			}
+		if t := latestRaw[raw]; t > latest[entry] {
+			latest[entry] = t
 		}
 	}
 	out := make([]alerts.Record, 0, len(recs)-len(fileRecs)+len(compacted))
@@ -469,13 +474,11 @@ func (r *LoopReconciler) learnSummaryNameTaken(ctx context.Context, loop *coxv1a
 	}
 	logf.FromContext(ctx).Info("Learn summary name is taken by a foreign ConfigMap; the operator will not write the summary there",
 		"loop", loop.Name, "configmap", name)
-	// At most one Event per Loop (R26 I90: surface once, not every reconcile).
-	// Load-then-Store: the Store succeeds on every reconcile (re-arming is
-	// harmless because the Event already went out), and Load reports whether
-	// this reconcile is the first to see the UID.
-	firstSeen, _ := r.loopNameTakenSummaryEvents.Load(loop.UID)
-	r.loopNameTakenSummaryEvents.Store(loop.UID, struct{}{})
-	if r.Recorder != nil && firstSeen == nil {
+	// At most one Event per Loop (R26 I90: surface once, not every
+	// reconcile): LoadOrStore reports whether this reconcile is the first to
+	// see the UID.
+	_, seen := r.loopNameTakenSummaryEvents.LoadOrStore(loop.UID, struct{}{})
+	if r.Recorder != nil && !seen {
 		r.Recorder.Eventf(loop, corev1.EventTypeWarning, "LearnSummaryNameTaken",
 			"ConfigMap %s/%s already exists and is not controlled by this Loop; the operator will not write the learn summary there", loop.Namespace, name)
 	}
@@ -507,6 +510,7 @@ func maxDroppedInt64(a, b int64) int64 {
 // installed (r.Audit nil). No return value: Reconcile is at its gocyclo
 // budget, so the call site is a bare line.
 func (r *LoopReconciler) forgetAuditState(loop *coxv1alpha1.Loop) {
+	r.loopNameTakenSummaryEvents.Delete(loop.UID)
 	if r.Audit == nil {
 		return
 	}

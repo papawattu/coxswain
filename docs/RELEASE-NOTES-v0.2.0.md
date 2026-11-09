@@ -1,7 +1,17 @@
-# Release notes: changes since v0.1.3 (unreleased)
+# Release notes: v0.2.0
 
 Entries are added per merged PR, each citing the PR and the squash commit it
 landed as, like `RELEASE-NOTES-v0.1.3.md`.
+
+## Summary
+
+- **ClusterAgentPolicy** (P6a): a cluster-scoped `AgentPolicy` companion a `spec.policyRefs` entry can name, so an org-wide allow is one object referenced by Loops in any namespace (namespaced policy wins on a name collision, with a `PolicyNameCollision` Warning Event).
+- **Learn mode** (P6b): `spec.auditOnly: true` runs a referenced policy in audit-only posture so the Loop records activity instead of enforcing it; **`cox policy suggest`** (P6b-2) prints a candidate `AgentPolicy` from that recorded activity.
+- **The learn summary** (D119): the operator keeps the distinct recorded allows of a learn-mode Loop in a bounded `<loop>-learn-summary` ConfigMap that `cox policy suggest` reads by default.
+- **The status VAP** (P6c): a ValidatingAdmissionPolicy that rejects every `loops/status` write except the operator's own ServiceAccount.
+- **`cox retry`** (D86, D116): a one-shot annotation that resumes a Loop failed with `SandboxFailed` from its checkpoint without losing its history.
+- **Node placement** (C2): `--loop-node-selector` and `--loop-tolerations` operator flags pin every operator-owned Loop workload to a dedicated node pool.
+- **Multi-arch images** (C1): linux/amd64 + linux/arm64 release images — pending the release workflow push.
 
 ## Upgrade
 
@@ -21,6 +31,18 @@ F77 pin half). Owner decisions: D84(a) and D106.
 
 **On upgrade:** a rollback on a Failed or Succeeded Loop now runs a verify
 again.
+
+### The status VAP (P6c, #416): non-manager `loops/status` writes are now rejected by admission
+
+Install from this release's `install.yaml` or chart and any tooling that patched `loops/status` directly (a hand `kubectl patch` on the status subresource, even by a cluster admin) is now denied at admission — including the editor role's old status-write grants. Approve or reject with `cox approve` / `cox reject` (one-shot annotation; the operator writes the status itself). Break-glass hand-edits: delete the binding, edit, re-apply it (`docs/OPERATOR.md`).
+
+### Learn mode: the operator creates `<loop>-learn-summary` ConfigMaps in Loop namespaces
+
+For a learn-mode Loop (every referenced policy `auditOnly`), the operator keeps the `<loop>-learn-summary` ConfigMap in the Loop's namespace (D119). No new RBAC: configmaps `create;get;update` are already in the operator's role. A pre-existing ConfigMap of that name that the Loop does not own is never touched (`LearnSummaryNameTaken` Warning Event).
+
+### D121 (#445): `kubectl cox` returns the kubeconfig error instead of running without a client
+
+When the Kubernetes client setup fails (a missing or broken kubeconfig), `kubectl cox` commands now exit with that kubeconfig error from the CLI pre-run, instead of running without a client and failing later at the first API call.
 
 ## New features
 

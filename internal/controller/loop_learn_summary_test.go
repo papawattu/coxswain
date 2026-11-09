@@ -330,6 +330,108 @@ func TestLearnSummaryCompactsWideTree(t *testing.T) {
 	}
 }
 
+// TestLearnSummaryCompactKeepsCounts covers the re-review P1 (compaction
+// must sum the records' COUNTS, not count the records): the merged input
+// holds the ConfigMap's existing records whose counts are already summed, so
+// collapsing them and re-deriving the count from the number of records would
+// reset every stored count on every write.
+//
+// Mutation m3 (targets[rec.Target]++ instead of += max(1, rec.Count)): the
+// count-50 record compacts to count 1 and the 300+1 pair compacts to 2.
+func TestLearnSummaryCompactKeepsCounts(t *testing.T) {
+	// Case 1: a single File record with a stored count of 50 compacts to a
+	// count of 50 (not 1).
+	one := []alerts.Record{{
+		Time: "2026-11-13T10:00:00Z", Loop: "l1", Source: alerts.SourceKubeArmor,
+		Action: "Audit", Target: "/etc/passwd", Detail: "operation=File, pod=l1-sandbox", Count: 50,
+	}}
+	compacted := compactLearnFileRecords(one, "l1")
+	if len(compacted) != 1 {
+		t.Fatalf("compaction kept %d records, want 1; targets: %v", len(compacted), targetsOf(compacted))
+	}
+	if compacted[0].Target != "/etc/passwd" {
+		t.Fatalf("compacted target = %q, want /etc/passwd (a single unbusy path is unchanged)", compacted[0].Target)
+	}
+	if compacted[0].Count != 50 {
+		t.Errorf("compacted count = %d, want 50 (the record's stored count, not the number of records — mutation m3 counts records)", compacted[0].Count)
+	}
+
+	// Case 2: a stored /scratch/.cache/go-build/ record (count 300, the
+	// collapse from a previous write) plus one new raw path under it (count 1)
+	// compact to ONE record /scratch/.cache/go-build/ with count 301.
+	pair := []alerts.Record{
+		{Time: "2026-11-13T10:00:00Z", Loop: "l1", Source: alerts.SourceKubeArmor, Action: "Audit",
+			Target: "/scratch/.cache/go-build/", Detail: "operation=File, pod=l1-sandbox", Count: 300},
+		{Time: "2026-11-13T11:00:00Z", Loop: "l1", Source: alerts.SourceKubeArmor, Action: "Audit",
+			Target: "/scratch/.cache/go-build/ab/cd", Detail: "operation=File, pod=l1-sandbox", Count: 1},
+	}
+	compacted = compactLearnFileRecords(pair, "l1")
+	if len(compacted) != 1 {
+		t.Fatalf("compaction kept %d records, want 1 (the stored dir entry and the path under it collapse together); targets: %v", len(compacted), targetsOf(compacted))
+	}
+	if compacted[0].Target != "/scratch/.cache/go-build/" {
+		t.Fatalf("compacted target = %q, want /scratch/.cache/go-build/", compacted[0].Target)
+	}
+	if compacted[0].Count != 301 {
+		t.Errorf("compacted count = %d, want 301 (the stored 300 + the new record's 1 — mutation m3 would give 2, the number of records)", compacted[0].Count)
+	}
+	// The Time is the latest of the two originals (the new raw path's 11:00).
+	if compacted[0].Time != "2026-11-13T11:00:00Z" {
+		t.Errorf("compacted time = %q, want the latest of the originals (11:00:00Z)", compacted[0].Time)
+	}
+}
+
+// TestLearnSummaryBoundEvictsProcessBeforeConnect covers the re-review P2
+// (class-ordered eviction: egress connects are evicted LAST, after Process
+// records — before the rank-2 fix they shared rank 1 and a count-1 connect
+// lost lowest-count-first to count-5 Process records):
+// 50 Process records with count 5 and one egress connect with count 1; at a
+// bound just under the full body the connect must survive and a Process
+// record must be dropped.
+//
+// Mutation m4 (delete the rank-2 line): the connect (count 1) is the lowest
+// count and is evicted first → this spec fails.
+func TestLearnSummaryBoundEvictsProcessBeforeConnect(t *testing.T) {
+	recs := make([]alerts.Record, 0, 51)
+	for i := range 50 {
+		target := "/bin/p" + strconv.Itoa(200+i) + string(rune('a'+i%26)) + string(rune('a'+i/26))
+		recs = append(recs, alerts.Record{
+			Time:   "2026-11-13T10:00:00Z",
+			Loop:   "l1",
+			Source: alerts.SourceKubeArmor,
+			Action: "Audit",
+			Target: target,
+			Detail: "operation=Process, pod=l1-sandbox",
+			Count:  5,
+		})
+	}
+	recs = append(recs, alerts.Record{
+		Time: "2026-11-13T11:00:00Z", Loop: "l1", Source: alerts.SourceEgress, Action: "connect", Target: "proxy.golang.org:443", Count: 1,
+	})
+	// A bound just under the full rendered body: it forces at least one
+	// eviction (a connect line is >100 bytes, so dropping the connect alone
+	// would still fit; one Process line is also >100 bytes, so the bound
+	// keeps everything but forces the evictions to actually trim size).
+	bound := len(renderLearnRecordsJSONL(recs)) - 100
+	kept, dropped := boundLearnRecords(recs, bound)
+	if dropped < 1 {
+		t.Fatalf("the bound dropped %d records, want >= 1 (the body is over the bound)", dropped)
+	}
+	found := map[string]bool{}
+	for _, r := range kept {
+		found[r.Target] = true
+	}
+	if !found["proxy.golang.org:443"] {
+		t.Fatalf("the bound dropped the egress connect (kept %d, dropped %d); connects are evicted LAST (rank 2) — after every Process record (mutation m4 shares rank 1)", len(kept), dropped)
+	}
+	for _, r := range recs {
+		if r.Source == alerts.SourceKubeArmor && !found[r.Target] {
+			return // a Process record was evicted, as the class order requires
+		}
+	}
+	t.Fatalf("no Process record was evicted (kept %d, dropped %d); the Process records must be evicted before the connect", len(kept), dropped)
+}
+
 // targetsOf returns the targets of the records (for failure messages).
 func targetsOf(recs []alerts.Record) []string {
 	out := make([]string, 0, len(recs))

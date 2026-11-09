@@ -230,7 +230,10 @@ func mergeLearnRecords(existing, new_ []alerts.Record) []alerts.Record {
 // busy-directory collapse (policy.CompactFileTargets) and replaced by ONE
 // record per resulting target (the Loop, Namespace and Source are copied
 // from an original record, the Detail is operation=File, pod=<loop>-sandbox,
-// the Count is the summed count and the Time the latest of the originals).
+// the Count is the SUM of the originals' counts (not the number of originals:
+// the merged input holds the ConfigMap's existing records whose counts are
+// already summed, and counting records would reset them to 1 on every write),
+// and the Time the latest of the originals).
 // Process and egress records pass through unchanged. If the records carry no
 // File records, the input is returned as-is.
 func compactLearnFileRecords(recs []alerts.Record, loopName string) []alerts.Record {
@@ -242,7 +245,8 @@ func compactLearnFileRecords(recs []alerts.Record, loopName string) []alerts.Rec
 	var fileRecs []alerts.Record
 	for _, rec := range recs {
 		if rec.Source == alerts.SourceKubeArmor && strings.HasPrefix(rec.Detail, "operation=File") {
-			targets[rec.Target]++
+			// A stored count of 0 means 1 (alerts.Record.Count: "0 means 1").
+			targets[rec.Target] += int(max(rec.Count, 1))
 			if rec.Time > latestRaw[rec.Target] {
 				latestRaw[rec.Target] = rec.Time
 			}
@@ -259,8 +263,7 @@ func compactLearnFileRecords(recs []alerts.Record, loopName string) []alerts.Rec
 	latest := map[string]string{}
 	rawByEntry := map[string][]string{}
 	for raw := range targets {
-		for entry, c := range compacted {
-			_ = c
+		for entry := range compacted {
 			if raw == entry || strings.HasPrefix(raw, entry) {
 				rawByEntry[entry] = append(rawByEntry[entry], raw)
 			}
@@ -302,9 +305,12 @@ func compactLearnFileRecords(recs []alerts.Record, loopName string) []alerts.Rec
 // lowest-count-first eviction dropped exactly the allows `suggest` exists to
 // find — the one egress connect and a rare exec — while keeping a thousand
 // go-build cache paths): kubearmor operation=File records first (lowest
-// count, ties by key), then Process records, and egress-proxy connects LAST
-// (only when nothing else is left). `dropped` counts every evicted record.
-// The kept records stay in key order.
+// count, ties by key), then Process records (rank 1), and egress-proxy
+// connects LAST (rank 2, only when nothing else is left) — connects are a
+// separate class from Process because a count-1 connect is the most valuable
+// allow in the summary and must never lose a lowest-count tie to a Process
+// record. `dropped` counts every evicted record. The kept records stay in
+// key order.
 func boundLearnRecords(recs []alerts.Record, bound int) ([]alerts.Record, int64) {
 	if bound <= 0 {
 		return nil, int64(len(recs))
@@ -336,10 +342,14 @@ func boundLearnRecords(recs []alerts.Record, bound int) ([]alerts.Record, int64)
 		if cnt == 0 {
 			cnt = 1
 		}
-		// Class rank: File records evicted first, then Process, connects last.
+		// Class rank: File records evicted first (0), then Process (1),
+		// connects last (2).
 		rank := 1
 		if rec.Source == alerts.SourceKubeArmor && strings.HasPrefix(rec.Detail, "operation=File") {
 			rank = 0
+		}
+		if rec.Source == alerts.SourceEgress {
+			rank = 2
 		}
 		cands = append(cands, cand{idx: i, cnt: cnt, key: alerts.LearnKey(rec), size: sizes[i], rank: rank})
 	}

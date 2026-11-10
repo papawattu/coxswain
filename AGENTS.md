@@ -213,6 +213,7 @@ make test       # Run unit tests
   into a harness that stubs the external commands (a fake `kubectl` on the
   PATH), and run it — don't paraphrase the logic into a test that may diverge
   from the committed script.
+- **A pod-script change that touches a volume shared across containers or Jobs needs a kind run** (R55 I263(c)). An execution test runs every step as one uid, so it cannot see a failure that depends on who owns the volume (git's `safe.directory` "dubious ownership" check, file modes, fsGroup). F67 (#331) merged with "Kind: not required" and broke every PR delivery in v0.1.3; only the J1d kind run found it. "Kind: not required" is acceptable only when no shared volume is involved, and the PR says so.
 - When a reviewer names a mutation, the builder applies **exactly** that diff
   in a scratch worktree and records the result. A broader mutation doesn't
   count.

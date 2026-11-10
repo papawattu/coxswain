@@ -46,6 +46,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -206,6 +207,10 @@ func verdictLine(v judge.Verdict, truncated bool) string {
 	return string(b) + "\n"
 }
 
+// proxyURLRe matches a Go url.Error's quoted-URL shape (I268: the cause
+// must keep the error, not the URL that can use up the whole cap).
+var proxyURLRe = regexp.MustCompile(`(Post|Get) "[^"]*": `)
+
 // unavailableLine renders the failure line:
 // {"unavailable":"<cause>","truncated":bool} with the cause bounded to
 // unavailableCauseMax characters and one line. Nothing from the env is
@@ -214,6 +219,11 @@ func unavailableLine(cause string, truncated bool) string {
 	cause = strings.ReplaceAll(cause, "\r", " ")
 	cause = strings.ReplaceAll(cause, "\n", " ")
 	cause = strings.ReplaceAll(cause, "\t", " ")
+	// I268: a Go url.Error cause embeds the full proxy URL, which can use up
+	// the entire 120-rune budget and lose the actual error. Before the cap,
+	// replace the quoted URL with the bare token <proxy> so the cause keeps
+	// the error, not the URL.
+	cause = proxyURLRe.ReplaceAllString(cause, "$1 <proxy>: ")
 	if r := []rune(cause); len(r) > unavailableCauseMax {
 		cause = string(r[:unavailableCauseMax])
 	}

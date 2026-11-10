@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -258,5 +259,60 @@ func TestHugeDiffIsTruncated(t *testing.T) {
 	// not fail the call).
 	if verdict, ok := m["verdict"].(bool); !ok || verdict {
 		t.Fatalf("verdict = %v, want false", m["verdict"])
+	}
+}
+
+// TestUnavailableLineReplacesProxyURL (I268): the unavailable cause must
+// keep the ERROR, not the URL. A Go url.Error cause embeds the full proxy
+// URL, which can use up the entire 120-rune budget and lose the actual
+// error. The fix replaces the quoted URL with the bare token <proxy>
+// BEFORE the cap.
+func TestUnavailableLineReplacesProxyURL(t *testing.T) {
+	const kindCause = `judge call: judge: call failed: Post ` +
+		`"http://j1d-honest-proxy.samples.svc.cluster.local:8080/v1/chat/completions": ` +
+		"context deadline exceeded (Client.Timeout exceeded while awaiting headers)"
+	tests := []struct {
+		name        string
+		cause       string
+		wantContain string
+		wantAbsent  string
+	}{
+		{
+			name:        "the exact kind-evidence cause keeps the error, not the URL",
+			cause:       kindCause,
+			wantContain: "context deadline exceeded",
+			wantAbsent:  "http://",
+		},
+		{
+			name:        "a cause without a URL is unchanged",
+			cause:       `judge call: judge: call failed: connection refused`,
+			wantContain: "connection refused",
+		},
+		{
+			name:       "a 300-character cause without a URL is still capped at 120 runes",
+			cause:      `judge call: judge: call failed: ` + strings.Repeat("x", 290),
+			wantAbsent: `judge call: judge: call failed: ` + strings.Repeat("x", 281),
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := unavailableLine(tc.cause, false)
+			if tc.wantContain != "" && !strings.Contains(got, tc.wantContain) {
+				t.Errorf("line must contain %q; got %s", tc.wantContain, got)
+			}
+			if tc.wantAbsent != "" && strings.Contains(got, tc.wantAbsent) {
+				t.Errorf("line must NOT contain %q; got %s", tc.wantAbsent, got)
+			}
+			// The cap: the "unavailable" field must be at most 120 runes.
+			var m map[string]any
+			if err := json.Unmarshal([]byte(got), &m); err != nil {
+				t.Fatalf("line is not valid JSON: %v; line: %s", err, got)
+			}
+			if u, ok := m["unavailable"].(string); ok {
+				if r := []rune(u); len(r) > 120 {
+					t.Errorf("unavailable field is %d runes; want at most 120; line: %s", len(r), got)
+				}
+			}
+		})
 	}
 }

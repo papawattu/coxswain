@@ -22,7 +22,7 @@
 
 ## P1
 
-- [ ] **I263: v0.1.3 shipped with delivery broken, and no check could have caught it**
+- [x] **I263: v0.1.3 shipped with delivery broken, and no check could have caught it** (`0246a2e`, `c0db1e3`, `a3c5324`)
 
   **Where:** F67, #331 (`d4fe61f`, 10-28), in `deliverImportAgentContainer` (internal/controller/loop_deliver_job.go). `git tag --contains d4fe61f` prints `v0.1.3`.
 
@@ -48,7 +48,7 @@
 
 ## P2
 
-- [ ] **I264: two Loops' deliveries recorded the same PR on Gitea**
+- [x] **I264: two Loops' deliveries recorded the same PR on Gitea** (`9753f8a`)
 
   **Where:** the push container's existing-PR lookup (loop_deliver_job.go, `pulls?state=open&head=…`, then the first list item).
 
@@ -61,7 +61,7 @@
 
   **Acceptance:** the R1 smoke's delivery log shows a "created PR" or "reusing open PR" line whose branch matches the Loop's own.
 
-- [ ] **I265: the Judge's model-proxy ingress repeated P5c's defect**
+- [x] **I265: the Judge's model-proxy ingress repeated P5c's defect** (`b40ed9d`)
 
   **Where:** #467 at dad2c6b. The proxy NetworkPolicy's 8080 ingress listed the agent and memory-writer peers but no Judge peer.
 
@@ -75,7 +75,7 @@
 
   **Acceptance:** that test exists, and the reviewer's mutation that drops any one proxy-ingress peer makes it fail.
 
-- [ ] **I266: the reviewer's J1d kind script needed three runs to test what it meant to**
+- [x] **I266: the reviewer's J1d kind script needed three runs to test what it meant to** (R56 (lab-run18.log:4-12))
 
   **Where:** the scratchpad `lab-run15-j1d.sh`, runs 15a, 15c and 16.
 
@@ -91,7 +91,7 @@
 
   **Acceptance:** the next kind script (R1) states, before its first run, what each Loop must show, and cites the plan line it proves.
 
-- [ ] **I267: the reviewer's builder watcher missed a report, and a slice sat idle about two hours**
+- [x] **I267: the reviewer's builder watcher missed a report, and a slice sat idle about two hours** (R56 (no missed report))
 
   **Where:** the F95 watcher (scratchpad, 11-10 ~00:05Z to 02:53Z).
 
@@ -103,7 +103,7 @@
 
 ## P3
 
-- [ ] **I268: the Judge's unavailable cause keeps the URL and drops the error**
+- [x] **I268: the Judge's unavailable cause keeps the URL and drops the error** (`bb4c0b8`)
 
   **Where:** cmd/judge/main.go, `unavailableCauseMax = 120`.
 

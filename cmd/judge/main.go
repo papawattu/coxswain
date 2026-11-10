@@ -207,12 +207,14 @@ func verdictLine(v judge.Verdict, truncated bool) string {
 	return string(b) + "\n"
 }
 
+// proxyURLRe matches a Go url.Error's quoted-URL shape (I268: the cause
+// must keep the error, not the URL that can use up the whole cap).
+var proxyURLRe = regexp.MustCompile(`(Post|Get) "[^"]*": `)
+
 // unavailableLine renders the failure line:
 // {"unavailable":"<cause>","truncated":bool} with the cause bounded to
 // unavailableCauseMax characters and one line. Nothing from the env is
 // echoed (the cause names the failure class, not the input).
-var proxyURLRe = regexp.MustCompile(`(Post|Get) "[^"]*": `)
-
 func unavailableLine(cause string, truncated bool) string {
 	cause = strings.ReplaceAll(cause, "\r", " ")
 	cause = strings.ReplaceAll(cause, "\n", " ")

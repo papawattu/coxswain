@@ -1215,9 +1215,9 @@ fi
 export GIT_ALTERNATE_OBJECT_DIRECTORIES="${SRC}/.git/objects"
 if ! (
   cd "${DEST}" &&
-  git -c core.hooksPath=/dev/null rev-list --objects "${PINNED}" \
+  git -c core.hooksPath=/dev/null ` + deliverSafeDirs() + ` rev-list --objects "${PINNED}" \
     | cut -d' ' -f1 \
-    | git -c core.hooksPath=/dev/null pack-objects .git/objects/pack/pack
+    | git -c core.hooksPath=/dev/null ` + deliverSafeDirs() + ` pack-objects .git/objects/pack/pack
 ); then
   echo "deliver import-agent: could not copy the pinned commit's objects out of the agent workspace; refusing"
   exit 1

@@ -129,5 +129,5 @@ These are settled — see ADRs and CONTEXT.md. Listed here so the plan and the m
 ## Before Phase 0
 
 - [x] Confirm the API group string is unused — done by renaming the group to `coxswain.wattu.com` (owned domain; commit e5027e9). CNCF landscape check for a "Coxswain" entry remains below.
-- [ ] Check the CNCF landscape for an existing "Coxswain" entry
+- [x] Check the CNCF landscape for an existing "Coxswain" entry (R56: none)
 - [ ] Read the agent-sandbox README end to end; note install prerequisites and the `sandboxd` model

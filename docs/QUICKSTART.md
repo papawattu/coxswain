@@ -521,8 +521,8 @@ make egress-proxy-build EGRESS_IMG=coxswain-egress-proxy:$BUILD_TAG
 # lines are the release workflow's own mapping (.github/workflows/release.yml:
 # the model-proxy and tool-proxy matrix rows, context "."), so they build the
 # same images a release does, with no build args:
-docker build -t coxswain-model-proxy:$BUILD_TAG -f cmd/model-proxy/Dockerfile .
-docker build -t coxswain-tool-proxy:$BUILD_TAG -f cmd/tool-proxy/Dockerfile .
+DOCKER_BUILDKIT=1 docker build -t coxswain-model-proxy:$BUILD_TAG -f cmd/model-proxy/Dockerfile .
+DOCKER_BUILDKIT=1 docker build -t coxswain-tool-proxy:$BUILD_TAG -f cmd/tool-proxy/Dockerfile .
 
 # All five images are needed: the tag/save/load block below is fixed at five.
 # tool-proxy is built even though this Loop uses no tools — §9 is a

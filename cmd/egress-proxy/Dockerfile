@@ -4,12 +4,15 @@
 #
 # UID 65534 (nonroot) — distinct from the agent (65532) and the model proxy
 # (65533), per ADR-0007's hardening parity table.
-FROM golang:1.26 AS build
+FROM --platform=$BUILDPLATFORM golang:1.26 AS build
+ARG TARGETOS
+ARG TARGETARCH
+
 WORKDIR /app
 COPY go.mod go.sum ./
 COPY cmd/egress-proxy/main.go ./cmd/egress-proxy/main.go
 COPY internal/egress/ ./internal/egress/
-RUN CGO_ENABLED=0 go build -o /app/egress-proxy ./cmd/egress-proxy
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -o /app/egress-proxy ./cmd/egress-proxy
 
 FROM gcr.io/distroless/static:nonroot
 COPY --from=build /app/egress-proxy /usr/local/bin/egress-proxy

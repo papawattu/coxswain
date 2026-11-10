@@ -36,7 +36,7 @@ kubectl apply -f config/crd/external/agents.x-k8s.io_sandboxes.yaml
 kubectl apply -f config/crd/bases/coxswain.wattu.com_loops.yaml
 
 # operator image
-docker build -t coxswain-operator:dev -f Dockerfile .
+DOCKER_BUILDKIT=1 docker build -t coxswain-operator:dev -f Dockerfile .
 kind load docker-image coxswain-operator:dev --name coxswain
 
 # ns + rbac + manager (override the scaffold's hardcoded namespace: system →

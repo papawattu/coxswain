@@ -18,6 +18,11 @@ endif
 # tools. (i.e. podman)
 CONTAINER_TOOL ?= docker
 
+# C1: the Dockerfiles use FROM --platform=$BUILDPLATFORM (cross-compiled
+# multi-arch images), which needs BuildKit; Docker 20.10's legacy builder
+# fails on it. Every $(CONTAINER_TOOL) build below inherits this.
+export DOCKER_BUILDKIT=1
+
 # Setting SHELL to bash allows bash commands to be executed by recipes.
 # Options are set to exit when a recipe line exits non-zero or a piped command fails.
 SHELL = /usr/bin/env bash -o pipefail

@@ -10,17 +10,17 @@
 # runner/go.mod — the root module does not build it). The agent runs as the
 # platform non-root UID (65532, set by the operator's securityContext), so the
 # binary must be readable/executable by that UID (it is: 0755 root-owned).
-FROM golang:1.26 AS build
+FROM --platform=$BUILDPLATFORM golang:1.26 AS build
 WORKDIR /src
 # The runner is a separate module (runner/go.mod); the root go.mod does not
 # cover it. Copy the sources and build hermetically (GOFLAGS=-mod=mod so a
 # missing go.sum is written from the module cache rather than failing the
 # COPY). The build is for the target platform, not the builder's.
 COPY runner/ ./
-ARG TARGETOS=linux
-ARG TARGETARCH=amd64
+ARG TARGETOS
+ARG TARGETARCH
 ENV CGO_ENABLED=0
-RUN GOFLAGS=-mod=mod GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -o /out/runner ./cmd
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} GOFLAGS=-mod=mod go build -o /out/runner ./cmd
 
 FROM golang:1.26
 RUN apt-get update && apt-get install -y --no-install-recommends \

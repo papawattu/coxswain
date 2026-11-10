@@ -1400,25 +1400,31 @@ EXISTING=$(curl -sfS -H "$API_AUTH" "${API_BASE}/repos/${OWNER}/${REPO_NAME}/pul
 # Top-level JSON fields via python3 (no jq in the push image): number and
 # html_url come from the PR OBJECT ITSELF — a nested object (head/parent
 # repos, etc.) with its own number/html_url must not be picked (I53).
+# F96: the list item must be an open PR whose head.ref IS this branch —
+# the branch is passed in as sys.argv[1] (never spliced into the python
+# source). No match means empty output, so the script creates a PR.
 PR_NUM=$(printf '%s' "${EXISTING}" | tr -d '\n' | python3 -c 'import json,sys
 try:
+    branch=sys.argv[1]
     a=json.load(sys.stdin)
-    pr=a[0] if isinstance(a,list) and a else a
-    print(int(pr["number"]))
+    pr=next((p for p in a if isinstance(p,dict) and p.get("head",{}).get("ref")==branch), None) if isinstance(a,list) else (a if isinstance(a,dict) and a.get("head",{}).get("ref")==branch else None)
+    print(int(pr["number"]) if pr is not None else "")
 except Exception:
-    pass')
+    pass' "${BRANCH}")
 PR_URL=$(printf '%s' "${EXISTING}" | tr -d '\n' | python3 -c 'import json,sys
 try:
+    branch=sys.argv[1]
     a=json.load(sys.stdin)
-    pr=a[0] if isinstance(a,list) and a else a
-    u=pr.get("html_url")
+    pr=next((p for p in a if isinstance(p,dict) and p.get("head",{}).get("ref")==branch), None) if isinstance(a,list) else (a if isinstance(a,dict) and a.get("head",{}).get("ref")==branch else None)
+    u=pr.get("html_url") if pr is not None else None
     print(u if isinstance(u,str) and "/pull" in u else "")
 except Exception:
-    pass')
+    pass' "${BRANCH}")
 if [ -n "${PR_NUM}" ]; then
   # An open PR for the branch: reuse it (idempotent) — an existing PR's body
   # is NOT updated by the operator (the operator's delivery evidence is the
   # pushed commit + the PR URL; the body is set at create time).
+  echo "deliver push: reusing open PR ${PR_NUM} for ${BRANCH}"
   [ -n "${PR_URL}" ] || { echo "deliver push: existing PR ${PR_NUM} has no html_url"; exit 1; }
 else
   # --- the PR body (A4): the FACTS half comes from the operator's ConfigMap
@@ -1471,6 +1477,7 @@ try:
     print(u if isinstance(u,str) and "/pull" in u else "")
 except Exception:
     pass')
+  echo "deliver push: created PR ${PR_NUM} for ${BRANCH}"
 fi
 [ -n "${PR_NUM}" ] || { echo "deliver push: no PR number returned (API unreachable or refused)"; exit 1; }
 [ -n "${PR_URL}" ] || { echo "deliver push: no PR html_url returned"; exit 1; }

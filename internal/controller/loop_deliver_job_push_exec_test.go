@@ -936,6 +936,160 @@ func TestDeliverPushScriptRecordsTopLevelJSONFields(t *testing.T) {
 	}
 }
 
+// TestF96PushIgnoresOpenPRForOtherBranch (F96, lab run 17a): the idempotency
+// lookup must match the branch ITSELF, not just take the first item of the
+// list the provider returned. Two Loops that pushed different branches both
+// recorded prNumber 1 — the script trusted the server-side head filter and
+// took a[0] without checking its head.ref.
+func TestF96PushIgnoresOpenPRForOtherBranch(t *testing.T) {
+	r := &LoopReconciler{CNIProber: testCNIProber()}
+
+	// The remote: a local bare repo (the deliver Job's origin stand-in).
+	remoteDir := t.TempDir()
+	remoteGit := filepath.Join(remoteDir, "remote.git")
+	mustGit(t, remoteDir, "init", "-q", "-b", baseBranch, "--bare", remoteGit)
+
+	// The agent repo: a base commit + one agent commit (the pinned
+	// verifiedCommit).
+	agentRepo := t.TempDir()
+	mustGit(t, agentRepo, "init", "-q", "-b", baseBranch)
+	mustGit(t, agentRepo, "config", "user.email", "agent@coxswain.test")
+	mustGit(t, agentRepo, "config", "user.name", "Agent")
+	writeFile(t, agentRepo, "round.go", "package main\n\nfunc Round(x float64) int { return int(x) }\n")
+	mustGit(t, agentRepo, "add", "-A")
+	mustGit(t, agentRepo, "commit", "-q", "-m", "base")
+	baseSHA := gitSHA(t, agentRepo)
+	mustGit(t, agentRepo, "remote", "add", "origin", remoteGit)
+	mustGit(t, agentRepo, "push", "-q", "origin", baseBranch)
+	writeFile(t, agentRepo, "round.go", "package main\n\nfunc Round(x float64) int { return int(x + 0.5) }\n")
+	mustGit(t, agentRepo, "add", "-A")
+	mustGit(t, agentRepo, "commit", "-q", "-m", "agent: fix rounding")
+	verifySHA := gitSHA(t, agentRepo)
+	if verifySHA == baseSHA {
+		t.Fatal("the agent commit must differ from the base commit")
+	}
+
+	loop := &coxv1alpha1.Loop{
+		ObjectMeta: metav1.ObjectMeta{Name: "f96push"},
+		Spec: coxv1alpha1.LoopSpec{
+			Workspace: coxv1alpha1.Workspace{
+				Repo:                testGiteaExampleRepoURL,
+				Ref:                 baseBranch,
+				GitCredentialSecret: testCredSecretName,
+			},
+			Delivery: &coxv1alpha1.DeliveryConfig{Mode: coxv1alpha1.DeliveryModePullRequest},
+		},
+		Status: coxv1alpha1.LoopStatus{
+			CurrentVerify: &coxv1alpha1.CurrentVerifyStatus{VerifiedCommit: verifySHA},
+		},
+	}
+	branch := deliverBranchName(deliverBranchPrefix(loop), loop.Name, string(loop.UID))
+
+	credsDir := t.TempDir()
+	mustWriteFile(t, filepath.Join(credsDir, workspaceCredsUsernameKey), []byte("samples"))
+	mustWriteFile(t, filepath.Join(credsDir, workspaceCredsPasswordKey), []byte("s3cret-pw"))
+
+	newScratch := func() string {
+		scratch := t.TempDir()
+		mustGit(t, scratch, "clone", "-q", remoteGit, ".")
+		mustGit(t, scratch, "-c", "protocol.file.allow=always", "-c", "core.hooksPath=/dev/null",
+			"fetch", "file://"+agentRepo+"/.git", verifySHA)
+		mustGit(t, scratch, "checkout", "-q", "--detach", verifySHA)
+		mustGit(t, scratch, "remote", "set-url", "origin", remoteGit)
+		return scratch
+	}
+
+	// runPush runs the REAL push script against the fake API (a Gitea stand-in
+	// whose GET /pulls returns the open-PR list the test supplies — head.ref
+	// controlled per case, as the Gitea lab run 17a observed a wrong-branch
+	// item) and returns the combined output, the parsed termination outcome,
+	// and the recorded PR-create POSTs.
+	runPush := func(openPRList string) (string, deliverOutcome, int) {
+		repoPath := "/repos/samples/gocli"
+		var mu sync.Mutex
+		var posts int
+		mux := http.NewServeMux()
+		mux.HandleFunc(repoPath, func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(w, `{"name":"gocli","default_branch":"%s"}`, baseBranch)
+		})
+		mux.HandleFunc(repoPath+"/pulls", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			if r.Method == http.MethodGet {
+				_, _ = w.Write([]byte(openPRList))
+				return
+			}
+			_, _ = io.ReadAll(r.Body)
+			mu.Lock()
+			posts++
+			mu.Unlock()
+			_, _ = fmt.Fprintf(w, `{"number":2,"state":"open","draft":true,"html_url":"http://gitea.example:3000/samples/gocli/pulls/2"}`)
+		})
+		srv := httptest.NewServer(mux)
+		t.Cleanup(srv.Close)
+
+		scratch := newScratch()
+		pushScript := deliverContainerScript(t, r.deliverPushContainer(loop, verifySHA, branch, baseBranch))
+		termFile := filepath.Join(t.TempDir(), "termination-log")
+		pushScript = strings.ReplaceAll(pushScript, deliverScratchPath, scratch)
+		pushScript = strings.ReplaceAll(pushScript, "/workspace-creds", credsDir)
+		pushScript = strings.ReplaceAll(pushScript, "/dev/termination-log", termFile)
+		wantAPIBase := "'" + deliverAPIBase(testGiteaExampleRepoURL, deliverProviderGitea) + "'"
+		if !strings.Contains(pushScript, wantAPIBase) {
+			t.Fatalf("push script does not carry the expected API_BASE %q (did the shape change?)", wantAPIBase)
+		}
+		pushScript = strings.ReplaceAll(pushScript, wantAPIBase, "'"+srv.URL+"'")
+		pushPath := filepath.Join(t.TempDir(), "push.sh")
+		mustWriteFile(t, pushPath, []byte(pushScript))
+		out, err := exec.Command("sh", pushPath).CombinedOutput()
+		if err != nil {
+			t.Fatalf("push script failed; want 0. err: %v, output: %s", err, out)
+		}
+		termBytes, rerr := os.ReadFile(termFile)
+		if rerr != nil {
+			t.Fatalf("read the termination log: %v", rerr)
+		}
+		outcome, ok, parseErr := parseDeliverTermination(string(termBytes), loop)
+		if !ok {
+			t.Fatalf("the termination message did not parse: %v; message: %q", parseErr, string(termBytes))
+		}
+		return string(out), outcome, posts
+	}
+
+	// Case 1: the open PR the provider returns belongs to ANOTHER branch.
+	// The script must ignore it and CREATE a PR (the operator must never
+	// record a PR it did not create for a different branch).
+	t.Run("open PR for another branch is ignored; a new PR is created", func(t *testing.T) {
+		openPR := `[{"number":1,"html_url":"http://gitea.example:3000/samples/gocli/pulls/1","head":{"ref":"some-other-branch"}}]`
+		out, outcome, posts := runPush(openPR)
+		if outcome.PRNumber != 2 {
+			t.Fatalf("termination prNumber %d; want the CREATED PR's number 2 (the other branch's open PR 1 must not be recorded)", outcome.PRNumber)
+		}
+		if !strings.Contains(out, "deliver push: created PR 2 for "+branch) {
+			t.Fatalf("the log must say it created PR 2 for the branch; output: %s", out)
+		}
+		if posts != 1 {
+			t.Fatalf("the script must POST exactly once to create the PR (the open PR for another branch must not be reused); POSTs: %d", posts)
+		}
+	})
+
+	// Case 2: the open PR the provider returns IS for this branch. The
+	// script must REUSE it (idempotent) — no create POST.
+	t.Run("open PR for this branch is reused; no create", func(t *testing.T) {
+		openPR := `[{"number":7,"html_url":"http://gitea.example:3000/samples/gocli/pulls/7","head":{"ref":"` + branch + `"}}]`
+		out, outcome, posts := runPush(openPR)
+		if outcome.PRNumber != 7 {
+			t.Fatalf("termination prNumber %d; want the EXISTING PR's number 7", outcome.PRNumber)
+		}
+		if !strings.Contains(out, "deliver push: reusing open PR 7 for "+branch) {
+			t.Fatalf("the log must say it is reusing open PR 7; output: %s", out)
+		}
+		if posts != 0 {
+			t.Fatalf("the script must NOT create a PR when one is open for the branch; it POSTed %d times", posts)
+		}
+	})
+}
+
 // P5e (R28 I94, #174 P1, R31 M2): the deliver push container script must
 // carry PR_TITLE = deliverytitle.Title(goal) so the PR title matches the
 // commit subject. M2 mutation: the script ignores the goal and uses a

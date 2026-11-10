@@ -283,7 +283,7 @@ func verifyJobLabels(loopName string) map[string]string {
 // The main container is a no-op (the inits do the work; the main is there
 // because a Job pod requires a main container — it exits 0 immediately).
 func (r *LoopReconciler) ensureVerifyJob(ctx context.Context, loop *coxv1alpha1.Loop) error {
-	if loop.Status.Phase != coxv1alpha1.LoopPhaseVerifying || loopHoldingForDelivery(loop) {
+	if loop.Status.Phase != coxv1alpha1.LoopPhaseVerifying || loopHeldAfterVerify(loop) {
 		return nil
 	}
 	if loop.Status.CurrentVerify == nil || loop.Status.CurrentVerify.VerifiedCommit == "" {
@@ -2078,7 +2078,7 @@ func clearTamperRecord(v *coxv1alpha1.VerifyStatus) {
 // maxIterations cap bounds the iterate: when the increment would exceed it,
 // the Loop is Failed:MaxIterationsExceeded instead of iterating.
 func (r *LoopReconciler) applyVerifyOutcome(ctx context.Context, loop *coxv1alpha1.Loop) (bool, bool) {
-	if loop.Status.Phase != coxv1alpha1.LoopPhaseVerifying || loopHoldingForDelivery(loop) {
+	if loop.Status.Phase != coxv1alpha1.LoopPhaseVerifying || loopHeldAfterVerify(loop) {
 		// P5f: a Loop held for delivery has already passed verify.
 		return false, false
 	}

@@ -169,7 +169,7 @@ func (r *LoopReconciler) applyBudget(ctx context.Context, loop *coxv1alpha1.Loop
 	// P5f: a Loop held for delivery (Verifying+Delivering) already passed
 	// verify; its clock is stopped like a terminal Loop's, and no budget
 	// decision may fail it (it would lose the delivery result).
-	if !loopPaused(loop) && !isTerminalPhase(loop.Status.Phase) && !loopHoldingForDelivery(loop) {
+	if !loopPaused(loop) && !isTerminalPhase(loop.Status.Phase) && !loopHeldAfterVerify(loop) {
 		b := loop.Status.Budget
 		// D79(b): a Loop waiting at AwaitingApproval does not use up its wall
 		// clock. Nothing is added, but the stamp below is still refreshed, so
@@ -253,7 +253,7 @@ func (r *LoopReconciler) applyBudget(ctx context.Context, loop *coxv1alpha1.Loop
 	// phase action does not fire). The decision runs AFTER the verify/stall
 	// decisions (item 8: a phase already changed by the stall decision is seen
 	// here and the budget decision is inert).
-	if !loopPaused(loop) && isPausablePhase(loop.Status.Phase) && !loopHoldingForDelivery(loop) {
+	if !loopPaused(loop) && isPausablePhase(loop.Status.Phase) && !loopHeldAfterVerify(loop) {
 		r.applyBudgetDecision(ctx, loop)
 	}
 
@@ -310,7 +310,7 @@ func (r *LoopReconciler) applyBudgetHoldGate(ctx context.Context, loop *coxv1alp
 		return false
 	}
 	// Inert states: Paused (P2f), the P5f delivery hold, and terminal phases.
-	if loopPaused(loop) || isTerminalPhase(loop.Status.Phase) || loopHoldingForDelivery(loop) {
+	if loopPaused(loop) || isTerminalPhase(loop.Status.Phase) || loopHeldAfterVerify(loop) {
 		return false
 	}
 	held := conditionTruePresent(loop, coxv1alpha1.BudgetReadingStaleCondition)

@@ -48,14 +48,21 @@
 package controller
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
 )
@@ -203,6 +210,57 @@ func judgeJobName(loop *coxv1alpha1.Loop) string {
 	// (status.iteration, 0-based; <= 0 maps to 1) by replacing the
 	// "-verify-" component with "-judge-".
 	return replaceSuffix(verifyJobName(loop), "-verify-", "-judge-")
+}
+
+// judgeEnabled reports whether this Loop opted into the advisory Judge
+// (ADR-0011, J1c3): spec.verify.judge is present AND .enabled is true. A
+// nil judge config (never defaulted) or an explicit enabled: false both
+// disable it — the Judge is opt-in and never runs without the flag.
+// judgeSettleStep is the Reconcile-facing wrapper around ensureJudgeAndSettle:
+// it runs the Judge hold decision and folds any change into the caller's
+// changed flag and requeue flag so Reconcile gains no branch (it sits at its
+// gocyclo budget, as the memory-writer and F62 alert-relay steps do). It is
+// a no-op when the Loop is not held for the Judge.
+func (r *LoopReconciler) judgeSettleStep(ctx context.Context, loop *coxv1alpha1.Loop, changed, requeue *bool) error {
+	judgeRequeue, err := r.ensureJudgeAndSettle(ctx, loop, changed)
+	*requeue = *requeue || judgeRequeue
+	return err
+}
+
+func judgeEnabled(loop *coxv1alpha1.Loop) bool {
+	return loop.Spec.Verify.Judge != nil &&
+		loop.Spec.Verify.Judge.Enabled
+}
+
+// loopHoldingForJudge (ADR-0011, J1c3) reports whether the Loop passed
+// verify but is held at phase Verifying (condition Verifying=True, reason
+// Judging) until the Judge Job is terminal — the hold is carried ONLY by
+// this condition's reason (the operator is its single writer: applyVerifySucceeded
+// sets it, ensureJudgeAndSettle releases it), the same scheme as the
+// delivery hold (loopHoldingForDelivery, P5f I98 D69 option i).
+func loopHoldingForJudge(loop *coxv1alpha1.Loop) bool {
+	if loop.Status.Phase != coxv1alpha1.LoopPhaseVerifying {
+		return false
+	}
+	for i := range loop.Status.Conditions {
+		c := &loop.Status.Conditions[i]
+		if c.Type == string(coxv1alpha1.LoopPhaseVerifying) {
+			return c.Status == metav1.ConditionTrue && c.Reason == coxv1alpha1.ReasonVerifyingJudging
+		}
+	}
+	return false
+}
+
+// loopHeldAfterVerify reports whether the Loop passed verify but is held at
+// phase Verifying by either the Judge hold (reason Judging, ADR-0011) or the
+// delivery hold (reason Delivering, P5f). It replaces loopHoldingForDelivery
+// at the call sites that gate verify-Job recreation, budget, and pause: a
+// Judge-held Loop is past verify, so the verify Job is not recreated, the
+// budget does not fire, and the sandbox is not treated as running. The
+// delivery-specific gates (deliveryPhaseActive, settleDeliveryHold) remain
+// Delivering-only.
+func loopHeldAfterVerify(loop *coxv1alpha1.Loop) bool {
+	return loopHoldingForDelivery(loop) || loopHoldingForJudge(loop)
 }
 
 // replaceSuffix replaces a (guaranteed) substring in s and returns the
@@ -607,4 +665,366 @@ func judgeNetworkPolicy(loop *coxv1alpha1.Loop) *networkingv1.NetworkPolicy {
 		}
 	}
 	return desired
+}
+
+// J1c3 (ADR-0011): the Judge Job RECONCILE WIRING.
+//
+// ensureJudgeAndSettle is the Reconcile-side counterpart of buildJudgeJob
+// (J1c2): when the Loop is held at Verifying for the Judge (reason Judging,
+// loopHoldingForJudge) it ensures the Judge NetworkPolicy + Job (both owned
+// by the Loop) and decides the hold:
+//
+//   - Job in progress (neither Complete nor Failed) -> requeue, NO decision
+//     (the I49 norm: a still-running Judge is not a verdict);
+//   - Job Complete -> read the judge container's termination message and
+//     parse the fixed-shape verdict ({"verdict","score","reason",
+//     "truncated"}): record it on status.judge + the JudgeVerdict condition
+//     (True/False, reason Judged) + a Normal Event;
+//   - {"unavailable",...} OR unparsable OR Job Failed (incl.
+//     DeadlineExceeded) OR a buildJudgeJob error -> status.judge {Verdict
+//     nil, Reason=cause} + JudgeVerdict=Unknown (reason JudgeUnavailable) +
+//     a Warning Event (D124: a fallback must surface its failure before it
+//     degrades — the verdict is never read as a pass or a fail);
+//   - then RELEASE the hold: delivery enabled -> Verifying=True reason
+//     Delivering (the existing P5f hold, so deliverDraft sees status.judge);
+//     otherwise Succeeded exactly as applyVerifySucceeded's non-delivery
+//     branch (phase + desiredPhase + bumpLoopCompletion).
+//
+// The hold is released even when the Judge is disabled mid-hold
+// (spec.verify.judge cleared after the hold was set): no Job is created and
+// the Loop proceeds with no verdict.
+
+// ensureJudgeAndSettle decides the Judge hold (ADR-0011, J1c3). It acts ONLY
+// while loopHoldingForJudge (phase Verifying, Verifying=True reason Judging);
+// every other state is a no-op (the delivery hold and the non-held paths are
+// untouched). It returns (requeue, err): a requeue is the in-progress signal
+// (the Job's final reconcile is triggered by the Owns(&batchv1.Job{}) watch
+// plus this 5s RequeueAfter).
+func (r *LoopReconciler) ensureJudgeAndSettle(ctx context.Context, loop *coxv1alpha1.Loop, changed *bool) (bool, error) {
+	if !loopHoldingForJudge(loop) {
+		return false, nil
+	}
+	// Disabled mid-hold (spec.verify.judge cleared after the hold was set):
+	// release with no Job and no verdict (the Loop proceeds exactly as the
+	// judge-off path).
+	if !judgeEnabled(loop) {
+		r.releaseJudgeHold(loop, changed)
+		return false, nil
+	}
+	// The NetworkPolicy BEFORE the Job (the memory-writer's P3-6 ordering:
+	// the judge pod never runs without its fence).
+	if err := r.ensureJudgeNetworkPolicy(ctx, loop); err != nil {
+		return false, fmt.Errorf("ensure judge netpol: %w", err)
+	}
+	job, err := r.ensureJudgeJob(ctx, loop)
+	if err != nil {
+		// A build error (e.g. missing verify inputs) is a Judge failure, not
+		// a controller error (D124: the Loop proceeds — the failure is
+		// surfaced, the verdict is Unknown, never a pass).
+		r.recordJudgeUnavailable(loop, "judge job build failed: "+err.Error())
+		*changed = true
+		r.releaseJudgeHold(loop, changed)
+		return false, nil
+	}
+	// Job Failed (incl. DeadlineExceeded): the Judge's verdict is Unknown
+	// (D124) and the Loop proceeds. Decided before the pod read — the
+	// DeadlineExceeded case leaves a pod that may never reach a terminal
+	// phase (the memory-writer's F73(a) ordering).
+	if jobTerminalCondition(job, batchv1.JobFailed) != nil {
+		cond := jobTerminalCondition(job, batchv1.JobFailed)
+		r.recordJudgeUnavailable(loop, "judge job failed: "+cond.Reason)
+		*changed = true
+		r.releaseJudgeHold(loop, changed)
+		return false, nil
+	}
+	// Job in progress (the Complete condition was checked after Failed; no
+	// conditions at all is also in progress): NO decision, requeue.
+	if jobTerminalCondition(job, batchv1.JobComplete) == nil {
+		return true, nil
+	}
+	// Job Complete: read the judge container's termination message (the
+	// kubelet-recorded verdict; the memory-writer's readMemoryWriterJobPod
+	// pattern) and decide it.
+	msg, err := r.judgeTerminationMessage(ctx, loop, job)
+	if err != nil {
+		// A pod read error is not a decision (the memory-writer's F73(b)):
+		// the Job's own conditions are authoritative and Complete is set —
+		// but the verdict is unread, so it is unavailable (D124).
+		r.recordJudgeUnavailable(loop, "judge verdict unreadable: "+err.Error())
+		*changed = true
+		r.releaseJudgeHold(loop, changed)
+		return false, nil
+	}
+	r.applyJudgeVerdict(loop, msg)
+	*changed = true
+	r.releaseJudgeHold(loop, changed)
+	return false, nil
+}
+
+// ensureJudgeJob returns the current Judge Job: it creates it (idempotently
+// — an existing Job with the name is left untouched, the I65 pattern) when
+// absent and returns the existing one otherwise. The Job is owned by the
+// Loop (controller ref: deleting the Loop garbage-collects it).
+func (r *LoopReconciler) ensureJudgeJob(ctx context.Context, loop *coxv1alpha1.Loop) (*batchv1.Job, error) {
+	name := judgeJobName(loop)
+	existing := &batchv1.Job{}
+	err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: loop.Namespace}, existing)
+	if err == nil {
+		return existing, nil
+	}
+	if !apierrors.IsNotFound(err) {
+		return nil, fmt.Errorf("get judge job %s: %w", name, err)
+	}
+	job, err := r.buildJudgeJob(loop)
+	if err != nil {
+		return nil, err
+	}
+	if err := ctrl.SetControllerReference(loop, job, r.Scheme); err != nil {
+		return nil, fmt.Errorf("set owner on judge job %s: %w", name, err)
+	}
+	if err := r.Create(ctx, job); err != nil {
+		if apierrors.IsAlreadyExists(err) {
+			// A concurrent reconcile created it (or a stale Job's deletion
+			// has not landed): re-read on the next pass, never skip.
+			if gerr := r.Get(ctx, types.NamespacedName{Name: name, Namespace: loop.Namespace}, existing); gerr != nil {
+				return nil, fmt.Errorf("get judge job %s after create: %w", name, gerr)
+			}
+			return existing, nil
+		}
+		return nil, fmt.Errorf("create judge job %s: %w", name, err)
+	}
+	return job, nil
+}
+
+// ensureJudgeNetworkPolicy creates (idempotently) the Judge Job's
+// NetworkPolicy: deny all ingress and egress except the Loop's model proxy
+// and DNS (the memory-writer's ensureMemoryWriterNetworkPolicy pattern —
+// drift against the whole desired spec triggers an update). The NetPol is
+// owned by the Loop (controller ref: the apiserver garbage-collects it on
+// Loop delete).
+func (r *LoopReconciler) ensureJudgeNetworkPolicy(ctx context.Context, loop *coxv1alpha1.Loop) error {
+	desired := judgeNetworkPolicy(loop)
+	if err := ctrl.SetControllerReference(loop, desired, r.Scheme); err != nil {
+		return fmt.Errorf("set the judge netpol %s owner to the Loop: %w", desired.Name, err)
+	}
+	existing := &networkingv1.NetworkPolicy{}
+	err := r.Get(ctx, types.NamespacedName{Name: desired.Name, Namespace: loop.Namespace}, existing)
+	if err == nil {
+		if equality.Semantic.DeepEqual(existing.Spec, desired.Spec) {
+			return nil // already correct
+		}
+		existing.Spec = desired.Spec
+		if err := r.Update(ctx, existing); err != nil {
+			return fmt.Errorf("update drifted judge netpol %s: %w", desired.Name, err)
+		}
+		return nil
+	}
+	if !apierrors.IsNotFound(err) {
+		return fmt.Errorf("get judge netpol %s: %w", desired.Name, err)
+	}
+	if err := r.Create(ctx, desired); err != nil {
+		if apierrors.IsAlreadyExists(err) {
+			return nil
+		}
+		return fmt.Errorf("create judge netpol %s: %w", desired.Name, err)
+	}
+	return nil
+}
+
+// judgeTerminationMessage reads the judge container's termination message
+// from the Judge Job's pod (the I65 pattern: match the pod to the CURRENT
+// Job's UID, not just its name — a recreated Job has a new UID; skip
+// terminating pods). It returns the trimmed termination message (the fixed
+// JSON line the Judge wrote to the termination-message path).
+func (r *LoopReconciler) judgeTerminationMessage(ctx context.Context, loop *coxv1alpha1.Loop, job *batchv1.Job) (string, error) {
+	reader := r.apiReader
+	if reader == nil {
+		reader = r
+	}
+	jobUID := job.UID
+	list := &corev1.PodList{}
+	if err := reader.List(ctx, list,
+		client.InNamespace(loop.Namespace),
+		client.MatchingLabels{judgeForLabel: loop.Name}); err != nil {
+		return "", fmt.Errorf("list judge pods: %w", err)
+	}
+	var pod *corev1.Pod
+	for i := range list.Items {
+		p := &list.Items[i]
+		if p.DeletionTimestamp != nil {
+			continue
+		}
+		if podOwnedByJobUID(p, jobUID) {
+			pod = p
+		}
+	}
+	if pod == nil {
+		return "", fmt.Errorf("no live judge pod for job %s (the pod may have been GC'd)", job.Name)
+	}
+	// The judge container's termination message: the fixed JSON line the
+	// Judge wrote to its termination-message path (the memory-writer's
+	// memoryWriterSummary pattern).
+	for i := range pod.Status.ContainerStatuses {
+		cs := &pod.Status.ContainerStatuses[i]
+		if cs.Name == judgeContainerName && cs.State.Terminated != nil {
+			return strings.TrimSpace(cs.State.Terminated.Message), nil
+		}
+	}
+	return "", fmt.Errorf("the judge container %s has no terminated state on pod %s", judgeContainerName, pod.Name)
+}
+
+// judgeVerdict is the fixed-shape reply the Judge Job reports via its
+// termination message (pkg/judge's output contract, ADR-0011): the operator
+// validates the shape and records the fields, never interprets prose.
+type judgeVerdict struct {
+	// Unavailable is the marker key in the {"unavailable",...} form: the
+	// Judge (cmd/judge) writes it when the model call failed — the operator
+	// records JudgeVerdict=Unknown (D124), never a pass or a fail.
+	Unavailable string `json:"unavailable,omitempty"`
+	// Verdict is the Judge's boolean answer (required in the verdict form).
+	Verdict *bool `json:"verdict,omitempty"`
+	// Score is the Judge's confidence score, 0-100.
+	Score int32 `json:"score,omitempty"`
+	// Reason is the Judge's one-line reason, at most 200 characters. A
+	// longer reason is a malformed reply (unavailable, not a truncation).
+	Reason string `json:"reason,omitempty"`
+	// Truncated is true when the diff exceeded the 256 KiB cap and was
+	// truncated to its first 256 KiB.
+	Truncated bool `json:"truncated,omitempty"`
+}
+
+// applyJudgeVerdict is the decision table for the Judge Job's completion:
+// a parsable verdict form is recorded (True/False, reason Judged, Normal
+// Event); everything else — the unavailable marker, an unparsable line, a
+// missing boolean, an out-of-range score, or an over-long reason — is
+// unavailable (D124: Unknown, reason JudgeUnavailable, Warning Event; the
+// Loop proceeds).
+func (r *LoopReconciler) applyJudgeVerdict(loop *coxv1alpha1.Loop, msg string) {
+	var v judgeVerdict
+	if err := json.Unmarshal([]byte(msg), &v); err != nil || v.Verdict == nil {
+		// A line that does not parse (or lacks the boolean verdict) is an
+		// unavailable line: the Judge's own failure marker is recorded with
+		// its cause, any other garbage is recorded as malformed.
+		if err == nil && v.Verdict == nil && v.Unavailable != "" {
+			r.recordJudgeUnavailable(loop, v.Unavailable)
+			return
+		}
+		r.recordJudgeUnavailable(loop, "malformed judge verdict: "+msg)
+		return
+	}
+	if v.Score < 0 || v.Score > 100 {
+		// A score outside 0..100 is a malformed reply (unavailable, not a
+		// clamped record — the CRD's Min=0/Max=100 would reject the status
+		// write otherwise, and clamping would record a confidence the Judge
+		// did not report).
+		r.recordJudgeUnavailable(loop, "malformed judge verdict: score out of range")
+		return
+	}
+	if len(v.Reason) > judgeReasonMaxChars {
+		// A reason over the 200-character bound is a malformed reply
+		// (unavailable), not a truncated record (the CRD's MaxLength=200
+		// would reject the status write otherwise).
+		r.recordJudgeUnavailable(loop, "malformed judge verdict: reason exceeds 200 characters")
+		return
+	}
+	status := &coxv1alpha1.JudgeStatus{
+		Verdict:   v.Verdict,
+		Score:     v.Score,
+		Reason:    v.Reason,
+		Truncated: v.Truncated,
+		At:        ptrJudgeTime(),
+	}
+	loop.Status.Judge = status
+	cond := metav1.ConditionFalse
+	if *v.Verdict {
+		cond = metav1.ConditionTrue
+	}
+	setCondition(loop, coxv1alpha1.JudgeVerdictCondition, cond, judgeVerdictedReason,
+		"judge verdict recorded (advisory, ADR-0011): verdict "+boolString(*v.Verdict)+", score "+int32String(v.Score))
+	if r.Recorder != nil {
+		r.Recorder.Eventf(loop, corev1.EventTypeNormal, judgeVerdictedReason,
+			"judge verdict: %s (score %d): %s", boolString(*v.Verdict), v.Score, v.Reason)
+	}
+}
+
+// recordJudgeUnavailable records the Judge's unavailability (D124):
+// status.judge {Verdict nil, Reason=cause, At} + JudgeVerdict=Unknown
+// (reason JudgeUnavailable) + a Warning Event. The Loop proceeds exactly as
+// if the Judge had not run — Unknown is never read as a pass or a fail.
+func (r *LoopReconciler) recordJudgeUnavailable(loop *coxv1alpha1.Loop, cause string) {
+	loop.Status.Judge = &coxv1alpha1.JudgeStatus{
+		Reason: truncateJudgeReason(cause),
+		At:     ptrJudgeTime(),
+	}
+	setCondition(loop, coxv1alpha1.JudgeVerdictCondition, metav1.ConditionUnknown,
+		coxv1alpha1.ReasonJudgeUnavailable, "judge unavailable: "+cause)
+	if r.Recorder != nil {
+		r.Recorder.Eventf(loop, corev1.EventTypeWarning, coxv1alpha1.ReasonJudgeUnavailable,
+			"judge unavailable, the Loop proceeds: %s", cause)
+	}
+}
+
+// releaseJudgeHold releases the Judging hold (Verifying=True reason Judging).
+// Delivery enabled -> the Loop moves to the existing delivery hold
+// (Verifying=True reason Delivering) so the deliver Job runs and deliverDraft
+// sees status.judge; otherwise Succeeded exactly as applyVerifySucceeded's
+// non-delivery branch (phase + desiredPhase + bumpLoopCompletion).
+func (r *LoopReconciler) releaseJudgeHold(loop *coxv1alpha1.Loop, changed *bool) {
+	if deliveryEnabled(loop) {
+		// The delivery hold takes over (P5f): the Delivered condition is
+		// terminal-checked by settleDeliveryHold; status.judge rides along
+		// (deliverDraft reads it for the draft + the PR description).
+		setCondition(loop, string(coxv1alpha1.LoopPhaseVerifying), metav1.ConditionTrue,
+			coxv1alpha1.ReasonVerifyingDelivering,
+			"verify passed; judge settled; holding Succeeded until delivery (Delivered condition) is terminal")
+		*changed = true
+		return
+	}
+	setCondition(loop, string(coxv1alpha1.LoopPhaseVerifying), metav1.ConditionFalse,
+		judgeVerdictedReason,
+		"verify passed and the judge is settled (no delivery): the Loop is Succeeded")
+	loop.Status.Phase = coxv1alpha1.LoopPhaseSucceeded
+	loop.Status.DesiredPhase = coxv1alpha1.LoopPhaseSucceeded
+	bumpLoopCompletion("succeeded", "verify_passed")
+	*changed = true
+}
+
+// judgeContainerName is the Judge Job's judge container's name (the
+// termination-message read keys on it).
+const judgeContainerName = "judge"
+
+// judgeReasonMaxChars is the Judge verdict's one-line reason bound (the
+// status.judge.reason MaxLength, loop_types.go). A longer reason is a
+// malformed reply (unavailable).
+const judgeReasonMaxChars = 200
+
+// judgeVerdictedReason is the reason on the JudgeVerdict condition when the
+// verdict was recorded (True or False). Distinct from the hold reason
+// "Judging" (the Verifying condition while the Job runs) and from
+// JudgeUnavailable (the Unknown case, D124).
+const judgeVerdictedReason = "Judged"
+
+func ptrJudgeTime() *metav1.Time {
+	t := metav1.NewTime(time.Now())
+	return &t
+}
+
+func boolString(b bool) string {
+	if b {
+		return "true"
+	}
+	return "false"
+}
+
+func int32String(i int32) string {
+	return fmt.Sprintf("%d", i)
+}
+
+// truncateJudgeReason bounds the unavailable-cause text to the 200-character
+// reason field (the cause can be a long build error; the record must fit).
+func truncateJudgeReason(s string) string {
+	if len(s) <= judgeReasonMaxChars {
+		return s
+	}
+	return s[:judgeReasonMaxChars-1] + "…"
 }

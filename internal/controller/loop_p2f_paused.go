@@ -157,7 +157,7 @@ func (r *LoopReconciler) loopSandboxStopped(loop *coxv1alpha1.Loop) bool {
 	return loopPaused(loop) ||
 		loop.Status.Phase == coxv1alpha1.LoopPhaseSucceeded ||
 		loop.Status.Phase == coxv1alpha1.LoopPhaseFailed ||
-		loopHoldingForDelivery(loop) // P5f: Verifying+Delivering hold (D69)
+		loopHeldAfterVerify(loop) // P5f: Verifying hold (Delivering D69 / Judging ADR-0011)
 }
 
 // sandboxOperatingMode is the P2f suspension gate: desired OperatingMode =

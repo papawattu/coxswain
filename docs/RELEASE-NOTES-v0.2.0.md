@@ -11,9 +11,16 @@ landed as, like `RELEASE-NOTES-v0.1.3.md`.
 - **The status VAP** (P6c): a ValidatingAdmissionPolicy that rejects every `loops/status` write except the operator's own ServiceAccount.
 - **`cox retry`** (D86, D116): a one-shot annotation that resumes a Loop failed with `SandboxFailed` from its checkpoint without losing its history.
 - **Node placement** (C2): `--loop-node-selector` and `--loop-tolerations` operator flags pin every operator-owned Loop workload to a dedicated node pool.
+- **The advisory Judge** (ADR-0011): opt-in via `spec.verify.judge`, a second model surface that asks — after the acceptance checks pass — whether the change meets the goal without gaming the acceptance. A false verdict makes delivery a draft; a true or Unknown verdict leaves `spec.delivery.draft` exactly as it is.
 - **Multi-arch images** (C1): linux/amd64 + linux/arm64 release images — pending the release workflow push.
 
 ## Upgrade
+
+### Known defect in v0.1.3: PR delivery fails on kind (F67) — fixed by #468
+
+- v0.1.3's deliver Job refused its workspace with git "detected dubious ownership", so `spec.delivery` Loops did not open a PR (cause: F67's git calls lacked `safe.directory`; fixed by F95, PR #468).
+- PR #469 (F96): the existing-PR lookup now matches the Loop's own branch, so two Loops no longer report the same PR.
+- Users of v0.1.3 with `spec.delivery` should upgrade to v0.2.0; there is no v0.1.4 (owner decision D128 = (a)).
 
 ### D84b (F77): a completed rollback re-verifies at the restored iteration — #400
 
@@ -45,6 +52,16 @@ For a learn-mode Loop (every referenced policy `auditOnly`), the operator keeps 
 When the Kubernetes client setup fails (a missing or broken kubeconfig), `kubectl cox` commands now exit with that kubeconfig error from the CLI pre-run, instead of running without a client and failing later at the first API call.
 
 ## New features
+
+### The advisory Judge (ADR-0011) — #455, #459, #460, #461, #462, #463, #465, #467
+
+**What it is:** a second, advisory model surface (after the Memory Curator). After the acceptance checks pass, the operator creates a Judge Job — a separate Job owned by the Loop, with a proxy+DNS-only NetworkPolicy (not a sidecar in the agent's pod) — that asks the model whether the change meets the goal without gaming the acceptance. The Judge gets the goal, PLAN.md, the diff `baseCommit..verifiedCommit` (capped at 256 KiB, marked `truncated: true` when cut), and each acceptance check's command as the user wrote it, with its exit code and an explicit `(passed|failed)` label. It runs through the Loop's model proxy with its own token cap (`spec.verify.judge.maxTokens`), metered like every other Loop token. The verdict is `{verdict, score 0-100, reason (at most 200 chars)}`, recorded in `status.judge`, a `JudgeVerdict` condition (`True`/`False`/`Unknown`), a history note, and an Event. The operator never interprets prose: it strictly validates the fixed shape (ADR-0002's boundary, applied to the second model surface).
+
+**What the verdict does (advisory, D122):** a **false** verdict makes delivery a draft PR whatever `spec.delivery.draft` says (on Gitea — which has no draft PRs — the draft is the `"WIP: "` title prefix; `internal/controller/loop_deliver_job.go:167-170`), and the verdict is shown in the PR description. It **never changes `Succeeded`** and **never iterates**. A **true** or **Unknown** verdict leaves `spec.delivery.draft` exactly as it is. An **unavailable** Judge (error, timeout, malformed reply) is `Unknown`, reason `JudgeUnavailable`, a Warning Event, and the Loop proceeds — never read as a pass or a fail.
+
+**How to use it:** set `spec.verify.judge.enabled: true` and `spec.verify.judge.maxTokens` (required when enabled; `{enabled: true}` without `maxTokens` is rejected at admission) on the Loop. A Loop without `spec.verify.judge` is unchanged: no Judge Job, no `JudgeVerdict` condition, no model call, no change to the phase machine or the PR draft computation.
+
+**On upgrade:** no change for existing Loops. The field is new and unset means no Judge.
 
 ### P6b: learn mode — auditOnly policies — #405
 
@@ -193,6 +210,14 @@ before.
 **On upgrade:** the first write after the upgrade removes stored lessons that fail the current rules (e.g. a lesson with no file path or error signature, or a short colon credential). Each removal is listed in that Loop's memory-write summary.
 
 ## Other changes
+
+### I268: the Judge's unavailable message keeps the error, not the proxy URL — #471
+
+**What was wrong:** the Judge's unavailable cause was cut to its first 120 characters, and a Go `url.Error` cause embeds the full proxy URL, which for a cluster-internal service uses up the budget and loses the actual error.
+
+**What changed:** `unavailableLine` now replaces the quoted URL with the bare token `<proxy>` before the cap, so the cause keeps the error, not the URL.
+
+**On upgrade:** no action; the unavailable message is shorter and carries the error.
 
 ### F62: the relay parses the KubeArmor agent's stdout; KubeArmor needs logPath=stdout — #408
 

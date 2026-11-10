@@ -12,7 +12,7 @@ landed as, like `RELEASE-NOTES-v0.1.3.md`.
 - **`cox retry`** (D86, D116): a one-shot annotation that resumes a Loop failed with `SandboxFailed` from its checkpoint without losing its history.
 - **Node placement** (C2): `--loop-node-selector` and `--loop-tolerations` operator flags pin every operator-owned Loop workload to a dedicated node pool.
 - **The advisory Judge** (ADR-0011): opt-in via `spec.verify.judge`, a second model surface that asks — after the acceptance checks pass — whether the change meets the goal without gaming the acceptance. A false verdict makes delivery a draft; a true or Unknown verdict leaves `spec.delivery.draft` exactly as it is.
-- **Multi-arch images** (C1): linux/amd64 + linux/arm64 release images — pending the release workflow push.
+- **Multi-arch images** (C1, #473, #477): linux/amd64 + linux/arm64 release images for all five components (controller, runner, model-proxy, egress-proxy, tool-proxy).
 
 ## Upgrade
 

@@ -100,6 +100,14 @@ Self-learning across Loops, per repo.
 - Confirm the `coxswain.wattu.com` group has no collision in the CNCF landscape entry (the group itself is under a domain we own).
 - Tag v0.1.0.
 
+## Phase 8: Verification hardening, then v0.3.0
+
+- Show the Judge's verdict in `kubectl get loop`; flag an unknown or partial verdict like a false one; let the Judge be a different model.
+- Build ADR-0005's diff scan (VerifySuspicious) beside the Judge, and measure the #371 canary probe on kind.
+- Tag v0.3.0. Adoption (dogfooding, a stranger-proof QUICKSTART, the CNCF landscape) follows.
+
+**Done when:** on kind, a planted #371 probe and a hardcoded-inputs trick each end as a flagged draft PR, and an honest change as a ready one. The slices are in [PLAN-PHASE8.md](PLAN-PHASE8.md).
+
 ## Decisions already made (from the design session)
 
 These are settled — see ADRs and CONTEXT.md. Listed here so the plan and the model agree.

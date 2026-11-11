@@ -43,7 +43,7 @@ R55's boxes are ticked in `docs/REVIEW-PHASE1-R55.md` in this commit, each with 
 
 ## P2
 
-- [ ] **I269: the reviewer stated a cause it had not checked: "the script took its evidence before v0.1.3's delivery finished"**
+- [x] **I269: the reviewer stated a cause it had not checked: "the script took its evidence before v0.1.3's delivery finished"** R57 (no unshown cause in the window)
 
   **Where:** the reviewer's messages to the owner, its log, and the first version of its R1 evidence comment on #474 (11-10 ~16:21Z to 16:35Z).
 
@@ -58,7 +58,7 @@ R55's boxes are ticked in `docs/REVIEW-PHASE1-R55.md` in this commit, each with 
 
 ## P3
 
-- [ ] **I270: the reviewer's slips in this window**
+- [x] **I270: the reviewer's slips in this window** R57 (none in the window)
 
   **Where:** the reviewer's brief for #474, and one diff command.
 

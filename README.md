@@ -100,14 +100,21 @@ The operator created an isolated sandbox for the loop, and agent-sandbox started
 kind delete cluster --name coxswain
 ```
 
-## How it works
+## Core concepts
 
-The design, most of which is still being built:
-
-- **Loop** — one goal, one repo, run until it succeeds or fails. New direction means a new Loop.
-- **Operator** — a deterministic state machine. It decides whether a loop succeeded or failed from evidence it gathers itself, never from what the agent claims.
-- **Runner** — the agent inside the sandbox. It plans and writes code; it can't mark its own work as done.
-- **Acceptance checks** — your commands (like `go test ./...`). The operator runs them in a separate, locked-down pod against a pinned commit, and fails the loop if the agent changed the tests. A person reviewing the draft pull request is the final gate.
+- **Loop** — a one-shot object with a single goal. It ends Succeeded or Failed — or Paused when a budget cap or stall fires with a `Pause` action; a new goal is a new Loop, optionally forked from a checkpoint.
+- **Phase** — one of: Pending, Planning, AwaitingApproval, Implementing, Verifying, Succeeded, Failed, Paused, CleaningUp.
+- **Iteration** — one plan→implement→verify cycle. Each iteration produces a commit on the Loop's branch.
+- **Operator** — a deterministic state machine for phase transitions, budgets, stalls, and approvals. It reads exit codes, result files, hashes, and counters; it does not judge the quality of agent output.
+- **Runner** — the in-sandbox one-shot phase driver: one container run per phase. It executes that phase once, writes the result file and a strict claim, and exits; the operator reads the claim and advances the phase.
+- **Sandbox and AgentPolicy** — the agent may do only what a default-deny allowlist policy grants; with no policy it may only run its entrypoint, read/write its own workspace, and talk to the model proxy on localhost. The policy is its own CRD (a cluster-scoped `ClusterAgentPolicy` is optional) and is enforced by an eBPF/LSM engine outside the agent plus a generated NetworkPolicy.
+- **Acceptance checks** — the user-authored verify commands; the only automated gate that can flip a Loop to Succeeded. The operator runs them in a separate, locked-down verify Job against a pinned commit, and a tamper check (an init container diffs the protected check files) fails the iteration if the agent changed them; the canary control passed makes the reason `SubvertedVerify`.
+- **Judge** — an optional model verdict (`spec.verify.judge`) after the acceptance checks pass: does the change game the tests? It is advisory: a false verdict makes the delivery PR a draft, and it never changes whether the Loop succeeded (ADR-0011).
+- **Delivery** — the operator-owned deliver Job opens the PR using the credentials from `spec.workspace.gitCredentialSecret`. It is draft by default; a failed delivery is retried via `cox redeliver`.
+- **Budget and stall** — token, wall-clock, and cost caps on a Loop; on breach the operator applies `onExceeded` (Pause or Fail). A stall is N consecutive iterations with the same normalised failure hash; its action is Fail, Pause, or Continue.
+- **Model proxy and metering** — a per-Loop proxy pod owned by the operator, outside the agent. It reports token usage from its `/coxswain/usage` endpoint; it reports only, and the operator makes the pause/fail decision.
+- **Shared memory and lessons** — a cluster-local, per-repo store of lessons (≤500 chars each) that survive across Loops. It is written only when the Memory Curator — the operator-triggered LLM gate — approves.
+- **Checkpoint** — a VolumeSnapshot of the workspace PVC taken after each successful verify, retained as the last 3 plus all milestones. It is the durability mechanism that forks and rollbacks restore from; it is best-effort by default.
 
 The vocabulary is defined in [CONTEXT.md](CONTEXT.md); the docs index is in [docs/README.md](docs/README.md); the glossary of terms used in the docs is in [docs/GLOSSARY.md](docs/GLOSSARY.md); the operator FAQ is in [docs/FAQ.md](docs/FAQ.md); the design decisions are in [docs/adr/](docs/adr/).
 

@@ -59,9 +59,9 @@ The owner asked to be grilled on the last few decisions. Each answer is recorded
 - **D137 (on D129):** arm64 is built, not run. The release page says so (done), and so do the v0.2.0 notes in this commit (`docs/RELEASE-NOTES-v0.2.0.md:15`). There is no arm64 smoke and no arm64 build in PR CI.
 - **D130:** Phase 8 hardens verification (D131–D136) and ships v0.3.0. Adoption follows: dogfooding the owner's repos, a QUICKSTART a stranger can follow, and the CNCF landscape. The plan is `docs/PLAN-PHASE8.md`, in its own PR for the owner's approval.
 
-**Open (in the Phase 8 plan):**
+**Answered with the Phase 8 plan (owner, 11-12: "approve the plan, D138 and D139 as recommended"):**
 
-- **D138:** the `Judge` column's values and their order. The recommendation is one value, the most serious first: `Suspicious` > `False` > `Truncated` > `Unknown` > `True`.
+- **D138:** the `Judge` column shows one value, the most serious first: `Suspicious` > `False` > `Truncated` > `Unknown` > `True`.
 - **D139:** drop `--prerelease` from `release.yml:117`. This is an owner push.
 
 ## P3

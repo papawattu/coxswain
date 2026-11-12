@@ -485,7 +485,6 @@ func TestDeliverDescriptionJudgeLine(t *testing.T) {
 		t.Errorf("a nil verdict must carry the draft note (D133) (want %q):\n%s", want, got3)
 	}
 
-
 	// 5. Truncated: the suffix is appended to each of the three lines.
 	for name, tc := range map[string]*coxv1alpha1.JudgeStatus{
 		"pass":        {Verdict: &tv, Score: 87, Reason: "ok", Truncated: true},

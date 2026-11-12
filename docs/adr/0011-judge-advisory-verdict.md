@@ -230,3 +230,7 @@ reviewer's capture only.
 
 **What the first capture also showed:** the model returned plain JSON (no
 reasoning preamble), so the strict parse applies as designed.
+
+## Amendment (2026-11-12): Unknown and truncated force a draft (D133)
+
+The owner decided D133 in R57 (`docs/REVIEW-PHASE1-R57.md`). An Unknown verdict (`JudgeUnavailable`) or a truncated diff (`status.judge.truncated`) now delivers the PR as a draft, like a false verdict. This replaces "A **true** or **Unknown** verdict leaves `spec.delivery.draft` exactly as it is" under "Effect (D122, advisory)", and "nothing downstream treats it as either verdict" under "Unavailable (D124)", for the draft only. Unknown is still never read as a pass or a fail, and `Succeeded` is unchanged in every case. The PR description's Judge line says the PR is held as a draft.

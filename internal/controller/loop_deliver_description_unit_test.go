@@ -473,16 +473,18 @@ func TestDeliverDescriptionJudgeLine(t *testing.T) {
 		t.Errorf("a false verdict must render the FAIL line with the draft note (want %q):\n%s", want, got2)
 	}
 
-	// 4. Verdict nil (the Judge was unavailable, D124): the unavailable line.
+	// 4. Verdict nil (the Judge was unavailable, D124; D133 R57: an Unknown
+	// verdict forces a draft, so the line carries the draft note too).
 	l3 := a4FactsLoop()
 	l3.Status.Judge = &coxv1alpha1.JudgeStatus{Score: 0}
 	got3 := render(l3)
 	if want := "- **Judge (advisory):** unavailable"; !strings.Contains(got3, want) {
 		t.Errorf("a nil verdict must render the unavailable line (want %q):\n%s", want, got3)
 	}
-	if strings.Contains(got3, "the PR is held as a draft") {
-		t.Errorf("an unavailable judge must not carry the draft note:\n%s", got3)
+	if want := "- **Judge (advisory):** unavailable (the PR is held as a draft)"; !strings.Contains(got3, want) {
+		t.Errorf("a nil verdict must carry the draft note (D133) (want %q):\n%s", want, got3)
 	}
+
 
 	// 5. Truncated: the suffix is appended to each of the three lines.
 	for name, tc := range map[string]*coxv1alpha1.JudgeStatus{
@@ -495,6 +497,14 @@ func TestDeliverDescriptionJudgeLine(t *testing.T) {
 		if got := render(l); !strings.Contains(got, "(diff truncated)") {
 			t.Errorf("the %s line must carry the truncated suffix:\n%s", name, got)
 		}
+	}
+
+	// 5b. A truncated pass (D133 R57): the pass line carries both the
+	// truncated suffix and the draft note.
+	l5 := a4FactsLoop()
+	l5.Status.Judge = &coxv1alpha1.JudgeStatus{Verdict: &tv, Score: 87, Reason: "ok", Truncated: true}
+	if got := render(l5); !strings.Contains(got, "- **Judge (advisory):** pass, score 87 — ok (diff truncated) (the PR is held as a draft)") {
+		t.Errorf("a truncated pass must carry the truncated suffix and the draft note (D133):\n%s", got)
 	}
 
 	// 6. The line is a pure function of status.judge: a second occurrence of

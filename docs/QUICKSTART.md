@@ -113,12 +113,10 @@ kubectl -n coxswain-system rollout status deploy/coxswain-controller-manager
 
 Fetch the release's `install.yaml` and apply it. It installs the controller
 into the `coxswain-system` namespace (the manifest is namespaced + prefixed
-`coxswain-`). From a release tag (the alphas are prereleases — GitHub's
-`releases/latest` skips them, so pin the tag; the first alpha release is
-`v0.1.0-alpha.1`):
+`coxswain-`). From a release tag (pin it; v0.2.0 is the latest release):
 
 ```sh
-curl -sfL "https://github.com/papawattu/coxswain/releases/download/v0.1.0-alpha.1/install.yaml" \
+curl -sfL "https://github.com/papawattu/coxswain/releases/download/v0.2.0/install.yaml" \
   -o install.yaml
 kubectl apply -f install.yaml
 kubectl rollout status deploy/coxswain-controller-manager -n coxswain-system

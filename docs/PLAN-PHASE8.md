@@ -1,6 +1,6 @@
 # Next phase: Phase 8 — verification hardening, then v0.3.0
 
-**Status:** draft for the owner's approval. The direction (D130) and D131–D137 were decided by the owner on 2026-11-11 (R57). D138 and D139 below are open.
+**Status:** approved by the owner on 2026-11-12, with D138 and D139 as recommended. The direction (D130) and D131–D137 were decided by the owner on 2026-11-11 (R57).
 
 **What carries in:**
 - **D130** (owner, 2026-11-11): Phase 8 hardens verification and ships v0.3.0. Adoption comes after it (see "After Phase 8").
@@ -29,7 +29,7 @@
 ## Why it is safe to take now
 
 - The review backlog is clear (R57). Every slice is advisory. None changes the phase machine or `Succeeded`.
-- Each slice is small and its effect is decided. The open questions are D138 (the column's values) and D139 (the release default).
+- Each slice is small and its effect is decided, including D138 (the column's values) and D139 (the release default).
 
 ## Slices (in order; one PR each, TDD per the AGENTS.md test norms)
 
@@ -132,8 +132,8 @@ This gets its own plan once v0.3.0 ships.
 |---|---|---|---|
 | D130 | What comes after Phase 7? | — | **Harden verification (D131–D136), v0.3.0, then adoption** (owner, 2026-11-11). |
 | D131–D137 | See R57. | — | Decided (owner, 2026-11-11). |
-| D138 | **The `Judge` column's values and their order.** One column shows the Judge and the scan. | **One value, the most serious signal first:** `Suspicious` (scan hit) > `False` > `Truncated` > `Unknown` > `True`. Blank when there is no Judge and no hit. The conditions keep every signal. | |
-| D139 | **The release default.** `release.yml:117` passes `--prerelease`, so v0.3.0 will publish as a prerelease, as v0.2.0 did until the owner promoted it. | **Drop `--prerelease`.** Releases are proven before the tag (R1's method), so a tag is a release. It is a workflow change, so it is an owner push, like #477. | |
+| D138 | **The `Judge` column's values and their order.** One column shows the Judge and the scan. | **One value, the most serious signal first:** `Suspicious` (scan hit) > `False` > `Truncated` > `Unknown` > `True`. Blank when there is no Judge and no hit. The conditions keep every signal. | **As recommended** (owner, 2026-11-12). |
+| D139 | **The release default.** `release.yml:117` passes `--prerelease`, so v0.3.0 will publish as a prerelease, as v0.2.0 did until the owner promoted it. | **Drop `--prerelease`.** Releases are proven before the tag (R1's method), so a tag is a release. It is a workflow change, so it is an owner push, like #477. | **As recommended** (owner, 2026-11-12). |
 
 ## Estimate
 - **Small slices:** H0, J3 and J4 take half a day to a day each.

@@ -34,7 +34,7 @@ may create policies is a different RBAC role from who may create Loops.
 _Avoid_: policy (ambiguous), RBAC, profile
 
 **Judge**:
-An optional sidecar that produces a pass/fail verdict after deterministic verify checks. Its output is opaque to the operator — a boolean plus a score. It can never be the only gate.
+An optional model verdict (`spec.verify.judge`), run as a Job through the Loop's model proxy after the acceptance checks pass: does the change game the tests? It is advisory: a false verdict makes the delivery PR a draft, and it never changes whether the Loop succeeded (ADR-0011).
 _Avoid_: reviewer, evaluator, critic, LLM judge
 
 **Plan**:

@@ -257,6 +257,11 @@ make test       # Run unit tests
   the operator code) — not a hand-applied `kubectl apply` or a patch in the
   e2e script. A workaround in the script hides the defect from every future
   release and from the review.
+- **A defect found after a release gets a notice on that release's page**
+  (R57 D136). Put a notice at the top of the release's GitHub page that names
+  the defect, the fix PR and the release that fixes it (as on v0.1.3's
+  page), and keep the original notes below it. The next release's notes cite
+  the notice.
 - **A fallback must surface its failure before it degrades** (R26 I90). If
   the operator falls back to a degraded path (e.g. a best-effort ConfigMap
   ensure, a missing-escalation fallback), it must emit an Event or set a

@@ -33,9 +33,8 @@ The `v*` release tags publish the public images and the `install.yaml` that
 points at them. Fetch and apply:
 
 ```sh
-# Pin the tag (the alphas are prereleases — GitHub's releases/latest skips
-# them, so releases/latest is not the right URL for the alpha line).
-TAG=v0.1.0-alpha.1
+# Pin the tag. v0.2.0 is the latest release.
+TAG=v0.2.0
 curl -sfL "https://github.com/papawattu/coxswain/releases/download/${TAG}/install.yaml" \
   -o install.yaml
 kubectl apply -f install.yaml

@@ -114,5 +114,4 @@ jobs:
           gh release create "${GITHUB_REF_NAME}" dist/install.yaml dist/coxswain-*.tgz \
             --repo "${GITHUB_REPOSITORY}" \
             --title "${GITHUB_REF_NAME}" \
-            --prerelease \
             --generate-notes

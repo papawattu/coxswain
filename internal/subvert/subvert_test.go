@@ -4,7 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"sort"
+	"slices"
 	"testing"
 )
 
@@ -14,12 +14,12 @@ func expectPatterns(hits []Hit) []string {
 	for _, h := range hits {
 		got = append(got, h.Pattern)
 	}
-	sort.Strings(got)
+	slices.Sort(got)
 	return got
 }
 
 func wantPatterns(names ...string) []string {
-	sort.Strings(names)
+	slices.Sort(names)
 	return names
 }
 
@@ -166,7 +166,6 @@ func main() { _ = p }
 	}
 
 	for _, row := range rows {
-		row := row
 		t.Run(row.name, func(t *testing.T) {
 			t.Parallel()
 

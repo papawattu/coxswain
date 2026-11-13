@@ -85,7 +85,7 @@ func TestScanGo(t *testing.T) {
 			want:     wantPatterns(PatternLinkname),
 		},
 		{
-			name:     `flag.Lookup("test.v")`,
+			name: `flag.Lookup("test.v")`,
 			verified: `package main
 
 import "flag"
@@ -95,7 +95,7 @@ func main() { flag.Lookup("test.v") }
 			want: wantPatterns(PatternFlagLookupTest),
 		},
 		{
-			name:     `flag.Lookup("v") is not suspicious`,
+			name: `flag.Lookup("v") is not suspicious`,
 			verified: `package main
 
 import "flag"
@@ -105,7 +105,7 @@ func main() { flag.Lookup("v") }
 			want: []string{},
 		},
 		{
-			name:     "canary name in a string literal",
+			name: "canary name in a string literal",
 			verified: `package main
 
 var p = "zzz_canary_test.go"
@@ -115,12 +115,37 @@ func main() { _ = p }
 			want: wantPatterns(PatternCanaryName),
 		},
 		{
+			name:     "aliased testing",
+			verified: "package main\n\nimport t \"testing\"\n\nfunc f() bool { return t.Testing() }\n",
+			want:     wantPatterns(PatternTestingTesting),
+		},
+		{
+			name:     "aliased os in init",
+			verified: "package main\n\nimport o \"os\"\n\nfunc init() { o.Exit(0) }\n",
+			want:     wantPatterns(PatternExitInInit),
+		},
+		{
+			name:     "dot-imported testing",
+			verified: "package main\n\nimport . \"testing\"\n\nfunc f() bool { return Testing() }\n",
+			want:     wantPatterns(PatternTestingTesting),
+		},
+		{
+			name:     "a local type with a Testing method is not a hit",
+			verified: "package main\n\ntype x struct{}\n\nfunc (x) Testing() bool { return true }\n\nfunc f() bool { var v x; return v.Testing() }\n",
+			want:     []string{},
+		},
+		{
+			name:     "canary name in a comment",
+			verified: "package main\n\n// see zzz_canary_test.go\nfunc main() {}\n",
+			want:     wantPatterns(PatternCanaryName),
+		},
+		{
 			name:     "probe371 fixture (base nil)",
 			verified: probePath,
 			want:     wantPatterns(PatternExitInInit, PatternCanaryName),
 		},
 		{
-			name:    "os.Exit in init already in base",
+			name:     "os.Exit in init already in base",
 			verified: exitInInit,
 			base:     exitInInit,
 			baseSet:  true,

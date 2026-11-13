@@ -916,6 +916,40 @@ spec:
                     - WallClock
                     - Cost
                     type: string
+                  judgeProxy:
+                    description: |-
+                      judgeProxy is the Judge proxy's own delta state (J5b, D141): the Judge
+                      proxy (<loop>-jproxy) exists only while the Judge Job runs, and its
+                      usage is folded into the SAME totals above with its own boot-ID delta
+                      (a new jproxy for a later verify has a new boot ID, so its counters
+                      are added in full and never subtracted). Absent until a Judge proxy
+                      has been read.
+                    properties:
+                      lastBootID:
+                        description: lastBootID is the Judge proxy boot ID the last-read
+                          counters came from.
+                        type: string
+                      lastCompletionTokens:
+                        description: lastCompletionTokens is the last-read cumulative
+                          completion-token counter.
+                        format: int64
+                        type: integer
+                      lastPromptTokens:
+                        description: lastPromptTokens is the last-read cumulative
+                          prompt-token counter.
+                        format: int64
+                        type: integer
+                      lastRequests:
+                        description: lastRequests is the last-read cumulative metered-request
+                          counter.
+                        format: int64
+                        type: integer
+                      lastUnmeteredRequests:
+                        description: lastUnmeteredRequests is the last-read cumulative
+                          unmetered-request counter.
+                        format: int64
+                        type: integer
+                    type: object
                   lastActiveStamp:
                     description: |-
                       lastActiveStamp is the last reconcile's active-time accumulation point

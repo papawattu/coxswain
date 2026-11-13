@@ -594,6 +594,10 @@ type LoopReconciler struct {
 	// (F44, F84b).
 	readProxyUsage func(ctx context.Context, loop *coxv1alpha1.Loop) (proxy.Reading, error)
 
+	// readJudgeProxyUsage is the same seam for the Judge proxy (J5b, D141):
+	// nil reads the <loop>-jproxy pod's /coxswain/usage endpoint.
+	readJudgeProxyUsage func(ctx context.Context, loop *coxv1alpha1.Loop) (proxy.Reading, error)
+
 	// usageHTTPClient is the http.Client the default readProxyUsage uses. Set
 	// in tests to shorten the read timeout; the production default is a 2s
 	// timeout (a proxy that does not answer is not worth blocking the

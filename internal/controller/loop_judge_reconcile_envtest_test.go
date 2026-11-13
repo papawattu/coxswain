@@ -64,7 +64,7 @@ import (
 // events are asserted) and the Judge Job's name. The in-cluster .svc repo
 // skips the egress-proxy holds (verifyNeedsProxy / deliveryNeedsProxy are
 // false for .svc).
-func judgeDriveToJudging(ns, name string, withDelivery bool) string {
+func judgeDriveToJudging(ns, name string, withDelivery bool, mut ...func(*coxv1alpha1.Loop)) string {
 	ctx := context.Background()
 	r := &LoopReconciler{
 		CNIProber:         testCNIProber(),
@@ -93,6 +93,9 @@ func judgeDriveToJudging(ns, name string, withDelivery bool) string {
 	}
 	if withDelivery {
 		loop.Spec.Delivery = &coxv1alpha1.DeliveryConfig{Mode: coxv1alpha1.DeliveryModePullRequest}
+	}
+	for _, m := range mut {
+		m(loop)
 	}
 	Expect(k8sClient.Create(ctx, loop)).To(Succeed())
 	// Bootstrap: Pending -> Planning.

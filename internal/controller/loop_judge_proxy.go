@@ -14,6 +14,7 @@
 package controller
 
 import (
+	"context"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -21,6 +22,7 @@ import (
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
 
 	"github.com/papawattu/coxswain/internal/policy"
+	"github.com/papawattu/coxswain/internal/proxy"
 )
 
 // judgeProxyName is the Judge proxy's pod and Service name (D132). The
@@ -87,4 +89,18 @@ func judgeEndpointValue(loop *coxv1alpha1.Loop) string {
 		return eps
 	}
 	return "http://" + eps
+}
+
+// STEP 3a skeleton (RED): the lifecycle and metering entry points; bodies
+// arrive with the implementation commit.
+
+func (r *LoopReconciler) ensureJudgeProxy(_ context.Context, _ *coxv1alpha1.Loop) (bool, error) {
+	return false, nil
+}
+
+func (r *LoopReconciler) settleJudgeProxy(_ context.Context, _ *coxv1alpha1.Loop) error {
+	return nil
+}
+
+func (r *LoopReconciler) applyJudgeUsageReading(_ context.Context, _ *coxv1alpha1.Loop, _ proxy.Reading) {
 }

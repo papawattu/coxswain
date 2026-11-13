@@ -1355,6 +1355,27 @@ const (
 	PausedReasonBudget PausedReason = "Budget"
 )
 
+// JudgeProxyUsage is the last-read state of the Judge proxy's cumulative
+// usage counters (J5b, D141), the Judge proxy's counterpart of the
+// BudgetStatus last* fields.
+type JudgeProxyUsage struct {
+	// lastBootID is the Judge proxy boot ID the last-read counters came from.
+	// +optional
+	LastBootID string `json:"lastBootID,omitempty"`
+	// lastPromptTokens is the last-read cumulative prompt-token counter.
+	// +optional
+	LastPromptTokens int64 `json:"lastPromptTokens,omitempty"`
+	// lastCompletionTokens is the last-read cumulative completion-token counter.
+	// +optional
+	LastCompletionTokens int64 `json:"lastCompletionTokens,omitempty"`
+	// lastRequests is the last-read cumulative metered-request counter.
+	// +optional
+	LastRequests int64 `json:"lastRequests,omitempty"`
+	// lastUnmeteredRequests is the last-read cumulative unmetered-request counter.
+	// +optional
+	LastUnmeteredRequests int64 `json:"lastUnmeteredRequests,omitempty"`
+}
+
 // BudgetStatus is the operator's record of the Loop's accumulated budget
 // consumption (P2c; the counts are accumulated by P2d from the model proxy
 // endpoint, ADR-0009). The last* fields carry the last-READ CUMULATIVE
@@ -1428,6 +1449,15 @@ type BudgetStatus struct {
 	// counter from the proxy (item 2).
 	// +optional
 	LastUnmeteredRequests int64 `json:"lastUnmeteredRequests,omitempty"`
+
+	// judgeProxy is the Judge proxy's own delta state (J5b, D141): the Judge
+	// proxy (<loop>-jproxy) exists only while the Judge Job runs, and its
+	// usage is folded into the SAME totals above with its own boot-ID delta
+	// (a new jproxy for a later verify has a new boot ID, so its counters
+	// are added in full and never subtracted). Absent until a Judge proxy
+	// has been read.
+	// +optional
+	JudgeProxy *JudgeProxyUsage `json:"judgeProxy,omitempty"`
 
 	// bootIDChanged is true (sticky) when a proxy pod recreate wiped the
 	// counters between reads (the honest-limit marker, P2a): the

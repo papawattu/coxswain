@@ -134,6 +134,28 @@ const (
 	// uses the same pattern (verifyCanaryTmpVolName). Bounded like the
 	// per-check scratch.
 	verifyTamperTmpVolName = "tamper-tmp"
+	// verifyScanPrepInit / verifyScanInit are the S1 (ADR-0005 D17.2) diff
+	// scan's two trusted inits, between artifact and the canary. scan-prep
+	// (git + sh image) copies the changed non-protected .go files out of the
+	// checkout into the /scan volume; scan (the operator image) runs
+	// coxswain-subvert-scan over it. Neither ever blocks the checks: no
+	// decision in verifyOutcome reads either name.
+	// verifyTermMsgPathEnv names the env var carrying verifyTerminationLogPath.
+	verifyTermMsgPathEnv = "TERMINATION_MESSAGE_PATH"
+	verifyScanPrepInit   = "scan-prep"
+	verifyScanInit       = "scan"
+	// verifyScanVolName / verifyScanPath: the bounded emptyDir scan-prep
+	// writes and scan reads (read-only there). /verify stays read-only to it.
+	verifyScanVolName = "scan"
+	verifyScanPath    = "/scan"
+	// verifyScanTmpVolName is the scan init's own writable /tmp (its
+	// termination message lands there; the root filesystem is read-only).
+	verifyScanTmpVolName = "scan-tmp"
+	// verifyScanBinary is the scanner's path in the operator image.
+	verifyScanBinary = "/usr/local/bin/coxswain-subvert-scan"
+	// verifyScanPrepFailedMarker is written (empty) in /scan by scan-prep
+	// when a git step failed, so the scan reports it instead of a clean.
+	verifyScanPrepFailedMarker = "PREP_FAILED"
 	// verifyArtifactMaxBytes is the I47 size cap for a file ADDED in
 	// baseCommit..verifiedCommit (1 MiB — the same cap the runner's
 	// commitWorkspace refuses against on the agent side).
@@ -1050,6 +1072,59 @@ exit 0
 `, verifyScratchPath, shellQuote(baseCommit), shellQuote(verifyCommit), strings.Join(quoted, " "), tamperGitErrorExit, diffHash)
 }
 
+// scanPrepScript is the S1 scan-prep init's sh script. It lists the .go files
+// added or modified in baseCommit..verifyCommit, MINUS the protected globs
+// (the same globs the tamper check diffs, with "exclude" added to their magic: a protected
+// change already fails the tamper gate), and for each path copies the
+// verified blob to /scan/verified/<path> and, when the path exists at the
+// base, the base blob to /scan/base/<path>. It writes nothing else. D17.2: the
+// scan never blocks the checks, so the script always exits 0; a git failure
+// writes the PREP_FAILED marker (the scan reports it as an error, never as a
+// clean) and is logged on stderr.
+func scanPrepScript(baseCommit, verifyCommit string, globs []string) string {
+	spec := make([]string, 0, 1+len(globs))
+	spec = append(spec, shellQuote("*.go"))
+	for _, g := range globs {
+		// The globs carry their own magic (":(glob)**/*_test.go"): add
+		// "exclude" to it rather than prefixing a second magic.
+		if strings.HasPrefix(g, ":(") {
+			g = ":(exclude," + g[2:]
+		} else {
+			g = ":(exclude)" + g
+		}
+		spec = append(spec, shellQuote(g))
+	}
+	return fmt.Sprintf(`
+cd %s
+S=%s
+mkdir -p "$S/verified" "$S/base"
+fail() { echo "scan-prep: $1" >&2; : > "$S/%s"; }
+LIST="$S/.list"
+# Not piped into tr: a pipe would hide a git failure behind tr's status.
+if ! git -c core.hooksPath=/dev/null -c core.quotePath=false diff -z --name-only --diff-filter=AM %s %s -- %s > "$LIST.z"; then
+  fail "git diff failed"
+  rm -f "$LIST.z"
+  exit 0
+fi
+tr '\0' '\n' < "$LIST.z" > "$LIST"
+rm -f "$LIST.z"
+while IFS= read -r p; do
+  [ -n "$p" ] || continue
+  mkdir -p "$S/verified/$(dirname "$p")"
+  if ! git show %s:"$p" > "$S/verified/$p"; then fail "cannot read $p at the verified commit"; continue; fi
+  if git cat-file -e %s:"$p" 2>/dev/null; then
+    mkdir -p "$S/base/$(dirname "$p")"
+    git show %s:"$p" > "$S/base/$p" || fail "cannot read $p at the base commit"
+  fi
+done < "$LIST"
+rm -f "$LIST"
+echo "scan-prep: done"
+exit 0
+`, verifyScratchPath, verifyScanPath, verifyScanPrepFailedMarker,
+		shellQuote(baseCommit), shellQuote(verifyCommit), strings.Join(spec, " "),
+		shellQuote(verifyCommit), shellQuote(baseCommit), shellQuote(baseCommit))
+}
+
 // verifyNotDescendantExit is the import-agent script's exit status when the
 // pinned commit is NOT a descendant of baseCommit (F43). Distinct from a git
 // failure (any other non-zero), which stays an infra failure.
@@ -1248,7 +1323,7 @@ func (r *LoopReconciler) buildVerifyJobSpec(loop *coxv1alpha1.Loop) batchv1.JobS
 		Image:           baseImage,
 		Command:         []string{verifySh, "-c", tamperScript},
 		SecurityContext: trustedContainerSecurityContext(),
-		Env:             append(verifyGitSafeEnv(), corev1.EnvVar{Name: "TERMINATION_MESSAGE_PATH", Value: verifyTerminationLogPath}),
+		Env:             append(verifyGitSafeEnv(), corev1.EnvVar{Name: verifyTermMsgPathEnv, Value: verifyTerminationLogPath}),
 		Resources:       verifyTrustedResources(),
 		// D79(b): the tamper init's termination message carries the agent
 		// diff's hash — the operator's only read path. It needs a writable
@@ -1257,6 +1332,38 @@ func (r *LoopReconciler) buildVerifyJobSpec(loop *coxv1alpha1.Loop) batchv1.JobS
 		TerminationMessagePath: verifyTerminationLogPath,
 		VolumeMounts: []corev1.VolumeMount{{Name: verifyVol, MountPath: verifyScratchPath},
 			{Name: verifyTamperTmpVolName, MountPath: agentTmpMount}},
+	}
+
+	// S1 (D17.2): the diff scan's two trusted inits. scan-prep runs on the
+	// trusted git image and copies the changed non-protected .go files to
+	// /scan; scan runs the operator's own coxswain-subvert-scan binary
+	// (the Judge Job's image choice) over it, /scan read-only, and reports
+	// through its termination message. /verify is read-only to scan-prep.
+	scanPrepCt := corev1.Container{
+		Name:            verifyScanPrepInit,
+		Image:           baseImage,
+		Command:         []string{verifySh, "-c", scanPrepScript(baseCommit, verifyCommit, globs)},
+		SecurityContext: trustedContainerSecurityContext(),
+		Env:             verifyGitSafeEnv(),
+		Resources:       verifyTrustedResources(),
+		VolumeMounts: []corev1.VolumeMount{
+			{Name: verifyVol, MountPath: verifyScratchPath, ReadOnly: true},
+			{Name: verifyScanVolName, MountPath: verifyScanPath},
+		},
+	}
+	scanCt := corev1.Container{
+		Name:                   verifyScanInit,
+		Image:                  r.memoryWriterImage(),
+		Command:                []string{verifyScanBinary},
+		Args:                   []string{verifyScanPath},
+		SecurityContext:        trustedContainerSecurityContext(),
+		Env:                    []corev1.EnvVar{{Name: verifyTermMsgPathEnv, Value: verifyTerminationLogPath}},
+		Resources:              verifyTrustedResources(),
+		TerminationMessagePath: verifyTerminationLogPath,
+		VolumeMounts: []corev1.VolumeMount{
+			{Name: verifyScanVolName, MountPath: verifyScanPath, ReadOnly: true},
+			{Name: verifyScanTmpVolName, MountPath: agentTmpMount},
+		},
 	}
 
 	// The F60 (D17.1) canary init: the negative control for in-process
@@ -1303,7 +1410,7 @@ func (r *LoopReconciler) buildVerifyJobSpec(loop *coxv1alpha1.Loop) batchv1.JobS
 			// 2).
 			Env: append(verifyCheckEnv(),
 				corev1.EnvVar{Name: "BASE_COMMIT", Value: baseCommit},
-				corev1.EnvVar{Name: "TERMINATION_MESSAGE_PATH", Value: verifyTerminationLogPath},
+				corev1.EnvVar{Name: verifyTermMsgPathEnv, Value: verifyTerminationLogPath},
 				corev1.EnvVar{Name: "TERMINATION_MESSAGE_MARKER", Value: verifyCanarySkipMarker},
 			),
 			// F94b: the skip marker (exit 0, never-had-tests) has to reach the
@@ -1417,7 +1524,7 @@ func (r *LoopReconciler) buildVerifyJobSpec(loop *coxv1alpha1.Loop) batchv1.JobS
 	// Build the inits list: skip the canary (and its scratch volume) for
 	// preset none (a non-Go repo — the canary would 44 and wedge, and the
 	// negative control is not applicable to a repo with no Go tests).
-	inits := []corev1.Container{cloneCt, importCt, tamperCt, artifactCt}
+	inits := []corev1.Container{cloneCt, importCt, tamperCt, artifactCt, scanPrepCt, scanCt}
 	if canaryCt.Name != "" {
 		inits = append(inits, canaryCt)
 	}
@@ -1435,6 +1542,9 @@ func (r *LoopReconciler) buildVerifyJobSpec(loop *coxv1alpha1.Loop) batchv1.JobS
 		{Name: verifyAgentVol, VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
 			ClaimName: workspacePVCName(loop.Name), ReadOnly: true,
 		}}},
+		// S1: the scan's bounded volumes (the copied sources; scan's /tmp).
+		{Name: verifyScanVolName, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: newLimit(verifyCheckTmpSizeLimit)}}},
+		{Name: verifyScanTmpVolName, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: newLimit("16Mi")}}},
 	}
 	// F60 (D17.1): the canary's own writable /tmp scratch (post-F53 /verify
 	// is read-only; the canary copies the package here). Bounded like the

@@ -33,6 +33,10 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -o co
 # Job's container runs /usr/local/bin/coxswain-judge).
 RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -o coxswain-judge ./cmd/judge
 
+# The S1 diff scan (ADR-0005 D17.2) runs in the verify Job on this image
+# (/usr/local/bin/coxswain-subvert-scan, cmd/subvert-scan).
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -o coxswain-subvert-scan ./cmd/subvert-scan
+
 # Use distroless as minimal base image to package the manager binary
 # Refer to https://github.com/GoogleContainerTools/distroless for more details
 FROM gcr.io/distroless/static:nonroot
@@ -40,6 +44,7 @@ WORKDIR /
 COPY --from=builder /workspace/manager .
 COPY --from=builder /workspace/coxswain-memory-write /usr/local/bin/coxswain-memory-write
 COPY --from=builder /workspace/coxswain-judge /usr/local/bin/coxswain-judge
+COPY --from=builder /workspace/coxswain-subvert-scan /usr/local/bin/coxswain-subvert-scan
 USER 65532:65532
 
 ENTRYPOINT ["/manager"]

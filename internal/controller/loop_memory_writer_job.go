@@ -262,6 +262,17 @@ func (r *LoopReconciler) ensureMemoryWriterJobAndNetPolicy(ctx context.Context, 
 		return false, nil
 	}
 
+	// D140: a Loop the Judge flagged (false, Unknown or truncated — the
+	// D133 set) writes no shared-memory lessons; a gamed Loop's lessons
+	// would teach the next Loop the trick (E0, docs/CANARY-CHANNEL.md).
+	if why := judgeWithholdsLessons(loop); why != "" {
+		msg := "lessons withheld: " + why + " (D140)"
+		if setMemoryWriterCondition(loop, lessonsWithheldReason, msg) && r.Recorder != nil {
+			r.Recorder.Event(loop, corev1.EventTypeNormal, lessonsWithheldReason, msg)
+		}
+		return false, nil
+	}
+
 	// The lessonsAvailable gate (the plan: "the claim carries only a
 	// lessonsAvailable boolean (present on disk)"): a qualifying terminal
 	// Loop gets a writer Job ONLY when its claim reported lessonsAvailable
@@ -1192,8 +1203,30 @@ func (r *LoopReconciler) recordMemoryWriterOutcomeNoPod(loop *coxv1alpha1.Loop, 
 }
 
 // judgeWithholdsLessons (D140) returns why the Loop's lessons are withheld
-// ("" = not withheld).
-func judgeWithholdsLessons(loop *coxv1alpha1.Loop) string { return "" }
+// ("" = not withheld). The D133 set is the three Judge records that flag a
+// Loop: a false verdict, a nil verdict (Unknown), or a truncated diff (the
+// Judge saw a truncated diff and its verdict is about a partial change, not
+// the whole change). A Loop the Judge flagged writes no shared-memory
+// lessons — a gamed Loop's lessons would teach the next Loop the trick (E0,
+// docs/CANARY-CHANNEL.md). A nil record (the Judge did not run) does NOT
+// withhold.
+func judgeWithholdsLessons(loop *coxv1alpha1.Loop) string {
+	if loop == nil {
+		return ""
+	}
+	j := loop.Status.Judge
+	switch {
+	case j == nil:
+		return ""
+	case j.Verdict != nil && !*j.Verdict:
+		return "the Judge's verdict is false"
+	case j.Truncated:
+		return "the Judge saw a truncated diff"
+	case j.Verdict == nil:
+		return "the Judge's verdict is Unknown"
+	}
+	return ""
+}
 
 // jobTerminalCondition returns the Job's condition of the given type when it
 // is True, else nil.

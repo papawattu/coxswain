@@ -127,13 +127,14 @@ var _ = Describe("M1 (D140): a Loop the Judge flags writes no shared-memory less
 		// The Event names the withhold (the audit trail): one of the events
 		// on the fake recorder contains the LessonsWithheld reason.
 		var seen []string
+	drain:
 		for {
 			select {
 			case ev := <-recorder.Events:
 				seen = append(seen, ev)
 			default:
+				break drain
 			}
-			break
 		}
 		found := false
 		for _, ev := range seen {
@@ -161,5 +162,12 @@ var _ = Describe("M1 (D140): a Loop the Judge flags writes no shared-memory less
 			Expect(cond.Reason).NotTo(Equal(lessonsWithheldReason),
 				"a Loop the Judge did not flag must not be recorded as LessonsWithheld")
 		}
+
+		// The memory-writer Job IS created (proof the spec setup reaches the
+		// writer: the false spec's "no Job" is the gate, not a setup gap).
+		job := &batchv1.Job{}
+		Expect(k8sClient.Get(context.Background(), types.NamespacedName{
+			Name: memoryWriterJobName(loop), Namespace: ns,
+		}, job)).To(Succeed())
 	})
 })

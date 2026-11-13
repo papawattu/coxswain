@@ -116,11 +116,12 @@ func TestPolicyYAMLPinnedAgainstConstants(t *testing.T) {
 	expr := spec.MatchConditions[0].Expression
 
 	// The matchCondition expression must reference the label key and all
-	// three component values (as quoted CEL string literals).
+	// four component values (as quoted CEL string literals).
 	for _, c := range []string{
 		ComponentLabelKey,
 		ComponentAgentLabel,
 		ComponentProxyLabel,
+		ComponentJudgeProxyLabel,
 		ComponentEgressProxyLabel,
 		ComponentToolProxyLabel,
 	} {

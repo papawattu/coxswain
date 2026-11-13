@@ -518,8 +518,9 @@ func renderDeliverDescriptionBody(d deliverDescription) string {
 // line is absent (the body is byte-identical to the pre-Judge body). The
 // line is operator-recorded: the fixed shape the operator recorded from the
 // Judge Job's termination message (the boolean, the score, the one-line
-// reason, the truncated flag). A false verdict notes the PR is held as a
-// draft (the advisory's only effect on delivery, D122).
+// reason, the truncated flag). A false verdict, a nil verdict (Unknown) or
+// a truncated diff notes the PR is held as a draft (the advisory's only
+// effect on delivery, D122, D133).
 func judgeLine(j *judgeFacts) string {
 	if j == nil {
 		return ""
@@ -528,13 +529,17 @@ func judgeLine(j *judgeFacts) string {
 	if j.Truncated {
 		trunc = " (diff truncated)"
 	}
+	held := ""
+	if j.Verdict == nil || !*j.Verdict || j.Truncated {
+		held = " (the PR is held as a draft)"
+	}
 	switch {
 	case j.Verdict != nil && *j.Verdict:
-		return fmt.Sprintf("- **Judge (advisory):** pass, score %d — %s%s\n", j.Score, oneLine(j.Reason), trunc)
+		return fmt.Sprintf("- **Judge (advisory):** pass, score %d — %s%s%s\n", j.Score, oneLine(j.Reason), trunc, held)
 	case j.Verdict != nil && !*j.Verdict:
-		return fmt.Sprintf("- **Judge (advisory):** FAIL, score %d — %s%s (the PR is held as a draft)\n", j.Score, oneLine(j.Reason), trunc)
+		return fmt.Sprintf("- **Judge (advisory):** FAIL, score %d — %s%s%s\n", j.Score, oneLine(j.Reason), trunc, held)
 	default:
-		return "- **Judge (advisory):** unavailable" + trunc + "\n"
+		return "- **Judge (advisory):** unavailable" + trunc + held + "\n"
 	}
 }
 

@@ -13,13 +13,14 @@
 // limitations under the License.
 
 // J1e (ADR-0011 "Effect (D122, advisory)"): a false Judge verdict holds the
-// PR as a draft whatever spec.delivery.draft says; a true verdict, a nil
-// verdict (Unknown, D124), or no status.judge leaves spec.delivery.draft
-// exactly as it is (default true). The test is a plain unit test (no
-// envtest, no cluster): deliverDraft is a pure function of the Loop's
-// spec/status, and the table below covers every combination of
-// spec.delivery.draft (unset / false) with status.judge (nil / verdict nil /
-// verdict true / verdict false).
+// PR as a draft whatever spec.delivery.draft says; D133 (R57): a nil verdict
+// (Unknown) or a truncated diff forces a draft like a false verdict; a clean
+// true verdict or no status.judge leaves spec.delivery.draft exactly as it is
+// (default true). The test is a plain unit test (no envtest, no cluster):
+// deliverDraft is a pure function of the Loop's spec/status, and the table
+// below covers every combination of spec.delivery.draft (unset / false) with
+// status.judge (nil / verdict nil / verdict true / verdict false) and the
+// Truncated flag.
 package controller
 
 import (
@@ -35,9 +36,12 @@ import (
 //   - no judge and draft false   -> false (spec says ready);
 //   - verdict false and draft false -> true (the advisory forces a draft);
 //   - verdict true and draft false  -> false (a pass does not force a draft);
-//   - verdict nil and draft false   -> false (Unknown leaves draft as-is).
+//   - verdict nil and draft false   -> true (Unknown forces a draft, D133);
+//   - any verdict + truncated and draft false -> true (a truncated diff
+//     forces a draft, D133, R57).
 //
-// The "verdict false forces a draft" case is D122's only effect on delivery:
+// The "false verdict / Unknown / truncated diff force a draft" case is D122 +
+// D133's only effect on delivery:
 // the Judge can never be the only gate (it cannot make a ready PR non-draft,
 // and it never changes Succeeded or iterates — the draft marker is the
 // advisory's whole reach).
@@ -58,8 +62,11 @@ func TestDeliverDraftJudgeVerdict(t *testing.T) {
 		{"verdict false, draft unset -> true", nil, &coxv1alpha1.JudgeStatus{Verdict: &fv}, true},
 		{"verdict true, draft false -> false", new(bool), &coxv1alpha1.JudgeStatus{Verdict: &tv}, false},
 		{"verdict true, draft unset -> true", nil, &coxv1alpha1.JudgeStatus{Verdict: &tv}, true},
-		{"verdict nil, draft false -> false", new(bool), &noJudge, false},
+		{"verdict nil, draft false -> true (D133: Unknown forces a draft)", new(bool), &noJudge, true},
 		{"verdict nil, draft unset -> true", nil, &noJudge, true},
+		{"verdict true + truncated, draft false -> true (D133)", new(bool), &coxv1alpha1.JudgeStatus{Verdict: &tv, Truncated: true}, true},
+		{"verdict false + truncated, draft false -> true", new(bool), &coxv1alpha1.JudgeStatus{Verdict: &fv, Truncated: true}, true},
+		{"verdict nil + truncated, draft false -> true (D133)", new(bool), &coxv1alpha1.JudgeStatus{Truncated: true}, true},
 	}
 
 	for _, tt := range tests {

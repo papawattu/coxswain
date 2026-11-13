@@ -14,8 +14,7 @@ landed as in the heading, like `RELEASE-NOTES-v0.2.0.md`.
 - **Measured: the Judge catches the #371 probe** (E0, #485, 0deb5a6): the planted probe ran on kind-ref against the released v0.2.0 operator with the Judge on. The canary, the tamper check and all three acceptance checks passed with the repo still broken and the Loop Succeeded; the Judge gave verdict false, score 0, and the delivery was a draft PR. The result and its limits (n=1, one model, an easy-to-read probe) are under a new "Measured" heading in `docs/CANARY-CHANNEL.md`.
 - **The Judge can ask for its own model** (J5a, #488, c8f56e3): `spec.verify.judge.model` names the model the Judge asks for, through the Loop's own model proxy and endpoint (D132). Empty means the Loop's `spec.agent.model` (D123), so existing Loops are unchanged.
 - **arm64:** built, not run (D137, carried over from v0.2.0).
-- TODO(J5a): filled when J5a merges
-- TODO(M1): filled when M1 merges
+- **A Judge-flagged Loop writes no lessons** (M1, #487, 8f73d0b): a Loop the Judge flags (verdict `false`, `Unknown`, or a truncated diff: the D133 set) creates no memory-writer Job and records `MemoryWriteDone` with the reason `LessonsWithheld`, plus a Normal Event of the same reason (D140).
 - TODO(S1): filled when S1 merges
 - TODO(J5b): filled when J5b merges
 
@@ -83,9 +82,13 @@ The release workflow no longer passes `--prerelease` to `gh release create`, so 
 
 **Covered by:** unit specs for the `COX_JUDGE_MODEL` choice in `internal/controller/loop_j5a_judge_model_unit_test.go` (the Judge's own model when named, the Loop's model when empty, and no key with no endpoint).
 
-### TODO(M1): a Judge-flagged Loop writes no lessons (D140) — #487
+### M1: a Judge-flagged Loop writes no shared-memory lessons (D140) — #487 (8f73d0b)
 
-Filled when M1 merges.
+**What it is:** a Loop the Judge flags — verdict `false`, verdict `Unknown` (no verdict recorded), or a truncated diff: the D133 set that forces a draft — writes NO shared-memory lessons (D140). No memory-writer Job is created; the `MemoryWriteDone` condition records the reason `LessonsWithheld`, with a Normal Event of the same reason (`internal/controller/loop_memory_writer_job.go`, `judgeWithholdsLessons`). TODO(S1): the diff scan's `VerifySuspicious` hit joins the same rule.
+
+**Why:** E0 (the "Measured" section of `docs/CANARY-CHANNEL.md`) found the Memory Curator keeping a lesson from the flagged #371 probe Loop — a lesson that calls the probe harmless (D140, `docs/PLAN-PHASE8.md`). A gamed Loop's lessons would teach the next Loop the trick.
+
+**On upgrade:** a Loop that ends after a Judge flag no longer adds lessons to the shared memory. A Loop without a Judge, or with a clean true verdict, is unchanged.
 
 ### TODO(S1): the diff scan — VerifySuspicious (D135)
 

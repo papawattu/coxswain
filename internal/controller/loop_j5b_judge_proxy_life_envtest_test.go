@@ -203,4 +203,3 @@ var _ = Describe("J5b 3a the Judge proxy metering (D141)", func() {
 		Expect(loop.Status.Budget.ExceededReason).To(Equal(coxv1alpha1.BudgetExceededTokens))
 	})
 })
-

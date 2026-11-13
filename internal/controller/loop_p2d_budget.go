@@ -478,19 +478,25 @@ func (r *LoopReconciler) ensureBudgetStatus(loop *coxv1alpha1.Loop, activeSecond
 // otherwise — no new RBAC: the operator already has pod get) and performs a
 // plain HTTP GET to http://<pod-ip>:9090/coxswain/usage.
 func (r *LoopReconciler) readProxyUsageDefault(ctx context.Context, loop *coxv1alpha1.Loop) (proxy.Reading, error) {
+	return r.readPodUsage(ctx, loop, proxyPodName(loop.Name))
+}
+
+// readPodUsage reads the usage endpoint of the named model-proxy pod (the
+// Loop's <loop>-proxy, or the Judge's <loop>-jproxy, J5b D141).
+func (r *LoopReconciler) readPodUsage(ctx context.Context, loop *coxv1alpha1.Loop, podName string) (proxy.Reading, error) {
 	reader := r.apiReader
 	if reader == nil {
 		reader = r
 	}
 	pod := &corev1.Pod{}
-	if err := reader.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: proxyPodName(loop.Name)}, pod); err != nil {
+	if err := reader.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: podName}, pod); err != nil {
 		if apierrors.IsNotFound(err) {
 			// No proxy pod (absent, or not yet created): not a reading, and
 			// not yet a FAILURE (F84): the pod is created in the same
 			// reconcile that reads it.
-			return proxy.Reading{}, fmt.Errorf("proxy pod %s/%s absent: %w", loop.Namespace, proxyPodName(loop.Name), proxy.ErrNotReady)
+			return proxy.Reading{}, fmt.Errorf("proxy pod %s/%s absent: %w", loop.Namespace, podName, proxy.ErrNotReady)
 		}
-		return proxy.Reading{}, fmt.Errorf("read proxy pod %s/%s: %w", loop.Namespace, proxyPodName(loop.Name), err)
+		return proxy.Reading{}, fmt.Errorf("read proxy pod %s/%s: %w", loop.Namespace, podName, err)
 	}
 	if pod.Status.PodIP == "" {
 		// The pod has not received an IP (not Ready / still scheduling): not a
@@ -646,6 +652,13 @@ func (r *LoopReconciler) applyUsageReading(ctx context.Context, loop *coxv1alpha
 	b.LastRequests = reading.Requests
 	b.LastUnmeteredRequests = reading.UnmeteredRequests
 
+	r.refreshBudgetCost(ctx, loop)
+}
+
+// refreshBudgetCost re-derives status.budget.costUsd from the totals (shared
+// by the Loop proxy and the Judge proxy folds, J5b D141).
+func (r *LoopReconciler) refreshBudgetCost(ctx context.Context, loop *coxv1alpha1.Loop) {
+	b := loop.Status.Budget
 	// Cost (derived, P2a): promptTokens * promptPrice/1e6 +
 	// completionTokens * completionPrice/1e6, from spec.budget.modelPrices or
 	// the coxswain-model-prices ConfigMap. A missing/unreadable source with no
@@ -853,4 +866,87 @@ func (r *LoopReconciler) fireBudgetExceeded(ctx context.Context, loop *coxv1alph
 		return true
 	}
 	return false
+}
+
+// judgeUsageUnreadReason is the Warning Event reason when the Judge proxy's
+// FINAL usage reading could not be taken before it was deleted (J5b D141,
+// I90: never a silent zero).
+const judgeUsageUnreadReason = "JudgeUsageUnread"
+
+// resolveJudgeProxyUsageRead is resolveProxyUsageRead for the Judge proxy
+// (<loop>-jproxy): the readJudgeProxyUsage seam, else the pod's usage endpoint.
+func (r *LoopReconciler) resolveJudgeProxyUsageRead(ctx context.Context, loop *coxv1alpha1.Loop) (*proxy.Reading, error) {
+	if r.readJudgeProxyUsage != nil {
+		reading, err := r.readJudgeProxyUsage(ctx, loop)
+		if err != nil {
+			return nil, err
+		}
+		return &reading, nil
+	}
+	reading, err := r.readPodUsage(ctx, loop, judgeProxyName(loop.Name))
+	if err != nil {
+		return nil, err
+	}
+	return &reading, nil
+}
+
+// applyJudgeUsageReading folds one Judge proxy reading into the SAME
+// status.budget totals as the Loop proxy, with the Judge proxy's OWN boot-ID
+// delta state (status.budget.judgeProxy, J5b D141):
+//
+//   - a boot ID different from the stored one (including none stored: the
+//     Judge proxy is born inside the Judge's window, so a first reading is a
+//     delta from 0, unlike the Loop proxy's adopt-the-baseline rule 2): ADD
+//     the reading in full, rebase. A later verify's NEW jproxy or a restart
+//     therefore never drops tokens, and nothing is ever subtracted;
+//   - the same boot ID: add the (floored) delta; a counter that DROPS
+//     without a boot change is a MeteringAnomaly: rebase, add nothing.
+//
+// The Loop proxy's last* fields and bootIDChanged are never touched.
+func (r *LoopReconciler) applyJudgeUsageReading(ctx context.Context, loop *coxv1alpha1.Loop, reading proxy.Reading) {
+	if loop.Status.Budget == nil {
+		loop.Status.Budget = &coxv1alpha1.BudgetStatus{}
+	}
+	b := loop.Status.Budget
+	if b.JudgeProxy == nil {
+		b.JudgeProxy = &coxv1alpha1.JudgeProxyUsage{}
+	}
+	j := b.JudgeProxy
+	var dPrompt, dCompletion, dRequests, dUnmetered int64
+	switch {
+	case j.LastBootID != reading.BootID:
+		dPrompt, dCompletion, dRequests, dUnmetered = reading.PromptTokens, reading.CompletionTokens, reading.Requests, reading.UnmeteredRequests
+	case reading.PromptTokens < j.LastPromptTokens || reading.CompletionTokens < j.LastCompletionTokens ||
+		reading.Requests < j.LastRequests || reading.UnmeteredRequests < j.LastUnmeteredRequests:
+		if r.Recorder != nil {
+			r.Recorder.Eventf(loop, corev1.EventTypeWarning, meteringAnomalyReason,
+				"judge proxy usage counter dropped without a boot ID change (boot %s): rebasing to the reading; the drop is not counted", reading.BootID)
+		}
+	default:
+		dPrompt = reading.PromptTokens - j.LastPromptTokens
+		dCompletion = reading.CompletionTokens - j.LastCompletionTokens
+		dRequests = reading.Requests - j.LastRequests
+		dUnmetered = reading.UnmeteredRequests - j.LastUnmeteredRequests
+	}
+	b.PromptTokens += dPrompt
+	b.CompletionTokens += dCompletion
+	b.Requests += dRequests
+	b.UnmeteredRequests += dUnmetered
+	if dUnmetered > 0 {
+		// Only a positive delta: a zero here must not clear a Loop-proxy
+		// MeteringDegraded condition.
+		r.noteUnmetered(loop, dUnmetered)
+	}
+	if dPrompt > 0 {
+		loopTokensTotal.WithLabelValues("prompt").Add(float64(dPrompt))
+	}
+	if dCompletion > 0 {
+		loopTokensTotal.WithLabelValues("completion").Add(float64(dCompletion))
+	}
+	j.LastBootID = reading.BootID
+	j.LastPromptTokens = reading.PromptTokens
+	j.LastCompletionTokens = reading.CompletionTokens
+	j.LastRequests = reading.Requests
+	j.LastUnmeteredRequests = reading.UnmeteredRequests
+	r.refreshBudgetCost(ctx, loop)
 }

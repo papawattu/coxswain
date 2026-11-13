@@ -764,6 +764,15 @@ func (r *LoopReconciler) ensureJudgeAndSettle(ctx context.Context, loop *coxv1al
 	// Job in progress (the Complete condition was checked after Failed; no
 	// conditions at all is also in progress): NO decision, requeue.
 	if jobTerminalCondition(job, batchv1.JobComplete) == nil {
+		// Fold a reading so the caps see the Judge's spend mid-run. It is
+		// not the final read: a failure (ErrNotReady, an HTTP error) is
+		// SILENT here (no JudgeUsageUnread; the final read reports a loss).
+		if judgeOwnEndpoint(loop) {
+			if fr, rerr := r.resolveJudgeProxyUsageRead(ctx, loop); rerr == nil && fr != nil {
+				r.applyJudgeUsageReading(ctx, loop, *fr)
+				*changed = true
+			}
+		}
 		return true, nil
 	}
 	// Job Complete: read the judge container's termination message (the

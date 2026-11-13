@@ -15,6 +15,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"github.com/papawattu/coxswain/internal/proxy"
 )
@@ -93,6 +94,87 @@ var _ = Describe("J5b 3a the Judge proxy lifecycle (D141)", func() {
 		Expect(loop.Status.Budget.CompletionTokens).To(Equal(int64(20)))
 		Expect(loop.Status.Budget.JudgeProxy).NotTo(BeNil())
 		Expect(loop.Status.Budget.JudgeProxy.LastBootID).To(Equal("jb1"))
+	})
+
+	It("drift: a jproxy pod whose spec-hash annotation changed gets ONE read, is deleted, requeues, and is recreated with the right hash", func() {
+		ns := freshNS()
+		judgeDriveToJudging(ns, "j5bl-e", false, j5bOwnEndpoint)
+		key := types.NamespacedName{Namespace: ns, Name: judgeProxyName("j5bl-e")}
+		pod := &corev1.Pod{}
+		Expect(k8sClient.Get(ctx, key, pod)).To(Succeed())
+		wantHash := pod.Annotations[proxySpecHashAnnotation]
+		Expect(wantHash).NotTo(BeEmpty())
+		oldUID := pod.UID
+		pod.Annotations[proxySpecHashAnnotation] = "stale-hash"
+		Expect(k8sClient.Update(ctx, pod)).To(Succeed())
+
+		r := judgeFreshReconciler()
+		reads := 0
+		r.readJudgeProxyUsage = func(context.Context, *coxv1alpha1.Loop) (proxy.Reading, error) {
+			reads++
+			return proxy.Reading{BootID: "jb1", PromptTokens: 100, CompletionTokens: 20, Requests: 1}, nil
+		}
+		res, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: "j5bl-e", Namespace: ns}})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(res.RequeueAfter).To(BeNumerically(">", 0), "a drifted pod delete requeues")
+		Expect(reads).To(Equal(1), "one final read through the seam before the delete")
+		gone := &corev1.Pod{}
+		gerr := k8sClient.Get(ctx, key, gone)
+		// envtest has no kubelet: a deleted pod with no finalizers is gone at once.
+		Expect(apierrors.IsNotFound(gerr) || (gerr == nil && gone.DeletionTimestamp != nil)).To(BeTrue(), "the drifted pod is deleted")
+
+		// The next reconcile recreates it with the right hash.
+		// The recreated pod has a NEW boot ID: it adds its own counters, and
+		// the drift read lost nothing.
+		r.readJudgeProxyUsage = func(context.Context, *coxv1alpha1.Loop) (proxy.Reading, error) {
+			return proxy.Reading{BootID: "jb2", PromptTokens: 5, CompletionTokens: 1, Requests: 1}, nil
+		}
+		judgeReconcile(r, ns, "j5bl-e")
+		fresh := &corev1.Pod{}
+		Expect(k8sClient.Get(ctx, key, fresh)).To(Succeed())
+		Expect(fresh.UID).NotTo(Equal(oldUID))
+		Expect(fresh.Annotations[proxySpecHashAnnotation]).To(Equal(wantHash))
+		Expect(judgeGet(ns, "j5bl-e").Status.Budget.PromptTokens).To(Equal(int64(105)), "the drift read (100) is folded and the new boot adds its 5: nothing lost")
+	})
+
+	It("the jproxy Service is a mutated object: a changed selector is restored on the next reconcile while Judging", func() {
+		ns := freshNS()
+		judgeDriveToJudging(ns, "j5bl-f", false, j5bOwnEndpoint)
+		key := types.NamespacedName{Namespace: ns, Name: judgeProxyName("j5bl-f")}
+		svc := &corev1.Service{}
+		Expect(k8sClient.Get(ctx, key, svc)).To(Succeed())
+		svc.Spec.Selector = map[string]string{"component": "model-proxy", "coxswain.io/proxy-for": "j5bl-f"}
+		Expect(k8sClient.Update(ctx, svc)).To(Succeed())
+
+		judgeReconcile(judgeFreshReconciler(), ns, "j5bl-f")
+		Expect(k8sClient.Get(ctx, key, svc)).To(Succeed())
+		Expect(svc.Spec.Selector).To(Equal(judgeProxyLabels("j5bl-f")))
+	})
+
+	It("in progress: a reconcile folds a 100+20 reading (silent on failure); the final read of the same counters adds 0", func() {
+		ns := freshNS()
+		jobName := judgeDriveToJudging(ns, "j5bl-g", false, j5bOwnEndpoint)
+		r := judgeFreshReconciler()
+		// A failed in-progress read is silent: no JudgeUsageUnread, no totals.
+		r.readJudgeProxyUsage = func(context.Context, *coxv1alpha1.Loop) (proxy.Reading, error) {
+			return proxy.Reading{}, fmt.Errorf("not up: %w", proxy.ErrNotReady)
+		}
+		loop := judgeReconcile(r, ns, "j5bl-g")
+		Expect(strings.Join(judgeDrainedEvents(r), "\n")).NotTo(ContainSubstring("JudgeUsageUnread"))
+		Expect(loop.Status.Budget == nil || loop.Status.Budget.PromptTokens == 0).To(BeTrue())
+
+		rd := proxy.Reading{BootID: "jb1", PromptTokens: 100, CompletionTokens: 20, Requests: 1}
+		r.readJudgeProxyUsage = func(context.Context, *coxv1alpha1.Loop) (proxy.Reading, error) { return rd, nil }
+		loop = judgeReconcile(r, ns, "j5bl-g")
+		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseVerifying), "still Judging")
+		Expect(loop.Status.Budget.PromptTokens).To(Equal(int64(100)))
+		Expect(loop.Status.Budget.CompletionTokens).To(Equal(int64(20)))
+
+		finishJudge(ns, "j5bl-g", jobName)
+		loop = judgeReconcile(r, ns, "j5bl-g")
+		Expect(loop.Status.Phase).To(Equal(coxv1alpha1.LoopPhaseSucceeded))
+		Expect(loop.Status.Budget.PromptTokens).To(Equal(int64(100)), "the final read of the same counters adds 0")
+		Expect(loop.Status.Budget.CompletionTokens).To(Equal(int64(20)))
 	})
 
 	It("no own endpoint: no jproxy is ever created", func() {
@@ -188,6 +270,29 @@ var _ = Describe("J5b 3a the Judge proxy metering (D141)", func() {
 		r.applyJudgeUsageReading(context.Background(), loop, proxy.Reading{BootID: "jb2", PromptTokens: 45, CompletionTokens: 9, Requests: 2})
 		Expect(b.PromptTokens).To(Equal(int64(145)))
 	})
+
+	for _, tc := range []struct {
+		name string
+		drop proxy.Reading
+	}{
+		{"promptTokens and completionTokens drop", proxy.Reading{BootID: "jb1", PromptTokens: 40, CompletionTokens: 8, Requests: 2}},
+		{"only promptTokens drops", proxy.Reading{BootID: "jb1", PromptTokens: 40, CompletionTokens: 25, Requests: 2}},
+		{"only completionTokens drops", proxy.Reading{BootID: "jb1", PromptTokens: 130, CompletionTokens: 5, Requests: 2}},
+	} {
+		It("a same-boot counter drop ("+tc.name+") adds nothing, rebases judgeProxy.last*, and warns MeteringAnomaly", func() {
+			r, loop := newR(), loopWith()
+			r.applyJudgeUsageReading(context.Background(), loop, proxy.Reading{BootID: "jb1", PromptTokens: 100, CompletionTokens: 20, Requests: 1})
+			b := loop.Status.Budget
+			Expect(judgeDrainedEvents(r)).To(BeEmpty())
+			r.applyJudgeUsageReading(context.Background(), loop, tc.drop)
+			Expect([]int64{b.PromptTokens, b.CompletionTokens, b.Requests}).To(Equal([]int64{100, 20, 1}), "nothing is ever subtracted or added")
+			Expect([]int64{b.JudgeProxy.LastPromptTokens, b.JudgeProxy.LastCompletionTokens, b.JudgeProxy.LastRequests}).
+				To(Equal([]int64{tc.drop.PromptTokens, tc.drop.CompletionTokens, tc.drop.Requests}), "rebased to the reading")
+			evs := judgeDrainedEvents(r)
+			Expect(evs).To(HaveLen(1))
+			Expect(evs[0]).To(And(ContainSubstring("Warning"), ContainSubstring(meteringAnomalyReason)))
+		})
+	}
 
 	It("a token cap below Loop+Judge but above the Loop alone fires the budget decision", func() {
 		r, loop := newR(), loopWith()

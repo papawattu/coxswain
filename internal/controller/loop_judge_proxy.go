@@ -214,7 +214,9 @@ func (r *LoopReconciler) settleJudgeProxy(ctx context.Context, loop *coxv1alpha1
 // Event and a note appended to the JudgeVerdict condition's message.
 func (r *LoopReconciler) noteJudgeUsageUnread(loop *coxv1alpha1.Loop, err error) {
 	note := fmt.Sprintf(" (judge usage unread: %v; its tokens are not in status.budget)", err)
-	if c := apimeta.FindStatusCondition(loop.Status.Conditions, coxv1alpha1.JudgeVerdictCondition); c != nil {
+	// A failed settle retries and would append the note again: once only.
+	if c := apimeta.FindStatusCondition(loop.Status.Conditions, coxv1alpha1.JudgeVerdictCondition); c != nil &&
+		!strings.Contains(c.Message, "judge usage unread") {
 		setCondition(loop, coxv1alpha1.JudgeVerdictCondition, c.Status, c.Reason, c.Message+note)
 	}
 	if r.Recorder != nil {

@@ -2109,6 +2109,7 @@ func (r *LoopReconciler) applyVerifyOutcome(ctx context.Context, loop *coxv1alph
 	// it) BEFORE the decision, so it is also persisted while the checks are
 	// still running.
 	evidenceChanged := recordTamperEvidence(loop, pod, job)
+	evidenceChanged = r.recordScanEvidence(loop, pod) || evidenceChanged
 	checkCount := len(loop.Spec.Verify.AcceptanceChecks)
 	outcome, requeue, failedCheck, checkExitCode, canarySkipped := verifyOutcome(pod, checkCount, jobFailed, deadlineExceeded)
 	if requeue {

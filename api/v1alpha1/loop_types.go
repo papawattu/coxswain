@@ -397,6 +397,13 @@ type JudgeConfig struct {
 	// +kubebuilder:validation:Maximum=32768
 	// +optional
 	MaxTokens int64 `json:"maxTokens,omitempty"`
+
+	// model is the model the Judge asks for, through the Loop's own model
+	// proxy and endpoint (D132). Empty means the Loop's spec.agent.model
+	// (D123). A Judge on a different endpoint is J5b.
+	// +kubebuilder:validation:MaxLength=253
+	// +optional
+	Model string `json:"model,omitempty"`
 }
 
 // VerifyStatus is the operator's record of the last verify run's evidence

@@ -308,6 +308,7 @@ func (r *LoopReconciler) applyVerifySucceeded(loop *coxv1alpha1.Loop) (bool, boo
 	// takes over after the Judge settles (ensureJudgeAndSettle releases it).
 	if judgeEnabled(loop) {
 		loop.Status.Judge = nil
+		loop.Status.JudgeSummary = judgeSummary(loop)
 		setCondition(loop, string(coxv1alpha1.LoopPhaseVerifying), metav1.ConditionTrue,
 			coxv1alpha1.ReasonVerifyingJudging,
 			"verify passed; holding Succeeded until the Judge Job (ADR-0011) reports")

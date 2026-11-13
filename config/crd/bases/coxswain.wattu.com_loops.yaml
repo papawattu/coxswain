@@ -21,6 +21,9 @@ spec:
     - jsonPath: .status.iteration
       name: Iteration
       type: integer
+    - jsonPath: .status.judgeSummary
+      name: Judge
+      type: string
     - jsonPath: .metadata.creationTimestamp
       name: Age
       type: date
@@ -1220,6 +1223,19 @@ spec:
                       a fail (D122/D124).
                     type: boolean
                 type: object
+              judgeSummary:
+                description: |-
+                  judgeSummary is the one-word Judge signal shown in `kubectl get loop`
+                  (D131, D138): the most serious of Suspicious (the S1 diff scan) >
+                  False > Truncated > Unknown > True. Empty when there is no Judge and
+                  no scan hit. The JudgeVerdict condition keeps the detail.
+                enum:
+                - Suspicious
+                - "False"
+                - Truncated
+                - Unknown
+                - "True"
+                type: string
               observedGeneration:
                 description: observedGeneration is the spec generation last reconciled.
                 format: int64

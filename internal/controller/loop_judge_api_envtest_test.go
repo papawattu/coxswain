@@ -135,6 +135,39 @@ var _ = Describe("Judge API", func() {
 		Expect(got.Spec.Verify.Judge).To(BeNil(), "the Judge is opt-in and never defaulted (ADR-0011)")
 	})
 
+	It("rejects a Loop with judge.modelEndpoint but no judge.endpointSecretRef (XValidation)", func() {
+		ns := freshNS("j5b-nokey")
+		loop := &coxv1alpha1.Loop{
+			ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "judge-nokey"},
+			Spec: coxv1alpha1.LoopSpec{
+				Goal:      "Judge API",
+				Workspace: testWorkspace(),
+				Agent:     coxv1alpha1.AgentConfig{Image: runnerImage, Model: testModel},
+				Verify: coxv1alpha1.VerifyConfig{
+					AcceptanceChecks: []string{"go build ./..."},
+					Judge:            &coxv1alpha1.JudgeConfig{Enabled: true, MaxTokens: 512, ModelEndpoint: "judge-vllm.judge-ns.svc:8001"},
+				},
+			},
+		}
+		if err := k8sClient.Create(ctx, loop); err == nil {
+			Fail("the API server must reject judge.modelEndpoint without judge.endpointSecretRef")
+		} else {
+			Expect(err.Error()).To(MatchRegexp(`judge modelEndpoint and endpointSecretRef must be set together`), "the API server must reject with the set-together message")
+		}
+	})
+
+	It("accepts a Loop with judge.modelEndpoint and judge.endpointSecretRef set together (XValidation)", func() {
+		ns := freshNS("j5b-both")
+		got := newLoop(ns, "judge-both", &coxv1alpha1.JudgeConfig{
+			Enabled:           true,
+			MaxTokens:         512,
+			ModelEndpoint:     "judge-vllm.judge-ns.svc:8001",
+			EndpointSecretRef: "judge-key",
+		})
+		Expect(got.Spec.Verify.Judge.ModelEndpoint).To(Equal("judge-vllm.judge-ns.svc:8001"))
+		Expect(got.Spec.Verify.Judge.EndpointSecretRef).To(Equal("judge-key"))
+	})
+
 	It("rejects a status update with judge.score = 101 (maximum is 100)", func() {
 		ns := freshNS("j1a-score")
 		newLoop(ns, "judge-score", nil)

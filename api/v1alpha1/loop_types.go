@@ -378,6 +378,7 @@ type VerifyConfig struct {
 // (the CEL compiler rejects field selection on a bool or int), while on the
 // type self is the JudgeConfig object.
 // +kubebuilder:validation:XValidation:rule="!self.enabled || has(self.maxTokens)",message="maxTokens is required when the Judge is enabled"
+// +kubebuilder:validation:XValidation:rule="has(self.modelEndpoint) == has(self.endpointSecretRef)",message="judge modelEndpoint and endpointSecretRef must be set together"
 type JudgeConfig struct {
 	// enabled turns the Judge on for this Loop. Never defaulted — without it
 	// (or with it false) no Judge Job is created and nothing in the phase
@@ -404,6 +405,26 @@ type JudgeConfig struct {
 	// +kubebuilder:validation:MaxLength=253
 	// +optional
 	Model string `json:"model,omitempty"`
+
+	// modelEndpoint is the Judge's own model server (host:port), reached
+	// through the Judge's own model proxy (<loop>-jproxy), metered into the
+	// Loop's totals (D132, ADR-0009). Empty = the Loop's proxy and endpoint.
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern="^[a-z0-9]([a-z0-9.-]*[a-z0-9])?:[0-9]{1,5}$"
+	// +kubebuilder:validation:XValidation:rule="self == '' || int(self.split(':')[1]) > 0 && int(self.split(':')[1]) <= 65535",message="modelEndpoint port must be 1-65535"
+	// +kubebuilder:validation:XValidation:rule="self == '' || self == oldSelf",message="judge modelEndpoint is immutable (the Judge proxy NetworkPolicy cannot change)"
+	// +optional
+	ModelEndpoint string `json:"modelEndpoint,omitempty"`
+
+	// endpointSecretRef names the Secret with the Judge endpoint's API key,
+	// mounted only into the Judge's proxy. Set together with modelEndpoint.
+	// Immutable for the same reason as the Loop's spec.agent.endpointSecretRef
+	// (the proxy pod's spec.volumes is immutable).
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
+	// +kubebuilder:validation:XValidation:rule="self == '' || self == oldSelf",message="judge endpointSecretRef is immutable (the Judge proxy pod's spec.volumes cannot change)"
+	// +optional
+	EndpointSecretRef string `json:"endpointSecretRef,omitempty"`
 }
 
 // VerifyStatus is the operator's record of the last verify run's evidence

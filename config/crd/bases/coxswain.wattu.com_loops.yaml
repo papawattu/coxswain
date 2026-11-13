@@ -502,6 +502,19 @@ spec:
                           (or with it false) no Judge Job is created and nothing in the phase
                           machine or the PR draft computation changes (ADR-0011, D122).
                         type: boolean
+                      endpointSecretRef:
+                        description: |-
+                          endpointSecretRef names the Secret with the Judge endpoint's API key,
+                          mounted only into the Judge's proxy. Set together with modelEndpoint.
+                          Immutable for the same reason as the Loop's spec.agent.endpointSecretRef
+                          (the proxy pod's spec.volumes is immutable).
+                        maxLength: 253
+                        pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                        type: string
+                        x-kubernetes-validations:
+                        - message: judge endpointSecretRef is immutable (the Judge
+                            proxy pod's spec.volumes cannot change)
+                          rule: self == '' || self == oldSelf
                       maxTokens:
                         description: |-
                           maxTokens caps the Judge's model call output: the Judge sets the model
@@ -524,12 +537,30 @@ spec:
                           (D123). A Judge on a different endpoint is J5b.
                         maxLength: 253
                         type: string
+                      modelEndpoint:
+                        description: |-
+                          modelEndpoint is the Judge's own model server (host:port), reached
+                          through the Judge's own model proxy (<loop>-jproxy), metered into the
+                          Loop's totals (D132, ADR-0009). Empty = the Loop's proxy and endpoint.
+                        maxLength: 253
+                        pattern: ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?:[0-9]{1,5}$
+                        type: string
+                        x-kubernetes-validations:
+                        - message: modelEndpoint port must be 1-65535
+                          rule: self == '' || int(self.split(':')[1]) > 0 && int(self.split(':')[1])
+                            <= 65535
+                        - message: judge modelEndpoint is immutable (the Judge proxy
+                            NetworkPolicy cannot change)
+                          rule: self == '' || self == oldSelf
                     required:
                     - enabled
                     type: object
                     x-kubernetes-validations:
                     - message: maxTokens is required when the Judge is enabled
                       rule: '!self.enabled || has(self.maxTokens)'
+                    - message: judge modelEndpoint and endpointSecretRef must be set
+                        together
+                      rule: has(self.modelEndpoint) == has(self.endpointSecretRef)
                   onVerifyFail:
                     default: Implement
                     description: |-

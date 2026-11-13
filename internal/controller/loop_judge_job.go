@@ -935,6 +935,7 @@ func (r *LoopReconciler) applyJudgeVerdict(loop *coxv1alpha1.Loop, msg string) {
 		At:        ptrJudgeTime(),
 	}
 	loop.Status.Judge = status
+	loop.Status.JudgeSummary = judgeSummary(loop)
 	cond := metav1.ConditionFalse
 	if *v.Verdict {
 		cond = metav1.ConditionTrue
@@ -956,6 +957,7 @@ func (r *LoopReconciler) recordJudgeUnavailable(loop *coxv1alpha1.Loop, cause st
 		Reason: truncateJudgeReason(cause),
 		At:     ptrJudgeTime(),
 	}
+	loop.Status.JudgeSummary = judgeSummary(loop)
 	setCondition(loop, coxv1alpha1.JudgeVerdictCondition, metav1.ConditionUnknown,
 		coxv1alpha1.ReasonJudgeUnavailable, "judge unavailable: "+cause)
 	if r.Recorder != nil {
@@ -997,6 +999,27 @@ const judgeContainerName = "judge"
 // status.judge.reason MaxLength, loop_types.go). A longer reason is a
 // malformed reply (unavailable).
 const judgeReasonMaxChars = 200
+
+// judgeSummary is the one-word Judge signal for `kubectl get loop` (D131,
+// D138): the most serious of the Judge's signals wins (the S1 diff scan sets
+// `Suspicious` itself, then False > Truncated > Unknown > True); empty when
+// there is no Judge. The JudgeVerdict condition keeps the detail.
+func judgeSummary(loop *coxv1alpha1.Loop) string {
+	if loop == nil || loop.Status.Judge == nil {
+		return ""
+	}
+	j := loop.Status.Judge
+	switch {
+	case j.Verdict != nil && !*j.Verdict:
+		return "False"
+	case j.Truncated:
+		return "Truncated"
+	case j.Verdict == nil:
+		return "Unknown"
+	default:
+		return "True"
+	}
+}
 
 // judgeVerdictedReason is the reason on the JudgeVerdict condition when the
 // verdict was recorded (True or False). Distinct from the hold reason

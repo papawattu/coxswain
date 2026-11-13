@@ -1047,6 +1047,14 @@ type LoopStatus struct {
 	// +optional
 	Judge *JudgeStatus `json:"judge,omitempty"`
 
+	// judgeSummary is the one-word Judge signal shown in `kubectl get loop`
+	// (D131, D138): the most serious of Suspicious (the S1 diff scan) >
+	// False > Truncated > Unknown > True. Empty when there is no Judge and
+	// no scan hit. The JudgeVerdict condition keeps the detail.
+	// +kubebuilder:validation:Enum=Suspicious;False;Truncated;Unknown;True
+	// +optional
+	JudgeSummary string `json:"judgeSummary,omitempty"`
+
 	// currentVerify is the operator's pin of the CURRENT iteration's verified
 	// commit, written by the operator on entering Verifying (D11) and used to
 	// bind the verify evidence to the commit being verified. It is deliberate
@@ -1781,6 +1789,7 @@ const (
 // +kubebuilder:subresource:status
 // +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
 // +kubebuilder:printcolumn:name="Iteration",type=integer,JSONPath=`.status.iteration`
+// +kubebuilder:printcolumn:name="Judge",type=string,JSONPath=`.status.judgeSummary`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 // D20: the Loop name names the Sandbox (and its Service, if one is enabled),
 // so it must be a DNS-1035 label (lowercase, start with a letter, no dots) of

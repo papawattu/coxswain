@@ -720,8 +720,9 @@ var _ = Describe("P5b memory-writer Job (Phase 5, R28 P2-7 transport)", func() {
 		// Implementing claim (the runner executed Implementing) — the Loop is
 		// now Verifying (the phase machine advanced Implementing -> Verifying
 		// because the claim carried a valid headCommit; Verifying is a
-		// non-terminal phase).
-		s5aClaimPodWithLessonsAvailable(ns, name, "Implementing", s6HeadCommit, false)
+		// non-terminal phase). lessonsAvailable is irrelevant here (the phase
+		// is non-terminal before any gate reads the claim's field).
+		s5aClaimPod(ns, name, "Implementing", s6HeadCommit)
 		s6Reconcile(r, ns, name)
 		loop = p5bMustLoop(ns, name)
 		// The Loop is Verifying (a non-terminal phase — the memory write

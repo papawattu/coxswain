@@ -325,10 +325,16 @@ func (r *LoopReconciler) judgeEnvValueMap(loop *coxv1alpha1.Loop) map[string]str
 		// The Judge's call goes through the Loop's model proxy (the same
 		// URL the curator uses — loop_memory_writer_job.go's
 		// COX_CURATOR_BASE_URL; D123: one metered path, no new
-		// credential). COX_JUDGE_MODEL is the Loop's model name (the
-		// same value the curator's COX_MODEL carries).
+		// credential). COX_JUDGE_MODEL is the Judge's own model name
+		// when spec.verify.judge.model names one (D132: a separate
+		// judge on the same endpoint), else the Loop's model name (the
+		// same value the curator's COX_MODEL carries; D123's default).
 		env["COX_JUDGE_BASE_URL"] = r.proxyServiceURL(loop.Name, loop.Namespace)
-		env["COX_JUDGE_MODEL"] = loop.Spec.Agent.Model
+		model := loop.Spec.Agent.Model
+		if loop.Spec.Verify.Judge != nil && loop.Spec.Verify.Judge.Model != "" {
+			model = loop.Spec.Verify.Judge.Model
+		}
+		env["COX_JUDGE_MODEL"] = model
 	}
 	if loop.Spec.Verify.Judge != nil && loop.Spec.Verify.Judge.MaxTokens > 0 {
 		// The Judge's own token cap (spec.verify.judge.maxTokens, ADR-0011

@@ -998,6 +998,12 @@ const judgeContainerName = "judge"
 // malformed reply (unavailable).
 const judgeReasonMaxChars = 200
 
+// judgeSummary is the one-word Judge signal for `kubectl get loop` (D131,
+// D138). RED stub (J4): the decision table lands with the implementation.
+func judgeSummary(loop *coxv1alpha1.Loop) string {
+	return ""
+}
+
 // judgeVerdictedReason is the reason on the JudgeVerdict condition when the
 // verdict was recorded (True or False). Distinct from the hold reason
 // "Judging" (the Verifying condition while the Job runs) and from

@@ -234,3 +234,7 @@ reasoning preamble), so the strict parse applies as designed.
 ## Amendment (2026-11-12): Unknown and truncated force a draft (D133)
 
 The owner decided D133 in R57 (`docs/REVIEW-PHASE1-R57.md`). An Unknown verdict (`JudgeUnavailable`) or a truncated diff (`status.judge.truncated`) now delivers the PR as a draft, like a false verdict. This replaces "A **true** or **Unknown** verdict leaves `spec.delivery.draft` exactly as it is" under "Effect (D122, advisory)", and "nothing downstream treats it as either verdict" under "Unavailable (D124)", for the draft only. Unknown is still never read as a pass or a fail, and `Succeeded` is unchanged in every case. The PR description's Judge line says the PR is held as a draft.
+
+## Amendment (2026-11-13): the Judge's own model (D132)
+
+The owner decided D132 in R57. `spec.verify.judge.model` names the model the Judge asks for. The call still goes through the Loop's model proxy to the Loop's endpoint (D123), so the Judge needs no new credential or egress. Empty means the Loop's `spec.agent.model`, as before. The proxy's usage reading still names the Loop's model for every call, the Judge's included (`internal/proxy/meter.go:44` — the reading's `model` field). A Judge on a different endpoint is J5b.

@@ -517,6 +517,13 @@ spec:
                         maximum: 32768
                         minimum: 1
                         type: integer
+                      model:
+                        description: |-
+                          model is the model the Judge asks for, through the Loop's own model
+                          proxy and endpoint (D132). Empty means the Loop's spec.agent.model
+                          (D123). A Judge on a different endpoint is J5b.
+                        maxLength: 253
+                        type: string
                     required:
                     - enabled
                     type: object

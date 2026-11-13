@@ -6,8 +6,11 @@
 package controller
 
 import (
+	"reflect"
 	"strings"
 	"testing"
+
+	"k8s.io/apimachinery/pkg/labels"
 )
 
 func TestJudgeProxyName(t *testing.T) {
@@ -92,6 +95,19 @@ func TestBuildJudgeProxyPod(t *testing.T) {
 	}
 	if !foundEndpoint {
 		t.Fatal("buildJudgeProxyPod: no MODEL_ENDPOINT env var on the proxy container")
+	}
+	// The Judge proxy's labels are judgeProxyLabels — and the Loop's own
+	// proxy Service (which selects proxyLabels) must NOT match them: the
+	// Service-routing trap. A Judge proxy carrying proxyLabels would be
+	// selected by the Loop's Service and route agent calls to the Judge's
+	// endpoint.
+	wantLabels := judgeProxyLabels("loop-b")
+	if !reflect.DeepEqual(pod.Labels, wantLabels) {
+		t.Fatalf("pod labels: got %v, want %v", pod.Labels, wantLabels)
+	}
+	loopProxySelector := labels.SelectorFromSet(proxyLabels("loop-b"))
+	if loopProxySelector.Matches(labels.Set(pod.Labels)) {
+		t.Fatalf("the Loop's proxy Service selector matches the Judge proxy's labels %v — the Service would route agent calls to the Judge's endpoint", pod.Labels)
 	}
 	// The Secret volume carries the Judge's key, not the Loop agent's.
 	foundSecret := false

@@ -321,7 +321,21 @@ func (r *LoopReconciler) judgeEnvValueMap(loop *coxv1alpha1.Loop) map[string]str
 		"COX_JUDGE_GOAL":        loop.Spec.Goal,
 		"COX_JUDGE_PLAN":        planSummary(loop),
 	}
-	if loop.Spec.Agent.ModelEndpoint != "" {
+	if judgeOwnEndpoint(loop) {
+		// The Judge has an endpoint of its own (J5b, D132): the Judge's call
+		// goes through the Judge's own model proxy (<loop>-jproxy), which
+		// carries the Judge endpoint's Secret — NOT the Loop's own proxy
+		// (whose Service selects proxyLabels, so it never sees the Judge
+		// proxy pod). The Judge proxy exists whenever the Judge names its
+		// own endpoint, even if spec.agent.modelEndpoint is empty (the Judge
+		// endpoint is the Loop's only model surface in that case).
+		env["COX_JUDGE_BASE_URL"] = r.judgeProxyServiceURL(loop.Name, loop.Namespace)
+		model := loop.Spec.Agent.Model
+		if loop.Spec.Verify.Judge.Model != "" {
+			model = loop.Spec.Verify.Judge.Model
+		}
+		env["COX_JUDGE_MODEL"] = model
+	} else if loop.Spec.Agent.ModelEndpoint != "" {
 		// The Judge's call goes through the Loop's model proxy (the same
 		// URL the curator uses — loop_memory_writer_job.go's
 		// COX_CURATOR_BASE_URL; D123: one metered path, no new

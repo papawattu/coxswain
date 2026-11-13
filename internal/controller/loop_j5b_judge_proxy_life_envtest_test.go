@@ -67,7 +67,7 @@ var _ = Describe("J5b 3a the Judge proxy lifecycle (D141)", func() {
 		s := &corev1.Service{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: judgeProxyName("j5bl-a")}, s)).To(Succeed())
 		Expect(s.Spec.Selector).To(Equal(judgeProxyLabels("j5bl-a")))
-		Expect(s.Spec.Ports[0].Port).To(Equal(int32(proxyPort)))
+		Expect(s.Spec.Ports[0].Port).To(Equal(proxyPort))
 		Expect(metav1.IsControlledBy(s, judgeGet(ns, "j5bl-a"))).To(BeTrue())
 
 		// A still-running Judge keeps the proxy.

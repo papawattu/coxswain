@@ -60,7 +60,7 @@ func TestScanUnparseableGoesToErrors(t *testing.T) {
 	put(t, root, "verified/bad.go", "package {{{ not go\n")
 	r := decode(t, encode(scan(root)))
 	if len(r.Errors) != 1 || r.Errors[0] != "bad.go" {
-		t.Skip("needs S1 step 2: ScanGo is still the stub and does not reject unparseable source; got " + fmt.Sprint(r))
+		t.Fatalf("an unparseable file must go to errors: %+v", r)
 	}
 }
 
@@ -81,8 +81,12 @@ func TestScanProbe371(t *testing.T) {
 	root := t.TempDir()
 	put(t, root, "verified/zz_init.go", string(src))
 	r := decode(t, encode(scan(root)))
-	if len(r.Hits) == 0 {
-		t.Skip("needs S1 step 2: ScanGo is still the stub and detects nothing")
+	got := map[string]bool{}
+	for _, h := range r.Hits {
+		got[h.Pattern] = true
+	}
+	if !got["os.Exit in init"] || !got["zzz_canary"] || len(r.Hits) != 2 {
+		t.Fatalf("the #371 probe must hit exactly os.Exit in init and zzz_canary: %+v", r.Hits)
 	}
 	for _, h := range r.Hits {
 		if h.Path != "zz_init.go" || h.Line == 0 {

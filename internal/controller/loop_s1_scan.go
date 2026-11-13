@@ -39,8 +39,8 @@ import (
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
 )
 
-// verifyScanInit is the scan init's name (S1-3a builds the container).
-const verifyScanInit = "scan"
+// verifyScanInit (the scan init's name) is declared with the verify Job's
+// other init names in loop_verify_job.go (S1-3a).
 
 // scanReport is the v==1 JSON report the scan init writes to its termination
 // message (the operator's only read of the scan's verdict).

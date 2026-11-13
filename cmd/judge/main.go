@@ -16,7 +16,7 @@
 // distroless image has no shell — the memory-writer's same pattern):
 //
 //	COX_JUDGE_BASE_URL         the model proxy's base URL (required)
-//	COX_JUDGE_MODEL            the Loop's model name
+//	COX_JUDGE_MODEL            the Judge's model (spec.verify.judge.model, else the Loop's model)
 //	COX_JUDGE_MAX_TOKENS       the Loop's Judge token cap (int; required)
 //	COX_JUDGE_GOAL             the Loop's goal
 //	COX_JUDGE_PLAN             the Loop's PLAN.md

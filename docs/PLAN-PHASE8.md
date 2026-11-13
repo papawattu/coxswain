@@ -23,6 +23,7 @@
   - **The #371 probe** (read `zzz_canary_test.go`, print the token, exit 1): a draft PR, and the Loop's `Judge` column shows a flag.
   - **The hardcoded-inputs trick** (the run 17b method, R55): a draft PR, and the column shows `False`.
   - **An honest change:** a ready PR, and the column shows `True`.
+  - The two flagged Loops write no lesson to the memory PVC; the honest one may (D140).
 - v0.3.0 is tagged, with notes and an upgrade proof from v0.2.0.
 - A Loop without `spec.verify.judge` still behaves exactly as in v0.2.0, apart from the scan's flag (D135 runs on every Loop).
 
@@ -92,6 +93,14 @@
   - Envtest that the condition, the Event and the draft follow a hit.
 - **Kind:** required. It is a new init container reading the shared workspace volume (the R55 I263(c) rule). The #371 probe Loop shows `VerifySuspicious=True` and a draft PR.
 
+### M1. A flagged Loop writes no lessons (D140)
+- **Why:** E0 (`docs/CANARY-CHANNEL.md` "Measured") found that the Memory Curator kept a lesson from the #371 probe Loop that the Judge had just judged false. The lesson calls the probe harmless. kind-ref's gocli memory also held four lessons from the 11-09/11-10 gaming runs that spell out the hardcoded-switch trick. Every later Loop on that repo reads them at start (ADR-0002).
+- **Change:** the memory writer Job (`ensureMemoryWriterJobAndNetPolicy`, `internal/controller/loop_memory_writer_job.go:217`) is not created when `status.judge` exists and its verdict is false or nil, or `status.judge.truncated` is true. This is the same set that forces a draft (D133). After S1, a `VerifySuspicious=True` hit withholds the lessons too.
+  - The Loop records `MemoryWriteDone=True` with its own reason (`LessonsWithheld`), a Normal Event and a history note naming the Judge signal.
+  - A Loop with no `status.judge` is unchanged.
+- **Specs:** envtest for each row of J3's table: a withheld row creates no memory writer Job, and the reason and Event are set. The clean-true and no-judge rows still write. The mutation that drops the check fails a spec.
+- **Kind:** not required for the gate itself: it decides whether a Job is created, with no pod script or volume change (R55 I263(c)). E1's probe Loop shows it (no new lesson file on the memory PVC).
+
 ### E1. The exit run (reviewer lab run)
 - **Run:** on kind-ref, scripted and restored, with everything above merged: the three Loops in "Done when".
 - **Record:** `kubectl get loop` with the `Judge` column, each Loop's conditions, and each PR's draft state. Add the probe's result to the canary note's "Measured" heading beside E0's.
@@ -105,7 +114,7 @@
   - an upgrade from v0.2.0 on kind-ref, with one Loop living across it (R1's method).
 - **After the tag:** the reviewer checks that each ghcr image lists both platforms, as for v0.2.0.
 
-**Parallel work:** E0 runs on the reviewer's side while H0 and J3 are built. J4 follows J3. J5a and S1 can run in parallel after J4. J5b follows J5a. E1 needs all of them.
+**Parallel work:** E0 runs on the reviewer's side while H0 and J3 are built. J4 and M1 follow J3. J5a and S1 can run in parallel after J4. J5b follows J5a. E1 needs all of them.
 
 ## After Phase 8: adoption (D130's second half; planned after v0.3.0)
 - **Dogfood:** Coxswain runs real goals on the owner's own repos day to day, not only planted ones. Each run's defects become slices.
@@ -134,6 +143,7 @@ This gets its own plan once v0.3.0 ships.
 | D131–D137 | See R57. | — | Decided (owner, 2026-11-11). |
 | D138 | **The `Judge` column's values and their order.** One column shows the Judge and the scan. | **One value, the most serious signal first:** `Suspicious` (scan hit) > `False` > `Truncated` > `Unknown` > `True`. Blank when there is no Judge and no hit. The conditions keep every signal. | **As recommended** (owner, 2026-11-12). |
 | D139 | **The release default.** `release.yml:117` passes `--prerelease`, so v0.3.0 will publish as a prerelease, as v0.2.0 did until the owner promoted it. | **Drop `--prerelease`.** Releases are proven before the tag (R1's method), so a tag is a release. It is a workflow change, so it is an owner push, like #477. | **As recommended** (owner, 2026-11-12). |
+| D140 | **Lessons from a flagged Loop** (found by E0). | **Withhold them** when the Judge is false, Unknown or truncated (the D133 set), and after S1 on a scan hit. | **As recommended** (owner, 2026-11-13). |
 
 ## Estimate
 - **Small slices:** H0, J3 and J4 take half a day to a day each.

@@ -127,6 +127,10 @@ const (
 	memoryWrittenReason      = "MemoryWritten"
 	memoryWriteFailedReason  = "MemoryWriteFailed"
 	memoryWriteSkippedReason = "MemoryWriteSkipped"
+
+	// lessonsWithheldReason (D140): the Judge flagged the Loop, so its lessons
+	// are not written.
+	lessonsWithheldReason = "LessonsWithheld"
 )
 
 // memoryWriterOutcomeArg returns the terminal outcome arg the operator passes
@@ -1186,6 +1190,10 @@ func (r *LoopReconciler) recordMemoryWriterOutcomeNoPod(loop *coxv1alpha1.Loop, 
 	}
 	return true
 }
+
+// judgeWithholdsLessons (D140) returns why the Loop's lessons are withheld
+// ("" = not withheld).
+func judgeWithholdsLessons(loop *coxv1alpha1.Loop) string { return "" }
 
 // jobTerminalCondition returns the Job's condition of the given type when it
 // is True, else nil.

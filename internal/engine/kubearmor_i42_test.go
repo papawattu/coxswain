@@ -37,6 +37,7 @@ package engine
 //          the proxy pods.
 
 import (
+	"reflect"
 	"slices"
 	"testing"
 )
@@ -133,6 +134,71 @@ func TestEmitModelProxyKubeArmorPolicyShape(t *testing.T) {
 	}
 	if !slices.Contains(matchProtocolItems(t, net["matchProtocols"]), "tcp") {
 		t.Fatalf("matchProtocols must include tcp, got %v", net["matchProtocols"])
+	}
+}
+
+// J5b step 3b (D132): the Judge proxy's KubeArmorPolicy — the SAME
+// hardening policy as the model proxy (the jproxy pod runs the model
+// proxy's image and binary, buildJudgeProxyPod), but with the Judge
+// proxy's DISJOINT selector (component=judge-proxy + judge-proxy-for,
+// NEVER coxswain.io/proxy-for or coxswain.io/loop) and its own name
+// (coxswain-<loop>-jproxy, the model proxy's coxswain-<loop>-proxy stays
+// the Loop's own proxy's policy). The spec is shared with the model
+// proxy by construction (EmitJudgeProxyKubeArmorPolicy re-points only the
+// selector and the name), so the two fences cannot drift.
+func TestEmitJudgeProxyKubeArmorPolicyShape(t *testing.T) {
+	judgeEP := "10.0.0.7:9100"
+	obj := EmitJudgeProxyKubeArmorPolicy(i42fLoop, i42fNS, judgeEP, "cluster.local")
+	if obj.GetName() != "coxswain-"+i42fLoop+"-jproxy" || obj.GetNamespace() != i42fNS {
+		t.Fatalf("the Judge proxy policy must be named coxswain-%s-jproxy in %s, got %s/%s",
+			i42fLoop, i42fNS, obj.GetName(), obj.GetNamespace())
+	}
+
+	// The SAME hardening spec as the model proxy for the Judge's endpoint
+	// (the positive control: every field below holds for the model proxy
+	// too, so the two fences cannot drift).
+	model := EmitModelProxyKubeArmorPolicy(i42fLoop, i42fNS, judgeEP, "cluster.local")
+
+	spec := obj.Object["spec"].(map[string]any)
+	if spec["action"] != kaptActionValue {
+		t.Fatalf("spec.action must be Block, got %v", spec["action"])
+	}
+
+	// Selector: the Judge proxy's DISJOINT label set.
+	labels := spec["selector"].(map[string]any)["matchLabels"].(map[string]any)
+	if labels["app.kubernetes.io/component"] != "judge-proxy" ||
+		labels["coxswain.io/judge-proxy-for"] != i42fLoop {
+		t.Fatalf("selector must match component=judge-proxy + judge-proxy-for=%s, got %v",
+			i42fLoop, labels)
+	}
+	if _, has := labels["coxswain.io/proxy-for"]; has {
+		t.Fatalf("the Judge proxy selector must NOT carry coxswain.io/proxy-for (the Loop proxy's key): %v", labels)
+	}
+	if _, has := labels["coxswain.io/loop"]; has {
+		t.Fatalf("the Judge proxy selector must NOT carry coxswain.io/loop (the agent policy's key): %v", labels)
+	}
+
+	// Process: only the model proxy binary (the jproxy runs the SAME
+	// binary, /usr/local/bin/proxy) — equal to the model proxy's process
+	// fence.
+	proc := spec["process"].(map[string]any)
+	if !slices.Equal(matchPathItems(t, proc["matchPaths"]), []string{"/usr/local/bin/proxy"}) {
+		t.Fatalf("the Judge proxy process.matchPaths must be exactly [{path: /usr/local/bin/proxy}], got %v",
+			matchPathItems(t, proc["matchPaths"]))
+	}
+
+	// Network: the Judge's endpoint host + tcp + the platform DNS allow
+	// (udp+tcp), as the model proxy's network block for the same endpoint.
+	modelSpec := model.Object["spec"].(map[string]any)
+	if !reflect.DeepEqual(spec["network"], modelSpec["network"]) {
+		t.Fatalf("the Judge proxy's network block must equal the model proxy's for the same endpoint, got %v vs %v",
+			spec["network"], modelSpec["network"])
+	}
+	net := spec["network"].(map[string]any)
+	if !slices.Contains(matchProtocolItems(t, net["matchProtocols"]), "udp") ||
+		!slices.Contains(matchProtocolItems(t, net["matchProtocols"]), "tcp") {
+		t.Fatalf("the Judge proxy matchProtocols must include udp AND tcp (platform DNS), got %v",
+			matchProtocolItems(t, net["matchProtocols"]))
 	}
 }
 

@@ -660,6 +660,32 @@ func judgeNetworkPolicy(loop *coxv1alpha1.Loop) *networkingv1.NetworkPolicy {
 			// pod + DNS when the Loop has a model (added below).
 		},
 	}
+	if judgeOwnEndpoint(loop) {
+		// J5b step 3b (D132): the Judge has an endpoint of its own, so its
+		// call goes through the Judge's OWN model proxy (<loop>-jproxy,
+		// judgeProxyLabels) — the egress rule targets the jproxy's pods
+		// INSTEAD of the Loop's proxy (proxy-for). The Loop proxy's Service
+		// selects proxyLabels, which the jproxy does not carry (the J5b
+		// label trap), so pointing this rule at the Loop's proxy would fence
+		// the Judge out of its actual path (the J1d/P5c egress-without-
+		// ingress shape, structurally caught by loop_i265_proxy_ingress_
+		// callers_test.go).
+		desired.Spec.Egress = []networkingv1.NetworkPolicyEgressRule{
+			{
+				To: []networkingv1.NetworkPolicyPeer{{
+					PodSelector: &metav1.LabelSelector{
+						MatchLabels: judgeProxyLabels(loop.Name),
+					},
+				}},
+				Ports: []networkingv1.NetworkPolicyPort{{Port: intstrPtr32(proxyPort)}},
+			},
+			{
+				To:    []networkingv1.NetworkPolicyPeer{dnsPeer()},
+				Ports: dnsPorts(),
+			},
+		}
+		return desired
+	}
 	if loop.Spec.Agent.ModelEndpoint != "" {
 		// The model-proxy egress rule (the Judge's /v1/chat/completions POST
 		// to the proxy; the proxy pod carries coxswain.io/proxy-for: <loop>)

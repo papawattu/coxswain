@@ -287,6 +287,43 @@ func modelProxyKaptSelector(loopName string) map[string]any {
 	}
 }
 
+// judgeProxyKaptSelector returns the label selector for a Loop's Judge proxy
+// pod (J5b, D132; via judgeProxyLabels in internal/controller: component =
+// judge-proxy + coxswain.io/judge-proxy-for — the label set DISJOINT from
+// proxyLabels, the J5b label trap). The selector NEVER carries
+// coxswain.io/loop.
+func judgeProxyKaptSelector(loopName string) map[string]any {
+	return map[string]any{
+		policy.ComponentLabelKey:      policy.ComponentJudgeProxyLabel,
+		"coxswain.io/judge-proxy-for": loopName,
+	}
+}
+
+// EmitJudgeProxyKubeArmorPolicy emits the KubeArmorPolicy for a Loop's Judge
+// proxy pod (J5b step 3b, D132). The Judge's own model proxy is the model
+// proxy's pod with the Judge's own endpoint and Secret, so it gets the SAME
+// hardening policy as the model proxy: the process block allows only the
+// proxy binary (/usr/local/bin/proxy — the jproxy pod runs the SAME image
+// and binary, buildJudgeProxyPod), the network block allows only the Judge
+// endpoint's host (+ its search-expanded form for a bare single-label
+// in-cluster Service name) + tcp + the platform DNS allow. The selector is
+// judgeProxyKaptSelector (judge-proxy + judge-proxy-for), and the policy
+// name is coxswain-<loop>-jproxy (the model proxy's coxswain-<loop>-proxy
+// stays the Loop's own proxy's policy — the two pods are fenced by two
+// policies).
+func EmitJudgeProxyKubeArmorPolicy(loopName, namespace, modelEndpoint, clusterDomain string) *unstructured.Unstructured {
+	obj := EmitModelProxyKubeArmorPolicy(loopName, namespace, modelEndpoint, clusterDomain)
+	// Re-point the selector and name at the Judge proxy; the spec (action
+	// Block, the process fence, the network block) is the model proxy's,
+	// shared by construction so the two fences cannot drift.
+	spec := obj.Object[KaptSpecKey].(map[string]any)
+	spec[KaptSelectorKey] = map[string]any{
+		KaptMatchLabelsKey: judgeProxyKaptSelector(loopName),
+	}
+	obj.Object[kaptMetadataKey].(map[string]any)[kaptNameKey] = "coxswain-" + loopName + "-jproxy"
+	return obj
+}
+
 // toolProxyKaptSelector returns the label selector for a Loop's tool proxy pod
 // (via toolProxyLabels in internal/controller: component = tool-proxy +
 // coxswain.io/tool-proxy-for + coxswain.io/tool). The selector NEVER carries

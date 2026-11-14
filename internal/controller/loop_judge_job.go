@@ -754,13 +754,19 @@ func (r *LoopReconciler) ensureJudgeAndSettle(ctx context.Context, loop *coxv1al
 	// release with no Job and no verdict (the Loop proceeds exactly as the
 	// judge-off path).
 	if !judgeEnabled(loop) {
-		r.releaseJudgeHold(loop, changed)
-		return false, nil
+		return r.settleAndRelease(ctx, loop, changed)
 	}
 	// The NetworkPolicy BEFORE the Job (the memory-writer's P3-6 ordering:
 	// the judge pod never runs without its fence).
 	if err := r.ensureJudgeNetworkPolicy(ctx, loop); err != nil {
 		return false, fmt.Errorf("ensure judge netpol: %w", err)
+	}
+	// D141: the Judge's own proxy (pod + Service + NetworkPolicy) lives only
+	// while the Judge Job runs; it is created right before the Job.
+	if requeue, perr := r.ensureJudgeProxy(ctx, loop); perr != nil {
+		return false, fmt.Errorf("ensure judge proxy: %w", perr)
+	} else if requeue {
+		return true, nil
 	}
 	job, err := r.ensureJudgeJob(ctx, loop)
 	if err != nil {
@@ -769,8 +775,7 @@ func (r *LoopReconciler) ensureJudgeAndSettle(ctx context.Context, loop *coxv1al
 		// surfaced, the verdict is Unknown, never a pass).
 		r.recordJudgeUnavailable(loop, "judge job build failed: "+err.Error())
 		*changed = true
-		r.releaseJudgeHold(loop, changed)
-		return false, nil
+		return r.settleAndRelease(ctx, loop, changed)
 	}
 	// Job Failed (incl. DeadlineExceeded): the Judge's verdict is Unknown
 	// (D124) and the Loop proceeds. Decided before the pod read — the
@@ -780,12 +785,20 @@ func (r *LoopReconciler) ensureJudgeAndSettle(ctx context.Context, loop *coxv1al
 		cond := jobTerminalCondition(job, batchv1.JobFailed)
 		r.recordJudgeUnavailable(loop, "judge job failed: "+cond.Reason)
 		*changed = true
-		r.releaseJudgeHold(loop, changed)
-		return false, nil
+		return r.settleAndRelease(ctx, loop, changed)
 	}
 	// Job in progress (the Complete condition was checked after Failed; no
 	// conditions at all is also in progress): NO decision, requeue.
 	if jobTerminalCondition(job, batchv1.JobComplete) == nil {
+		// Fold a reading so the caps see the Judge's spend mid-run. It is
+		// not the final read: a failure (ErrNotReady, an HTTP error) is
+		// SILENT here (no JudgeUsageUnread; the final read reports a loss).
+		if judgeOwnEndpoint(loop) {
+			if fr, rerr := r.resolveJudgeProxyUsageRead(ctx, loop); rerr == nil && fr != nil {
+				r.applyJudgeUsageReading(ctx, loop, *fr)
+				*changed = true
+			}
+		}
 		return true, nil
 	}
 	// Job Complete: read the judge container's termination message (the
@@ -798,11 +811,22 @@ func (r *LoopReconciler) ensureJudgeAndSettle(ctx context.Context, loop *coxv1al
 		// but the verdict is unread, so it is unavailable (D124).
 		r.recordJudgeUnavailable(loop, "judge verdict unreadable: "+err.Error())
 		*changed = true
-		r.releaseJudgeHold(loop, changed)
-		return false, nil
+		return r.settleAndRelease(ctx, loop, changed)
 	}
 	r.applyJudgeVerdict(loop, msg)
 	*changed = true
+	return r.settleAndRelease(ctx, loop, changed)
+}
+
+// settleAndRelease ends the Judge proxy's life (the final usage read, then the
+// delete: D141) and releases the Judging hold. The verdict (or
+// JudgeUnavailable) is already recorded, so a final-read note lands on the
+// JudgeVerdict condition. A delete error is returned (the hold stays and the
+// next reconcile retries).
+func (r *LoopReconciler) settleAndRelease(ctx context.Context, loop *coxv1alpha1.Loop, changed *bool) (bool, error) {
+	if err := r.settleJudgeProxy(ctx, loop); err != nil {
+		return false, fmt.Errorf("settle judge proxy: %w", err)
+	}
 	r.releaseJudgeHold(loop, changed)
 	return false, nil
 }

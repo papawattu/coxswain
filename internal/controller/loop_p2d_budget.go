@@ -89,6 +89,8 @@ const (
 	// usage endpoint before a read failure is counted (F84): the pod is
 	// created in the same reconcile that then reads it, and a recreated pod
 	// replaces it, so the first seconds are "not there yet", not a failure.
+	// The Judge proxy's FINAL settle read is exempt (readPodUsage
+	// skipStartGrace): that pod is deleted in the same pass.
 	proxyUsageStartGrace = 60 * time.Second
 	// budgetReadFailurePhrase is the condition message's transition phrase
 	// (fixed: the count lives in the Event, see noteUsageReadFailed).
@@ -478,12 +480,18 @@ func (r *LoopReconciler) ensureBudgetStatus(loop *coxv1alpha1.Loop, activeSecond
 // otherwise — no new RBAC: the operator already has pod get) and performs a
 // plain HTTP GET to http://<pod-ip>:9090/coxswain/usage.
 func (r *LoopReconciler) readProxyUsageDefault(ctx context.Context, loop *coxv1alpha1.Loop) (proxy.Reading, error) {
-	return r.readPodUsage(ctx, loop, proxyPodName(loop.Name))
+	return r.readPodUsage(ctx, loop, proxyPodName(loop.Name), false)
 }
 
 // readPodUsage reads the usage endpoint of the named model-proxy pod (the
 // Loop's <loop>-proxy, or the Judge's <loop>-jproxy, J5b D141).
-func (r *LoopReconciler) readPodUsage(ctx context.Context, loop *coxv1alpha1.Loop, podName string) (proxy.Reading, error) {
+//
+// skipStartGrace is true ONLY for the Judge proxy's FINAL settle read: that pod
+// is deleted in the same pass, so F84's "not there yet, try later" has no later
+// and would lose its tokens (J5b P1). It then attempts the HTTP read whatever
+// the pod's age; a failed read is reported by the caller (JudgeUsageUnread).
+// Every other read keeps the grace.
+func (r *LoopReconciler) readPodUsage(ctx context.Context, loop *coxv1alpha1.Loop, podName string, skipStartGrace bool) (proxy.Reading, error) {
 	reader := r.apiReader
 	if reader == nil {
 		reader = r
@@ -503,7 +511,7 @@ func (r *LoopReconciler) readPodUsage(ctx context.Context, loop *coxv1alpha1.Loo
 		// reading.
 		return proxy.Reading{}, fmt.Errorf("proxy pod %s/%s has no pod IP (not Ready): %w", loop.Namespace, pod.Name, proxy.ErrNotReady)
 	}
-	if started := pod.CreationTimestamp.Time; !started.IsZero() && r.operatorNow().Sub(started) < proxyUsageStartGrace {
+	if started := pod.CreationTimestamp.Time; !skipStartGrace && !started.IsZero() && r.operatorNow().Sub(started) < proxyUsageStartGrace {
 		// The pod exists but is inside its start grace: the first seconds are
 		// "not there yet" (the pod is created or replaced by this very
 		// reconcile), so nothing here is a read failure (F84).
@@ -875,7 +883,9 @@ const judgeUsageUnreadReason = "JudgeUsageUnread"
 
 // resolveJudgeProxyUsageRead is resolveProxyUsageRead for the Judge proxy
 // (<loop>-jproxy): the readJudgeProxyUsage seam, else the pod's usage endpoint.
-func (r *LoopReconciler) resolveJudgeProxyUsageRead(ctx context.Context, loop *coxv1alpha1.Loop) (*proxy.Reading, error) {
+// final is true only for settleJudgeProxy's read before the delete: it skips
+// F84's start grace (see readPodUsage).
+func (r *LoopReconciler) resolveJudgeProxyUsageRead(ctx context.Context, loop *coxv1alpha1.Loop, final bool) (*proxy.Reading, error) {
 	if r.readJudgeProxyUsage != nil {
 		reading, err := r.readJudgeProxyUsage(ctx, loop)
 		if err != nil {
@@ -883,7 +893,7 @@ func (r *LoopReconciler) resolveJudgeProxyUsageRead(ctx context.Context, loop *c
 		}
 		return &reading, nil
 	}
-	reading, err := r.readPodUsage(ctx, loop, judgeProxyName(loop.Name))
+	reading, err := r.readPodUsage(ctx, loop, judgeProxyName(loop.Name), final)
 	if err != nil {
 		return nil, err
 	}

@@ -794,7 +794,7 @@ func (r *LoopReconciler) ensureJudgeAndSettle(ctx context.Context, loop *coxv1al
 		// not the final read: a failure (ErrNotReady, an HTTP error) is
 		// SILENT here (no JudgeUsageUnread; the final read reports a loss).
 		if judgeOwnEndpoint(loop) {
-			if fr, rerr := r.resolveJudgeProxyUsageRead(ctx, loop); rerr == nil && fr != nil {
+			if fr, rerr := r.resolveJudgeProxyUsageRead(ctx, loop, false); rerr == nil && fr != nil {
 				r.applyJudgeUsageReading(ctx, loop, *fr)
 				*changed = true
 			}

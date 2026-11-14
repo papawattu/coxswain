@@ -155,7 +155,7 @@ func (r *LoopReconciler) ensureJudgeProxy(ctx context.Context, loop *coxv1alpha1
 		// Spec drift (an operator upgrade): a final read so the recreate's
 		// boot-ID change loses nothing recorded, then delete; the Owns(Pod)
 		// watch re-reconciles and creates the new pod.
-		if fr, rerr := r.resolveJudgeProxyUsageRead(ctx, loop); rerr == nil && fr != nil {
+		if fr, rerr := r.resolveJudgeProxyUsageRead(ctx, loop, false); rerr == nil && fr != nil {
 			r.applyJudgeUsageReading(ctx, loop, *fr)
 		}
 		if derr := r.Delete(ctx, existing); derr != nil && !apierrors.IsNotFound(derr) {
@@ -182,7 +182,7 @@ func (r *LoopReconciler) settleJudgeProxy(ctx context.Context, loop *coxv1alpha1
 	}
 	podFound := podErr == nil
 	if podFound || judgeOwnEndpoint(loop) {
-		if fr, rerr := r.resolveJudgeProxyUsageRead(ctx, loop); rerr == nil && fr != nil {
+		if fr, rerr := r.resolveJudgeProxyUsageRead(ctx, loop, true); rerr == nil && fr != nil {
 			r.applyJudgeUsageReading(ctx, loop, *fr)
 		} else if rerr != nil {
 			r.noteJudgeUsageUnread(loop, rerr)

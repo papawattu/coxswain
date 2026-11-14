@@ -6,7 +6,10 @@ package controller
 import (
 	"context"
 	"fmt"
+	"io"
+	"net/http"
 	"strings"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -215,6 +218,39 @@ var _ = Describe("J5b 3a the Judge proxy lifecycle (D141)", func() {
 		Expect(loop.Status.Budget == nil || loop.Status.Budget.PromptTokens == 0).To(BeTrue(), "no silent zero is invented as a reading")
 	})
 
+	// P1 on #491: the FINAL read must not be refused by F84's 60s start grace
+	// (the pod is deleted in the same pass, so "try later" loses the tokens).
+	// The DEFAULT reader runs (no seam): the grace lives in it.
+	It("the FINAL read of a jproxy younger than the start grace still folds its usage into status.budget", func() {
+		ns := freshNS()
+		jobName := judgeDriveToJudging(ns, "j5bl-y", false, j5bOwnEndpoint)
+		key := types.NamespacedName{Namespace: ns, Name: judgeProxyName("j5bl-y")}
+		pod := &corev1.Pod{}
+		Expect(k8sClient.Get(ctx, key, pod)).To(Succeed())
+		pod.Status.PodIP = "127.0.0.1"
+		Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+
+		finishJudge(ns, "j5bl-y", jobName)
+		r := judgeFreshReconciler()
+		young := metav1.NewTime(pod.CreationTimestamp.Add(10 * time.Second))
+		r.now = func() metav1.Time { return young }
+		gets := 0
+		r.usageHTTPClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			gets++
+			return &http.Response{StatusCode: http.StatusOK, Header: http.Header{},
+				Body: io.NopCloser(strings.NewReader(`{"bootID":"jy1","promptTokens":100,"completionTokens":20,"requests":1}`))}, nil
+		})}
+		loop := judgeReconcile(r, ns, "j5bl-y")
+		Expect(gets).To(Equal(1), "the usage endpoint was read despite the pod's age (10s < proxyUsageStartGrace)")
+		Expect(loop.Status.Budget).NotTo(BeNil())
+		Expect(loop.Status.Budget.JudgeProxy).NotTo(BeNil())
+		Expect(loop.Status.Budget.JudgeProxy.LastBootID).To(Equal("jy1"))
+		Expect(loop.Status.Budget.PromptTokens).To(Equal(int64(100)))
+		Expect(loop.Status.Budget.CompletionTokens).To(Equal(int64(20)))
+		pod2, _ := jproxyExists(ns, "j5bl-y")
+		Expect(pod2).To(BeFalse(), "the jproxy is still deleted")
+	})
+
 	It("a Judge job that failed also takes the jproxy down", func() {
 		ns := freshNS()
 		jobName := judgeDriveToJudging(ns, "j5bl-d", false, j5bOwnEndpoint)
@@ -308,3 +344,8 @@ var _ = Describe("J5b 3a the Judge proxy metering (D141)", func() {
 		Expect(loop.Status.Budget.ExceededReason).To(Equal(coxv1alpha1.BudgetExceededTokens))
 	})
 })
+
+// roundTripFunc is an http.RoundTripper from a func.
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }

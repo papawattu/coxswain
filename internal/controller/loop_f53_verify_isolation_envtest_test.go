@@ -105,6 +105,21 @@ var _ = Describe("F53: the verify Job isolates the checks and is time-bounded", 
 					"the canary must NOT be able to write the verified checkout (D19)")
 				continue
 			}
+			if ct.Name == verifyScanPrepInit {
+				// S1: scan-prep only READS the checkout (git show) and writes
+				// /scan; scan never mounts /verify at all.
+				m := f53Mount(ct, verifyVol)
+				Expect(m).NotTo(BeNil(), "scan-prep must mount the checkout /verify")
+				Expect(m.ReadOnly).To(BeTrue(), "scan-prep must NOT be able to write the verified checkout")
+				continue
+			}
+			if ct.Name == verifyScanInit {
+				Expect(f53Mount(ct, verifyVol)).To(BeNil(), "scan must not mount the checkout /verify")
+				m := f53Mount(ct, verifyScanVolName)
+				Expect(m).NotTo(BeNil(), "scan must mount /scan")
+				Expect(m.ReadOnly).To(BeTrue(), "scan must mount /scan read-only")
+				continue
+			}
 			trusted++
 			m := f53Mount(ct, verifyVol)
 			Expect(m).NotTo(BeNil(), "trusted init %s must mount /verify", ct.Name)

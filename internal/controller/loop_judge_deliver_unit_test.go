@@ -16,15 +16,19 @@
 // PR as a draft whatever spec.delivery.draft says; D133 (R57): a nil verdict
 // (Unknown) or a truncated diff forces a draft like a false verdict; a clean
 // true verdict or no status.judge leaves spec.delivery.draft exactly as it is
-// (default true). The test is a plain unit test (no envtest, no cluster):
+// (default true); D135 (S1): a VerifySuspicious True (the diff scan found a
+// subversion pattern) forces a draft too, whatever spec.delivery.draft says.
+// The test is a plain unit test (no envtest, no cluster):
 // deliverDraft is a pure function of the Loop's spec/status, and the table
 // below covers every combination of spec.delivery.draft (unset / false) with
-// status.judge (nil / verdict nil / verdict true / verdict false) and the
-// Truncated flag.
+// status.judge (nil / verdict nil / verdict true / verdict false), the
+// Truncated flag, and the VerifySuspicious condition (D135).
 package controller
 
 import (
 	"testing"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
 )
@@ -54,21 +58,27 @@ func TestDeliverDraftJudgeVerdict(t *testing.T) {
 		name  string
 		draft *bool // nil = spec.delivery.draft unset
 		judge *coxv1alpha1.JudgeStatus
-		want  bool
+		// suspicious: the VerifySuspicious condition is present (D135).
+		suspicious bool
+		want       bool
 	}{
-		{"no judge, draft unset -> true", nil, nil, true},
-		{"no judge, draft false -> false", new(bool), nil, false},
-		{"verdict false, draft false -> true (the advisory forces a draft)", new(bool), &coxv1alpha1.JudgeStatus{Verdict: &fv}, true},
-		{"verdict false, draft unset -> true", nil, &coxv1alpha1.JudgeStatus{Verdict: &fv}, true},
-		{"verdict true, draft false -> false", new(bool), &coxv1alpha1.JudgeStatus{Verdict: &tv}, false},
-		{"verdict true, draft unset -> true", nil, &coxv1alpha1.JudgeStatus{Verdict: &tv}, true},
-		{"verdict nil, draft false -> true (D133: Unknown forces a draft)", new(bool), &noJudge, true},
-		{"verdict nil, draft unset -> true", nil, &noJudge, true},
-		{"verdict true + truncated, draft false -> true (D133)", new(bool), &coxv1alpha1.JudgeStatus{Verdict: &tv, Truncated: true}, true},
-		{"verdict false + truncated, draft false -> true", new(bool), &coxv1alpha1.JudgeStatus{Verdict: &fv, Truncated: true}, true},
-		{"verdict nil + truncated, draft false -> true (D133)", new(bool), &coxv1alpha1.JudgeStatus{Truncated: true}, true},
+		{"no judge, draft unset -> true", nil, nil, false, true},
+		{"no judge, draft false -> false", new(bool), nil, false, false},
+		{"verdict false, draft false -> true (the advisory forces a draft)", new(bool), &coxv1alpha1.JudgeStatus{Verdict: &fv}, false, true},
+		{"verdict false, draft unset -> true", nil, &coxv1alpha1.JudgeStatus{Verdict: &fv}, false, true},
+		{"verdict true, draft false -> false", new(bool), &coxv1alpha1.JudgeStatus{Verdict: &tv}, false, false},
+		{"verdict true, draft unset -> true", nil, &coxv1alpha1.JudgeStatus{Verdict: &tv}, false, true},
+		{"verdict nil, draft false -> true (D133: Unknown forces a draft)", new(bool), &noJudge, false, true},
+		{"verdict nil, draft unset -> true", nil, &noJudge, false, true},
+		{"verdict true + truncated, draft false -> true (D133)", new(bool), &coxv1alpha1.JudgeStatus{Verdict: &tv, Truncated: true}, false, true},
+		{"verdict false + truncated, draft false -> true", new(bool), &coxv1alpha1.JudgeStatus{Verdict: &fv, Truncated: true}, false, true},
+		{"verdict nil + truncated, draft false -> true (D133)", new(bool), &coxv1alpha1.JudgeStatus{Truncated: true}, false, true},
+		{"VerifySuspicious True, no judge, draft false -> true (D135: the scan forces a draft)", new(bool), nil, true, true},
+		{"VerifySuspicious True + verdict true, draft false -> true (D135)", new(bool), &coxv1alpha1.JudgeStatus{Verdict: &tv}, true, true},
+		{"VerifySuspicious False, draft false -> false (D135: a clean scan is not a flag)", new(bool), nil, false, false},
 	}
 
+	suspCond := metav1.Condition{Type: coxv1alpha1.VerifySuspiciousCondition, Status: metav1.ConditionTrue, Reason: string(coxv1alpha1.ReasonSubversionPatternInDiff)}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			loop := &coxv1alpha1.Loop{
@@ -76,6 +86,9 @@ func TestDeliverDraftJudgeVerdict(t *testing.T) {
 					Delivery: &coxv1alpha1.DeliveryConfig{Draft: tt.draft},
 				},
 				Status: coxv1alpha1.LoopStatus{Judge: tt.judge},
+			}
+			if tt.suspicious {
+				loop.Status.Conditions = append(loop.Status.Conditions, suspCond)
 			}
 			if got := deliverDraft(loop); got != tt.want {
 				t.Errorf("deliverDraft() = %v, want %v (draft=%v judge=%v)", got, tt.want, tt.draft, tt.judge)

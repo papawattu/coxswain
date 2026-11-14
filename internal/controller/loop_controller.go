@@ -594,6 +594,10 @@ type LoopReconciler struct {
 	// (F44, F84b).
 	readProxyUsage func(ctx context.Context, loop *coxv1alpha1.Loop) (proxy.Reading, error)
 
+	// readJudgeProxyUsage is the same seam for the Judge proxy (J5b, D141):
+	// nil reads the <loop>-jproxy pod's /coxswain/usage endpoint.
+	readJudgeProxyUsage func(ctx context.Context, loop *coxv1alpha1.Loop) (proxy.Reading, error)
+
 	// usageHTTPClient is the http.Client the default readProxyUsage uses. Set
 	// in tests to shorten the read timeout; the production default is a 2s
 	// timeout (a proxy that does not answer is not worth blocking the
@@ -3359,6 +3363,22 @@ func proxyNdotsOneDNSConfig() *corev1.PodDNSConfig {
 }
 
 func (r *LoopReconciler) buildProxyPod(loop *coxv1alpha1.Loop, loopName, ns, image string) *corev1.Pod {
+	// The Loop's own model proxy (D33): the agent's endpoint and credential
+	// Secret, the agent proxy's name and labels.
+	return r.buildModelProxyPod(loop, proxyPodName(loopName), ns, proxyLabels(loopName),
+		modelEndpointValue(loop), loop.Spec.Agent.EndpointSecretRef, image)
+}
+
+// buildModelProxyPod builds the model-proxy pod shape shared by the Loop's
+// own proxy (buildProxyPod, D33) and the Judge's proxy (J5b, D132). It reads
+// ONLY its parameters for the endpoint and the credential Secret — the
+// caller decides which endpoint and which Secret the pod carries, so the
+// Judge's proxy can never carry the agent's endpoint or Secret (the label
+// trap: the Loop's proxy Service selects proxyLabels, so the Judge's pod
+// must NOT carry them or the Loop's Service would route agent calls to the
+// Judge's endpoint).
+func (r *LoopReconciler) buildModelProxyPod(loop *coxv1alpha1.Loop, podName, ns string, labels map[string]string, endpoint, secretRef, image string) *corev1.Pod {
+	loopName := loop.Name
 	secretMode := readOnlyMode
 	falseP := false
 	trueP := true
@@ -3368,9 +3388,9 @@ func (r *LoopReconciler) buildProxyPod(loop *coxv1alpha1.Loop, loopName, ns, ima
 
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      proxyPodName(loopName),
+			Name:      podName,
 			Namespace: ns,
-			Labels:    proxyLabels(loopName),
+			Labels:    labels,
 		},
 		Spec: corev1.PodSpec{
 			AutomountServiceAccountToken: &falseP,
@@ -3411,7 +3431,7 @@ func (r *LoopReconciler) buildProxyPod(loop *coxv1alpha1.Loop, loopName, ns, ima
 				Env: []corev1.EnvVar{
 					{
 						Name:  "MODEL_ENDPOINT",
-						Value: modelEndpointValue(loop),
+						Value: endpoint,
 					},
 					{
 						Name:  "MODEL_CRED_FILE",
@@ -3447,7 +3467,7 @@ func (r *LoopReconciler) buildProxyPod(loop *coxv1alpha1.Loop, loopName, ns, ima
 					Name: modelCredsVolume,
 					VolumeSource: corev1.VolumeSource{
 						Secret: &corev1.SecretVolumeSource{
-							SecretName:  loop.Spec.Agent.EndpointSecretRef,
+							SecretName:  secretRef,
 							DefaultMode: &secretMode,
 						},
 					},
@@ -3522,6 +3542,17 @@ func proxyServiceName(loopName string) string {
 // reconciler's ClusterDomain field (default cluster.local, R16 I44 item 2).
 func (r *LoopReconciler) proxyServiceURL(loopName, namespace string) string {
 	return fmt.Sprintf("http://%s.%s.svc.%s:%d", proxyServiceName(loopName), namespace, r.clusterDomain(), proxyPort)
+}
+
+// judgeProxyServiceURL is the in-cluster Service URL the Judge's
+// COX_JUDGE_BASE_URL points at when the Judge has an endpoint of its own
+// (J5b, D132): http://<loop>-jproxy.<namespace>.svc.<clusterDomain>:8080.
+// The Judge's proxy pod carries the Judge's labels (judgeProxyLabels), NOT
+// proxyLabels, so the Loop's own proxy Service never selects it — the Judge
+// call reaches the Judge's own proxy + credential, metered into the Loop's
+// totals.
+func (r *LoopReconciler) judgeProxyServiceURL(loopName, namespace string) string {
+	return fmt.Sprintf("http://%s.%s.svc.%s:%d", judgeProxyName(loopName), namespace, r.clusterDomain(), proxyPort)
 }
 
 // egressProxyServiceURL is the in-cluster URL the agent's *_PROXY env vars

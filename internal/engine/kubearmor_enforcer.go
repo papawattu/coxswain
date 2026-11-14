@@ -136,6 +136,23 @@ func (e *KubeArmorEnforcer) Apply(ctx context.Context, loop *v1alpha1.Loop, p po
 		return err
 	}
 
+	// J5b step 3b (D132): the Judge proxy policy — the SAME hardening policy
+	// as the model proxy (the jproxy pod runs the model proxy's image and
+	// binary, with the Judge's own endpoint and Secret), but with the Judge
+	// proxy's DISJOINT selector (judge-proxy + judge-proxy-for) and its own
+	// name (coxswain-<loop>-jproxy). Created only when the Judge has an own
+	// endpoint (that is when the jproxy pod is expected); cleaned up in the
+	// else branch when it is not (a stale policy would keep fencing a pod
+	// that no longer exists — the model proxy policy's drift rationale).
+	if judgeOwnEndpoint(loop) {
+		judgeObj := EmitJudgeProxyKubeArmorPolicy(loop.Name, loop.Namespace, loop.Spec.Verify.Judge.ModelEndpoint, e.clusterDomain())
+		if err := e.createOrUpdateKapt(ctx, loop, judgeObj); err != nil {
+			return err
+		}
+	} else if err := e.cleanupJudgeProxyKapt(ctx, loop); err != nil {
+		return err
+	}
+
 	// I42f: the egress proxy policy (created only when the egress proxy is
 	// expected, i.e. the effective policy has network allows). Cleaned up in
 	// the else branch when the allows go away (a stale policy would keep
@@ -277,6 +294,44 @@ func (e *KubeArmorEnforcer) cleanupModelProxyKapt(ctx context.Context, loop *v1a
 	}
 	if err := e.Client.Delete(ctx, obj); err != nil && !errors.IsNotFound(err) {
 		return fmt.Errorf("delete model proxy KubeArmorPolicy: %w", err)
+	}
+	return nil
+}
+
+// judgeOwnEndpoint mirrors internal/controller's judgeOwnEndpoint (J5b,
+// D132): the Judge is enabled AND names its own endpoint. The enforcer's
+// Apply decides the Judge proxy policy's expectation from the SAME predicate
+// the controller uses for the jproxy pod and its NetworkPolicies, so the
+// three paths cannot drift.
+func judgeOwnEndpoint(loop *v1alpha1.Loop) bool {
+	j := loop.Spec.Verify.Judge
+	return j != nil && j.Enabled && j.ModelEndpoint != ""
+}
+
+// cleanupJudgeProxyKapt deletes the Judge proxy KubeArmorPolicy when the
+// Judge no longer has an own endpoint (the model proxy policy's drift
+// rationale). A FOREIGN policy occupying the name is left alone (I2
+// never-take-over).
+func (e *KubeArmorEnforcer) cleanupJudgeProxyKapt(ctx context.Context, loop *v1alpha1.Loop) error {
+	obj := &unstructured.Unstructured{}
+	obj.SetGroupVersionKind(kaptGroupVersion.WithKind(kaptKind))
+	err := e.Client.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: "coxswain-" + loop.Name + "-jproxy"}, obj)
+	if errors.IsNotFound(err) {
+		return nil
+	}
+	// KubeArmor CRD absent: tolerated only under --allow-unenforced (D38);
+	// a loud error in production (reviewer P1 on b25f77e).
+	if meta.IsNoMatchError(err) && e.AllowUnenforced {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("get Judge proxy KubeArmorPolicy: %w", err)
+	}
+	if !metav1.IsControlledBy(obj, loop) {
+		return nil
+	}
+	if err := e.Client.Delete(ctx, obj); err != nil && !errors.IsNotFound(err) {
+		return fmt.Errorf("delete Judge proxy KubeArmorPolicy: %w", err)
 	}
 	return nil
 }

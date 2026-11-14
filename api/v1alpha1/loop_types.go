@@ -378,6 +378,7 @@ type VerifyConfig struct {
 // (the CEL compiler rejects field selection on a bool or int), while on the
 // type self is the JudgeConfig object.
 // +kubebuilder:validation:XValidation:rule="!self.enabled || has(self.maxTokens)",message="maxTokens is required when the Judge is enabled"
+// +kubebuilder:validation:XValidation:rule="has(self.modelEndpoint) == has(self.endpointSecretRef)",message="judge modelEndpoint and endpointSecretRef must be set together"
 type JudgeConfig struct {
 	// enabled turns the Judge on for this Loop. Never defaulted — without it
 	// (or with it false) no Judge Job is created and nothing in the phase
@@ -404,6 +405,26 @@ type JudgeConfig struct {
 	// +kubebuilder:validation:MaxLength=253
 	// +optional
 	Model string `json:"model,omitempty"`
+
+	// modelEndpoint is the Judge's own model server (host:port), reached
+	// through the Judge's own model proxy (<loop>-jproxy), metered into the
+	// Loop's totals (D132, ADR-0009). Empty = the Loop's proxy and endpoint.
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern="^[a-z0-9]([a-z0-9.-]*[a-z0-9])?:[0-9]{1,5}$"
+	// +kubebuilder:validation:XValidation:rule="self == '' || int(self.split(':')[1]) > 0 && int(self.split(':')[1]) <= 65535",message="modelEndpoint port must be 1-65535"
+	// +kubebuilder:validation:XValidation:rule="self == '' || self == oldSelf",message="judge modelEndpoint is immutable (the Judge proxy NetworkPolicy cannot change)"
+	// +optional
+	ModelEndpoint string `json:"modelEndpoint,omitempty"`
+
+	// endpointSecretRef names the Secret with the Judge endpoint's API key,
+	// mounted only into the Judge's proxy. Set together with modelEndpoint.
+	// Immutable for the same reason as the Loop's spec.agent.endpointSecretRef
+	// (the proxy pod's spec.volumes is immutable).
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
+	// +kubebuilder:validation:XValidation:rule="self == '' || self == oldSelf",message="judge endpointSecretRef is immutable (the Judge proxy pod's spec.volumes cannot change)"
+	// +optional
+	EndpointSecretRef string `json:"endpointSecretRef,omitempty"`
 }
 
 // VerifyStatus is the operator's record of the last verify run's evidence
@@ -1334,6 +1355,27 @@ const (
 	PausedReasonBudget PausedReason = "Budget"
 )
 
+// JudgeProxyUsage is the last-read state of the Judge proxy's cumulative
+// usage counters (J5b, D141), the Judge proxy's counterpart of the
+// BudgetStatus last* fields.
+type JudgeProxyUsage struct {
+	// lastBootID is the Judge proxy boot ID the last-read counters came from.
+	// +optional
+	LastBootID string `json:"lastBootID,omitempty"`
+	// lastPromptTokens is the last-read cumulative prompt-token counter.
+	// +optional
+	LastPromptTokens int64 `json:"lastPromptTokens,omitempty"`
+	// lastCompletionTokens is the last-read cumulative completion-token counter.
+	// +optional
+	LastCompletionTokens int64 `json:"lastCompletionTokens,omitempty"`
+	// lastRequests is the last-read cumulative metered-request counter.
+	// +optional
+	LastRequests int64 `json:"lastRequests,omitempty"`
+	// lastUnmeteredRequests is the last-read cumulative unmetered-request counter.
+	// +optional
+	LastUnmeteredRequests int64 `json:"lastUnmeteredRequests,omitempty"`
+}
+
 // BudgetStatus is the operator's record of the Loop's accumulated budget
 // consumption (P2c; the counts are accumulated by P2d from the model proxy
 // endpoint, ADR-0009). The last* fields carry the last-READ CUMULATIVE
@@ -1407,6 +1449,15 @@ type BudgetStatus struct {
 	// counter from the proxy (item 2).
 	// +optional
 	LastUnmeteredRequests int64 `json:"lastUnmeteredRequests,omitempty"`
+
+	// judgeProxy is the Judge proxy's own delta state (J5b, D141): the Judge
+	// proxy (<loop>-jproxy) exists only while the Judge Job runs, and its
+	// usage is folded into the SAME totals above with its own boot-ID delta
+	// (a new jproxy for a later verify has a new boot ID, so its counters
+	// are added in full and never subtracted). Absent until a Judge proxy
+	// has been read.
+	// +optional
+	JudgeProxy *JudgeProxyUsage `json:"judgeProxy,omitempty"`
 
 	// bootIDChanged is true (sticky) when a proxy pod recreate wiped the
 	// counters between reads (the honest-limit marker, P2a): the

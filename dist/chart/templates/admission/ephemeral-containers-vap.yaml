@@ -28,10 +28,10 @@ spec:
         has(object.metadata.labels)
         && 'app.kubernetes.io/component' in object.metadata.labels
         && object.metadata.labels['app.kubernetes.io/component']
-        in ['agent', 'model-proxy', 'egress-proxy', 'tool-proxy']
+        in ['agent', 'model-proxy', 'judge-proxy', 'egress-proxy', 'tool-proxy']
   validations:
     - expression: "false"
       message: >-
         Adding ephemeral containers to coxswain component pods (agent,
-        model-proxy, egress-proxy, tool-proxy) is denied: the container would run
+        model-proxy, judge-proxy, egress-proxy, tool-proxy) is denied: the container would run
         outside the KubeArmor fence and share the pod's network namespace.

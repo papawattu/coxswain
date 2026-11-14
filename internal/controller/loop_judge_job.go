@@ -321,7 +321,21 @@ func (r *LoopReconciler) judgeEnvValueMap(loop *coxv1alpha1.Loop) map[string]str
 		"COX_JUDGE_GOAL":        loop.Spec.Goal,
 		"COX_JUDGE_PLAN":        planSummary(loop),
 	}
-	if loop.Spec.Agent.ModelEndpoint != "" {
+	if judgeOwnEndpoint(loop) {
+		// The Judge has an endpoint of its own (J5b, D132): the Judge's call
+		// goes through the Judge's own model proxy (<loop>-jproxy), which
+		// carries the Judge endpoint's Secret — NOT the Loop's own proxy
+		// (whose Service selects proxyLabels, so it never sees the Judge
+		// proxy pod). The Judge proxy exists whenever the Judge names its
+		// own endpoint, even if spec.agent.modelEndpoint is empty (the Judge
+		// endpoint is the Loop's only model surface in that case).
+		env["COX_JUDGE_BASE_URL"] = r.judgeProxyServiceURL(loop.Name, loop.Namespace)
+		model := loop.Spec.Agent.Model
+		if loop.Spec.Verify.Judge.Model != "" {
+			model = loop.Spec.Verify.Judge.Model
+		}
+		env["COX_JUDGE_MODEL"] = model
+	} else if loop.Spec.Agent.ModelEndpoint != "" {
 		// The Judge's call goes through the Loop's model proxy (the same
 		// URL the curator uses — loop_memory_writer_job.go's
 		// COX_CURATOR_BASE_URL; D123: one metered path, no new
@@ -646,6 +660,32 @@ func judgeNetworkPolicy(loop *coxv1alpha1.Loop) *networkingv1.NetworkPolicy {
 			// pod + DNS when the Loop has a model (added below).
 		},
 	}
+	if judgeOwnEndpoint(loop) {
+		// J5b step 3b (D132): the Judge has an endpoint of its own, so its
+		// call goes through the Judge's OWN model proxy (<loop>-jproxy,
+		// judgeProxyLabels) — the egress rule targets the jproxy's pods
+		// INSTEAD of the Loop's proxy (proxy-for). The Loop proxy's Service
+		// selects proxyLabels, which the jproxy does not carry (the J5b
+		// label trap), so pointing this rule at the Loop's proxy would fence
+		// the Judge out of its actual path (the J1d/P5c egress-without-
+		// ingress shape, structurally caught by loop_i265_proxy_ingress_
+		// callers_test.go).
+		desired.Spec.Egress = []networkingv1.NetworkPolicyEgressRule{
+			{
+				To: []networkingv1.NetworkPolicyPeer{{
+					PodSelector: &metav1.LabelSelector{
+						MatchLabels: judgeProxyLabels(loop.Name),
+					},
+				}},
+				Ports: []networkingv1.NetworkPolicyPort{{Port: intstrPtr32(proxyPort)}},
+			},
+			{
+				To:    []networkingv1.NetworkPolicyPeer{dnsPeer()},
+				Ports: dnsPorts(),
+			},
+		}
+		return desired
+	}
 	if loop.Spec.Agent.ModelEndpoint != "" {
 		// The model-proxy egress rule (the Judge's /v1/chat/completions POST
 		// to the proxy; the proxy pod carries coxswain.io/proxy-for: <loop>)
@@ -714,13 +754,19 @@ func (r *LoopReconciler) ensureJudgeAndSettle(ctx context.Context, loop *coxv1al
 	// release with no Job and no verdict (the Loop proceeds exactly as the
 	// judge-off path).
 	if !judgeEnabled(loop) {
-		r.releaseJudgeHold(loop, changed)
-		return false, nil
+		return r.settleAndRelease(ctx, loop, changed)
 	}
 	// The NetworkPolicy BEFORE the Job (the memory-writer's P3-6 ordering:
 	// the judge pod never runs without its fence).
 	if err := r.ensureJudgeNetworkPolicy(ctx, loop); err != nil {
 		return false, fmt.Errorf("ensure judge netpol: %w", err)
+	}
+	// D141: the Judge's own proxy (pod + Service + NetworkPolicy) lives only
+	// while the Judge Job runs; it is created right before the Job.
+	if requeue, perr := r.ensureJudgeProxy(ctx, loop); perr != nil {
+		return false, fmt.Errorf("ensure judge proxy: %w", perr)
+	} else if requeue {
+		return true, nil
 	}
 	job, err := r.ensureJudgeJob(ctx, loop)
 	if err != nil {
@@ -729,8 +775,7 @@ func (r *LoopReconciler) ensureJudgeAndSettle(ctx context.Context, loop *coxv1al
 		// surfaced, the verdict is Unknown, never a pass).
 		r.recordJudgeUnavailable(loop, "judge job build failed: "+err.Error())
 		*changed = true
-		r.releaseJudgeHold(loop, changed)
-		return false, nil
+		return r.settleAndRelease(ctx, loop, changed)
 	}
 	// Job Failed (incl. DeadlineExceeded): the Judge's verdict is Unknown
 	// (D124) and the Loop proceeds. Decided before the pod read — the
@@ -740,12 +785,20 @@ func (r *LoopReconciler) ensureJudgeAndSettle(ctx context.Context, loop *coxv1al
 		cond := jobTerminalCondition(job, batchv1.JobFailed)
 		r.recordJudgeUnavailable(loop, "judge job failed: "+cond.Reason)
 		*changed = true
-		r.releaseJudgeHold(loop, changed)
-		return false, nil
+		return r.settleAndRelease(ctx, loop, changed)
 	}
 	// Job in progress (the Complete condition was checked after Failed; no
 	// conditions at all is also in progress): NO decision, requeue.
 	if jobTerminalCondition(job, batchv1.JobComplete) == nil {
+		// Fold a reading so the caps see the Judge's spend mid-run. It is
+		// not the final read: a failure (ErrNotReady, an HTTP error) is
+		// SILENT here (no JudgeUsageUnread; the final read reports a loss).
+		if judgeOwnEndpoint(loop) {
+			if fr, rerr := r.resolveJudgeProxyUsageRead(ctx, loop); rerr == nil && fr != nil {
+				r.applyJudgeUsageReading(ctx, loop, *fr)
+				*changed = true
+			}
+		}
 		return true, nil
 	}
 	// Job Complete: read the judge container's termination message (the
@@ -758,11 +811,22 @@ func (r *LoopReconciler) ensureJudgeAndSettle(ctx context.Context, loop *coxv1al
 		// but the verdict is unread, so it is unavailable (D124).
 		r.recordJudgeUnavailable(loop, "judge verdict unreadable: "+err.Error())
 		*changed = true
-		r.releaseJudgeHold(loop, changed)
-		return false, nil
+		return r.settleAndRelease(ctx, loop, changed)
 	}
 	r.applyJudgeVerdict(loop, msg)
 	*changed = true
+	return r.settleAndRelease(ctx, loop, changed)
+}
+
+// settleAndRelease ends the Judge proxy's life (the final usage read, then the
+// delete: D141) and releases the Judging hold. The verdict (or
+// JudgeUnavailable) is already recorded, so a final-read note lands on the
+// JudgeVerdict condition. A delete error is returned (the hold stays and the
+// next reconcile retries).
+func (r *LoopReconciler) settleAndRelease(ctx context.Context, loop *coxv1alpha1.Loop, changed *bool) (bool, error) {
+	if err := r.settleJudgeProxy(ctx, loop); err != nil {
+		return false, fmt.Errorf("settle judge proxy: %w", err)
+	}
 	r.releaseJudgeHold(loop, changed)
 	return false, nil
 }

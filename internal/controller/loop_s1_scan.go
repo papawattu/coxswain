@@ -86,7 +86,11 @@ func parseScanReport(msg string) (scanReport, bool) {
 //
 // The Warning Event fires only when the condition's status or reason CHANGES
 // (a steady-state reconcile never re-Events, and a clean scan never does).
-// It returns whether anything changed (the caller's evidenceChanged fold).
+// When the status and reason stay the same but the message differs (the same
+// verdict on a newer iteration — different hits, or the same hits at a new
+// commit), the message is refreshed WITHOUT an Event so the condition never
+// goes stale. It returns whether anything changed (the caller's evidenceChanged
+// fold), true in both the Event case and the message-refresh case.
 func (r *LoopReconciler) recordScanEvidence(loop *coxv1alpha1.Loop, pod *corev1.Pod) bool {
 	if pod == nil {
 		return false
@@ -109,8 +113,6 @@ func (r *LoopReconciler) recordScanEvidence(loop *coxv1alpha1.Loop, pod *corev1.
 	}
 
 	// The decision: status + reason of the condition this pass would record.
-	// (The message alone changing never re-Events — the Warning Event fires
-	// on a status or reason CHANGE, R26 I90.)
 	cond := metav1.ConditionFalse
 	reason := string(coxv1alpha1.ReasonNoSubversionPattern)
 	message := "no subversion pattern in the diff"
@@ -131,7 +133,6 @@ func (r *LoopReconciler) recordScanEvidence(loop *coxv1alpha1.Loop, pod *corev1.
 		message = "scan unavailable: no readable report"
 	}
 
-	changed := false
 	var existing *metav1.Condition
 	for i := range loop.Status.Conditions {
 		if loop.Status.Conditions[i].Type == coxv1alpha1.VerifySuspiciousCondition {
@@ -139,17 +140,27 @@ func (r *LoopReconciler) recordScanEvidence(loop *coxv1alpha1.Loop, pod *corev1.
 			break
 		}
 	}
-	if existing == nil || existing.Status != cond || existing.Reason != reason {
-		changed = true
-	}
 
-	if changed {
+	changed := false
+	switch {
+	case existing == nil || existing.Status != cond || existing.Reason != reason:
+		// A status or reason CHANGE: record it and Event the non-steady-state
+		// outcome (R26 I90: the True and Unknown cases are the noteworthy
+		// ones; a clean False stays quiet, R25 I84).
 		setCondition(loop, coxv1alpha1.VerifySuspiciousCondition, cond, reason, message)
-		// R26 I90: surface the non-steady-state outcome (R25 I84: the True and
-		// Unknown cases are the noteworthy ones; a clean False stays quiet).
 		if r.Recorder != nil && cond != metav1.ConditionFalse {
 			r.Recorder.Eventf(loop, corev1.EventTypeWarning, reason, "%s", message)
 		}
+		changed = true
+	case existing.Message != message:
+		// Same status and reason, different message: the scan re-decided on a
+		// newer iteration (different hits, or a new verified commit) and the
+		// condition must not keep the first iteration's message. Refresh it
+		// WITHOUT an Event — a message alone never re-Events (R26 I90).
+		setCondition(loop, coxv1alpha1.VerifySuspiciousCondition, cond, reason, message)
+		changed = true
+	default:
+		// steady state: same status, reason and message — nothing changes.
 	}
 
 	loop.Status.JudgeSummary = judgeSummary(loop)

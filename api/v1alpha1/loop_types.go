@@ -1713,6 +1713,12 @@ const (
 	// the Judge had not run (D124; R26 I90 surfaces the failure via a
 	// Warning Event as well).
 	ReasonJudgeUnavailable = "JudgeUnavailable"
+	// VerifySuspiciousCondition (D135, ADR-0005 D17.2): the diff scan's
+	// advisory flag.
+	VerifySuspiciousCondition     = "VerifySuspicious"
+	ReasonSubversionPatternInDiff = "SubversionPatternInDiff" // True
+	ReasonNoSubversionPattern     = "NoSubversionPattern"     // False
+	ReasonScanUnavailable         = "ScanUnavailable"         // Unknown
 )
 
 // SecretsUsable condition reasons (the named values on the condition).

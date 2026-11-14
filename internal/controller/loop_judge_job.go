@@ -1008,10 +1008,19 @@ const judgeReasonMaxChars = 200
 
 // judgeSummary is the one-word Judge signal for `kubectl get loop` (D131,
 // D138): the most serious of the Judge's signals wins (the S1 diff scan sets
-// `Suspicious` itself, then False > Truncated > Unknown > True); empty when
-// there is no Judge. The JudgeVerdict condition keeps the detail.
+// `Suspicious` itself, then False > Truncated > Unknown > True); a
+// VerifySuspicious True (D135) beats every Judge signal, INCLUDING the
+// absence of one (a Suspicious Loop with no Judge still reads Suspicious,
+// not blank). Empty when there is neither a Judge nor a scan hit.
+// The JudgeVerdict condition keeps the detail.
 func judgeSummary(loop *coxv1alpha1.Loop) string {
-	if loop == nil || loop.Status.Judge == nil {
+	if loop == nil {
+		return ""
+	}
+	if hasConditionTrue(loop, coxv1alpha1.VerifySuspiciousCondition) {
+		return "Suspicious"
+	}
+	if loop.Status.Judge == nil {
 		return ""
 	}
 	j := loop.Status.Judge

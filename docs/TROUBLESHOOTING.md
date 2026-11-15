@@ -1279,7 +1279,7 @@ taint), or remove the label from a node that should not run Loops:
 `kubectl label node <node> kubearmor.io/enforcer-`. A tainted control-plane
 node carrying the label is one way this happens (seen on kind, 2026-11-14:
 all three kind-ref nodes carried the label but the agent DaemonSet had only
-DESIRed 2 — the control-plane node's `NoSchedule` taint kept the agent off it
+DESIRED 2 — the control-plane node's `NoSchedule` taint kept the agent off it
 and every Loop sat held); why the label was there was not determined.
 
 **The model proxy hold (`ModelProxyNotReady`).** With

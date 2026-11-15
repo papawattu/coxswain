@@ -1123,7 +1123,9 @@ condition.
 A proxy pod that is still starting is **not** a read failure (F84). Three
 shapes are `proxy.ErrNotReady` and are neither counted nor cleared:
 - a pod that exists, has a pod IP, and is younger than
-  `proxyUsageStartGrace` (60s) — it may still be starting;
+  `proxyUsageStartGrace` (60s) — it may still be starting (the Judge proxy's
+  final read before it is deleted is the one exception: it always attempts the
+  read, and a failure there is `JudgeUsageUnread`);
 - a proxy pod that **does not exist** (yet), and one that has **never obtained
   an IP**. These two are not time-bounded by this condition — a proxy that
   never comes up is surfaced as `ModelProxyNotReady` on the Loop (below), not

@@ -250,6 +250,78 @@ func TestRecordScanEvidenceDecisions(t *testing.T) {
 	})
 }
 
+// TestRecordScanEvidenceMessageRefresh covers the message-refresh branch
+// (S1 follow-up, D135): when the status and reason stay the same but the
+// message differs (the scan re-decided on a newer iteration), the condition's
+// message is refreshed WITHOUT a second Event, and a repeat of the same
+// report is steady state.
+func TestRecordScanEvidenceMessageRefresh(t *testing.T) {
+	// Hits A at commit c1, hits B at commit c2 (the same verdict — True
+	// /SubversionPatternInDiff — re-decided on a newer iteration).
+	const hitsA = `{"v":1,"files":2,"hits":[{"path":"a.go","pattern":"os.Exit in init","line":7}],"hitsDropped":0,"errors":[],"errorsDropped":0}`
+	const hitsB = `{"v":1,"files":3,"hits":[{"path":"b.go","pattern":"zzz_canary","line":41},{"path":"b.go","pattern":"//go:linkname","line":3}],"hitsDropped":0,"errors":[],"errorsDropped":0}`
+
+	cond := func(t *testing.T, loop *coxv1alpha1.Loop) *metav1.Condition {
+		t.Helper()
+		for i := range loop.Status.Conditions {
+			if loop.Status.Conditions[i].Type == coxv1alpha1.VerifySuspiciousCondition {
+				return &loop.Status.Conditions[i]
+			}
+		}
+		return nil
+	}
+
+	rec := record.NewFakeRecorder(16)
+	r := &LoopReconciler{Recorder: rec}
+	loop := &coxv1alpha1.Loop{Status: coxv1alpha1.LoopStatus{
+		CurrentVerify: &coxv1alpha1.CurrentVerifyStatus{VerifiedCommit: "c1aaaaaaaaaaaaaaaa"},
+	}}
+
+	// First pass: hits A at c1 — the status and reason CHANGE from nothing,
+	// so this is the one (and only) Warning Event.
+	if !r.recordScanEvidence(loop, scanPod(t, true, hitsA)) {
+		t.Fatal("first pass: changed = false, want true")
+	}
+	c := cond(t, loop)
+	if c == nil || c.Status != metav1.ConditionTrue || c.Reason != string(coxv1alpha1.ReasonSubversionPatternInDiff) {
+		t.Fatalf("condition = %+v, want True/SubversionPatternInDiff", c)
+	}
+	wantA := "1 pattern(s) in the diff at c1aaaaa: os.Exit in init in a.go:7"
+	if c.Message != wantA {
+		t.Fatalf("first pass message = %q, want %q", c.Message, wantA)
+	}
+	if n := len(rec.Events); n != 1 {
+		t.Fatalf("first pass events = %v, want exactly one", rec.Events)
+	}
+
+	// Second pass: hits B at c2 — same status and reason, a different
+	// message. The message must refresh (naming hits B and c2), with NO
+	// second Event, and the pass must report changed.
+	loop.Status.CurrentVerify.VerifiedCommit = "c2bbbbbbbbbbbbbbbb"
+	if !r.recordScanEvidence(loop, scanPod(t, true, hitsB)) {
+		t.Fatal("second pass: changed = false, want true (message differs)")
+	}
+	wantB := "2 pattern(s) in the diff at c2bbbbb: zzz_canary in b.go:41, //go:linkname in b.go:3"
+	if c.Message != wantB {
+		t.Fatalf("second pass message = %q, want %q (the condition must not keep iteration one's message)", c.Message, wantB)
+	}
+	if n := len(rec.Events); n != 1 {
+		t.Fatalf("second pass events = %v, want still exactly one (a message alone never re-Events)", rec.Events)
+	}
+
+	// Third pass: the same report (hits B at c2) again — steady state: no
+	// change, no Event.
+	if r.recordScanEvidence(loop, scanPod(t, true, hitsB)) {
+		t.Fatal("third pass: changed = true, want false (the same report twice is steady state)")
+	}
+	if c.Message != wantB {
+		t.Fatalf("third pass message = %q, want unchanged %q", c.Message, wantB)
+	}
+	if n := len(rec.Events); n != 1 {
+		t.Fatalf("third pass events = %v, want still one", rec.Events)
+	}
+}
+
 // TestRecordScanEvidenceUnavailable covers the two Unknown decision cases of
 // recordScanEvidence (D135): an unreadable report (garbage message) and a
 // report with file errors (the scan did not see the whole diff).

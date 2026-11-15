@@ -27,6 +27,25 @@ You need a reachable cluster (kubectl in `~/.kube/config` pointing at it).
 For local dev the Makefile creates one: `make kind-up` (kind 1.34,
 agent-sandbox, KubeArmor), so the next two subsections are already done.
 
+**The kind path, in order.** `make kind-up`, `hack/github-secret.sh` and
+`config/samples/` all live in the repo, so get it at the release tag first
+(`<release tag>` is the tag whose `install.yaml` you use in §2; the example
+is `v0.2.0`):
+
+1. Get the repo at the release tag:
+   ```sh
+   git clone https://github.com/papawattu/coxswain.git && cd coxswain
+   git checkout v0.2.0        # your <release tag>
+   ```
+2. `make kind-up` (this section).
+3. Install the operator (§2).
+4. Patch in `--allow-unenforced-network` (the end of this section, "To add the
+   network escape hatch"). kind's default CNI does not enforce NetworkPolicy,
+   so without it every Loop is held Suspended. Do it after step 3: it patches
+   the Deployment that §2 creates.
+5. Create the Secrets, enable the namespace and opt the Secrets in (§3).
+6. Apply the Loop (§4).
+
 ### agent-sandbox
 
 The operator runs each Loop in an isolated agent-sandbox workspace. Install
@@ -100,8 +119,9 @@ flag disables the KubeArmor **policy** gate (the A1 enforcement), not the
 network gate. The two flags are independent (`cmd/main.go:93-104`).
 
 To add the network escape hatch to a deployed manager, patch the Deployment's
-args (the base manifest carries `--leader-elect` and
-`--health-probe-bind-address=:8081` as the manager's args, so this appends):
+args. **Run this after §2** (it patches the `coxswain-controller-manager`
+Deployment, which §2 creates; on the kind path it is step 4). The base manifest carries `--leader-elect` and
+`--health-probe-bind-address=:8081` as the manager's args, so this appends:
 
 ```sh
 kubectl -n coxswain-system patch deploy coxswain-controller-manager --type=json \
@@ -155,7 +175,9 @@ hack/github-secret.sh <namespace>            # secret name defaults to git-cred
 
 The helper reads the token from the file via `--from-file` (never the
 command line) and applies the Secret itself — you do not run the kubectl
-command below; it is shown so you can see what the helper does:
+command below; it is shown so you can see what the helper does. The helper
+does **not** label the Secret: do the opt-in below ("Enable the namespace and
+opt the Secrets in") after it:
 
 ```sh
 kubectl create secret generic git-cred -n <namespace> \
@@ -188,43 +210,94 @@ the failure is recorded on the Loop as `Delivered=False` reason
 in `internal/controller/loop_deliver_job.go`), and the supported way back is
 the `coxswain.io/redeliver` annotation.
 
-## 4. A first Loop
+### Enable the namespace and opt the Secrets in (required)
 
-Apply a minimal Loop CR (a `coxswain.wattu.com/v1alpha1` Loop). The operator
-creates the agent-sandbox workspace for it, the runner plans → implements →
-verifies inside the sandbox, and on success the Loop's PR is opened by the
-deliver Job. The agent needs a model endpoint: create a Secret in the
-Loop's namespace holding the model API key under the key `model-key` (§9
-Step 7 shows one), then set `spec.agent.endpointSecretRef` to that Secret's name
-and `spec.agent.modelEndpoint` to the endpoint's `host:port`. The CRD requires
-both together, and both are immutable, so a new endpoint means a new Loop.
-`config/samples/loop-fix-failing-test.yaml` shows the two fields as a
-commented-out example.
-
-`config/samples` has a working example:
+A Loop that names a Secret is **held** until two things are true (D76/D102;
+`docs/OPERATOR.md`, "Secret opt-in"): the Loop's namespace has a `RoleBinding`
+to the operator's `coxswain-secret-reader` ClusterRole, and each Secret the
+Loop names carries the label `coxswain.io/usable=true`. `install.yaml` ships
+the ClusterRole but no RoleBinding, and `hack/github-secret.sh` does not set
+the label, so do both once per namespace. For an `install.yaml` install the
+ClusterRole is named `coxswain-coxswain-secret-reader` (the kustomize
+`namePrefix` doubles the prefix; a Helm install names it
+`coxswain-secret-reader`):
 
 ```sh
-kubectl apply -f config/samples/coxswain_v1alpha1_loop.yaml
+kubectl -n <namespace> create rolebinding coxswain-secret-reader \
+  --clusterrole=coxswain-coxswain-secret-reader \
+  --serviceaccount=coxswain-system:coxswain-controller-manager
+kubectl -n <namespace> label secret git-cred coxswain.io/usable=true
 ```
 
-That sample is:
+§4 creates a second Secret (the model key); label it the same way
+(`kubectl -n <namespace> label secret model-creds coxswain.io/usable=true`).
+
+If you skip this, `kubectl get loop <name> -o yaml` shows
+`SecretsUsable=False` and the Loop makes no sandbox:
+
+| `SecretsUsable=False` reason | Meaning | Fix |
+|---|---|---|
+| `NamespaceNotEnabled` | no RoleBinding to `coxswain-secret-reader` in the Loop's namespace | the `create rolebinding` command above |
+| `SecretNotOptedIn` | a named Secret lacks `coxswain.io/usable: "true"`; the message names the Secret and the field | the `label secret` command above |
+
+The check re-runs on every reconcile, so the Loop proceeds on its own once the
+binding or label exists.
+
+## 4. A first Loop
+
+Apply a Loop CR (a `coxswain.wattu.com/v1alpha1` Loop). The operator
+creates the agent-sandbox workspace for it, the runner plans → implements →
+verifies inside the sandbox, and on success the Loop's PR is opened by the
+deliver Job.
+
+The agent needs a model endpoint. Create a Secret in the Loop's namespace
+holding the model API key under the key `model-key`, and label it (§3):
+
+```sh
+kubectl -n <namespace> create secret generic model-creds \
+  --from-literal=model-key=<your model API key>
+kubectl -n <namespace> label secret model-creds coxswain.io/usable=true
+```
+
+Then save this as `my-loop.yaml`. **Fill the four marked values before
+applying** (the lines marked `# FILL`). `workspace.repo` must be a repo your
+`git-cred` token can push to; the sample in `config/samples/coxswain_v1alpha1_loop.yaml`
+points at the maintainers' repo and sets no model, Secret or delivery, so
+it is held `ModelConfigValid=False reason=NoModelEndpoint` and opens no PR.
 
 ```yaml
 apiVersion: coxswain.wattu.com/v1alpha1
 kind: Loop
 metadata:
   name: loop-sample
+  namespace: <namespace>              # FILL: the namespace of §3
 spec:
   goal: "make the failing test pass"
   workspace:
-    repo: "https://github.com/papawattu/coxswain.git"
+    repo: "https://github.com/<you>/<your-repo>.git"   # FILL: YOUR repo, not a placeholder
     ref: "main"
+    gitCredentialSecret: git-cred     # the Secret from §3
+  agent:
+    endpointSecretRef: model-creds    # the Secret above (key model-key)
+    modelEndpoint: "<host>:<port>"    # FILL: your model server, host:port, no scheme
+    model: "<model name>"             # FILL: the model name your server serves
+  delivery:
+    mode: PullRequest
   verify:
     acceptanceChecks:
       - "go test ./..."
   loop:
     maxIterations: 3
 ```
+
+```sh
+kubectl apply -f my-loop.yaml
+```
+
+`agent.endpointSecretRef` and `agent.modelEndpoint` must be set together and
+are immutable, so a new endpoint means a new Loop.
+`config/samples/loop-fix-failing-test.yaml` and `loop-d61-proof.yaml` show the
+same fields.
 
 What you will see, in order:
 
@@ -242,6 +315,23 @@ What you will see, in order:
    `kubectl cox history <loop>`).
 
 ## 5. Reading results with `kubectl cox`
+
+Install the CLI first. From the checkout of the kind path (or any checkout of
+the release tag), build it and put it on `PATH` as `kubectl-cox`; kubectl then
+finds it as `kubectl cox`:
+
+```sh
+go build -o kubectl-cox ./cmd/kubectl-cox
+install -m 0755 kubectl-cox ~/.local/bin/kubectl-cox    # any directory on PATH
+kubectl cox --help
+```
+
+Without a checkout, `go install` builds the same binary from the module
+(into `$(go env GOBIN)`, default `~/go/bin`, which must be on `PATH`):
+
+```sh
+go install github.com/papawattu/coxswain/cmd/kubectl-cox@v0.2.0    # your <release tag>
+```
 
 The `cox` CLI (also installed as the `kubectl cox` plugin — `cmd/cox` and
 `cmd/kubectl-cox` share one command tree, `internal/cli`) reads Loop results.
@@ -595,6 +685,13 @@ ssh <vm> "
     --from-literal='MODEL_BASE_URL=http://192.168.1.20:8000'
   # GitHub secret (the token file must be on the VM at ~/.config/coxswain/github-token)
   bash hack/github-secret.sh $NS
+  # Secret opt-in (D76/D102; §3): without these the Loop is held
+  # SecretsUsable=False (NamespaceNotEnabled, then SecretNotOptedIn).
+  # install.yaml names the ClusterRole coxswain-coxswain-secret-reader.
+  kubectl --context kind-coxswain-ref -n $NS create rolebinding coxswain-secret-reader \
+    --clusterrole=coxswain-coxswain-secret-reader \
+    --serviceaccount=coxswain-system:coxswain-controller-manager
+  kubectl --context kind-coxswain-ref -n $NS label secret beta-model-creds git-cred coxswain.io/usable=true
 "
 ```
 

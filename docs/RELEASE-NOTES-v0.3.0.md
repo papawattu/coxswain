@@ -1,7 +1,6 @@
 # Release notes: v0.3.0
 
-Draft: the pre-tag smoke and the v0.2.0 upgrade proof are added by the reviewer.
-The pre-tag smoke and the v0.2.0 upgrade proof are added by the reviewer (R2's
+Draft: the pre-tag smoke and the v0.2.0 upgrade proof are added by the reviewer (R2's
 method, R1's upgrade method).
 
 Entries are added per merged PR, each citing the PR and the squash commit it
@@ -78,7 +77,7 @@ The release workflow no longer passes `--prerelease` to `gh release create`, so 
 
 **How it works:** the verify Job's `COX_JUDGE_MODEL` is set to `spec.verify.judge.model` when it names a model, else to the Loop's model (`internal/controller/loop_judge_job.go`'s `judgeEnvValueMap`); the call still goes through the Loop's model proxy — no new credential or egress. The proxy's usage reading still names the Loop's model for every call, the Judge's included (ADR-0011's 2026-11-13 amendment).
 
-**On upgrade:** a new optional field; a Loop without it is unchanged. Proven on kind with J5b (the lab endpoint serves no clean second model on one address).
+**On upgrade:** a new optional field; a Loop without it is unchanged. Set on kind in J5b run 5, to the same model as the Loop's, so a different Judge model is shown only by the unit specs below (the lab endpoint serves no clean second model on one address).
 
 **Covered by:** unit specs for the `COX_JUDGE_MODEL` choice in `internal/controller/loop_j5a_judge_model_unit_test.go` (the Judge's own model when named, the Loop's model when empty, and no key with no endpoint).
 
@@ -155,7 +154,7 @@ $ sed -n '130p' .samples/j5b-kind/j5b-kind.run5.log
 status.budget totals: prompt='14909' completion='309' (Loop-proxy-only share = total - judgeProxy.last*: prompt=14178 completion=266)
 ```
 
-The jproxy's own NetworkPolicy: the positive attempt reached the jproxy's 8080 port (an HTTP 404 response — a connection the proxy's ingress answered), and both negative attempts timed out (blocked) — one with the jproxy still present and one after it was deleted.
+The jproxy's own NetworkPolicy: the positive attempt reached the jproxy's 8080 port (an HTTP 404 response — a connection the proxy's ingress answered): one negative was blocked with the jproxy present (run log :87); the second ran as the jproxy was deleted and proves nothing (:88).
 
 The VAP denial and its positive control (`j5b-vap-check.log`):
 
@@ -182,7 +181,7 @@ Zero `forbidden` errors in the operator log (the counting `grep` matches its own
 
 **On upgrade:** both fields are optional; a Loop without them is unchanged — its Judge still goes through the Loop's own model proxy, exactly as before.
 
-**Covered by:** unit specs in `internal/controller/loop_j5b_judge_proxy_unit_test.go` (the jproxy name, the own-endpoint decision, `COX_JUDGE_BASE_URL` pointing at the jproxy, the pod shape and its disjoint labels), the jproxy NetPol specs (`internal/controller/loop_judge_proxy_netpol_test.go`), the proxy's full life (`loop_j5b_judge_proxy_life_envtest_test.go`) and the NetPol updates on kind (`loop_jproxy_netpol_update_envtest_test.go`).
+**Covered by:** unit specs in `internal/controller/loop_j5b_judge_proxy_unit_test.go` (the jproxy name, the own-endpoint decision, `COX_JUDGE_BASE_URL` pointing at the jproxy, the pod shape and its disjoint labels), the jproxy NetPol specs (`internal/controller/loop_judge_proxy_netpol_test.go`), the proxy's full life (`loop_j5b_judge_proxy_life_envtest_test.go`) and the NetPol update envtest spec (`loop_jproxy_netpol_update_envtest_test.go`).
 
 ## Known issues
 

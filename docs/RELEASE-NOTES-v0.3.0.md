@@ -1,7 +1,7 @@
 # Release notes: v0.3.0
 
-Draft: the pre-tag smoke and the v0.2.0 upgrade proof are added by the reviewer (R2's
-method, R1's upgrade method).
+The pre-tag smoke and the v0.2.0 upgrade proof are under "Proven on kind" below (R2,
+R1's upgrade method).
 
 Entries are added per merged PR, each citing the PR and the squash commit it
 landed as in the heading, like `RELEASE-NOTES-v0.2.0.md`.
@@ -34,6 +34,35 @@ The verify Job gains two trusted init containers between `artifact` and `canary`
 ### The scan can flag Loops WITHOUT a Judge (S1, #489)
 
 The diff scan's `VerifySuspicious` flag applies to every Loop, with or without `spec.verify.judge`. What changes for an existing Loop: (1) its verify Job now runs the two scan init containers on every verify; (2) a hit can flag a Loop that has no Judge at all — `deliverDraft` (`internal/controller/loop_deliver_job.go:450`) returns draft on `VerifySuspicious=True` whatever `spec.delivery.draft` says, `judgeSummary` (`internal/controller/loop_judge_job.go:1020`) reads `Suspicious` and beats every Judge signal including the absence of one, and `judgeWithholdsLessons` (`internal/controller/loop_memory_writer_job.go:1218`) withholds the shared-memory lessons. No spec change is required or made — the scan only writes status.
+
+### Proven on kind: the v0.2.0 → v0.3.0 upgrade and the pre-tag smoke (R2)
+
+The reviewer's R2 run on kind-ref, 2026-11-15, at main `dcd3e42`. The script is `.samples/r2-v030/r2-lab.sh` and the evidence is `.samples/r2-v030/run1/r2-lab.log` (the operator logs are beside it). It follows R1's method (`lab-run18.sh`): install v0.2.0, start a Loop on it, and upgrade the operator mid-run in the order this page gives (CRDs, RBAC, admission, image). Then it runs a smoke Loop on the candidate. Both Loops use the sample with its model fields set, PullRequest delivery with `draft: false`, and the Judge on.
+
+- **Images:** `ghcr.io/papawattu/coxswain-controller:v0.2.0` → `local/coxswain/main:r2-dcd3e42` (line 3).
+- **The CRD:** `judgeSummary` is absent on v0.2.0 (line 30) and present after the upgrade (line 58).
+- **The Loop across the upgrade:** `r2-across` was created on v0.2.0 and reached Implementing (lines 46-49). The upgrade ran while it was still Implementing (lines 50 and 52; `window=open`). The new operator rolled out with `r2-across` still Implementing (lines 68-69). It then moved to Verifying and Succeeded under the candidate (lines 75 and 78).
+- **Results:**
+
+```
+$ sed -n '85,87p' .samples/r2-v030/run1/r2-lab.log
+NAME        PHASE       ITERATION   JUDGE   AGE
+r2-across   Succeeded   0           True    5m47s
+r2-smoke    Succeeded   0           True    3m57s
+```
+
+| Loop | JudgeVerdict | VerifySuspicious | Delivered | deliver Job | MemoryWriteDone |
+|---|---|---|---|---|---|
+| r2-across (across the upgrade) | True, score 100 (line 107) | False, `NoSubversionPattern` (line 105) | True, PR 13 (line 108) | `DRAFT=false` (line 110) | `MemoryWritten`, `written=1` (line 109) |
+| r2-smoke (on the candidate) | True, score 100 (line 130) | False, `NoSubversionPattern` (line 128) | True, PR 14 (line 131) | `DRAFT=false` (line 133) | `MemoryWriteSkipped`: the runner reported no lessons file (line 132) |
+
+- **RBAC:** `can-i` says yes for each verb checked (lines 136-140). The candidate operator log has `forbidden=0` over 13674 lines (positive control `control=1`, line 141); the v0.2.0 log has `forbidden=0` (line 142).
+- **Verdict:** every check printed PASS (lines 143-156), and the run printed `R2 RESULT: PASS` (line 157).
+- **Restore:** the lab operator image and args are back (lines 172-173). The lab's admission objects are back (lines 183-185), and so are its CRDs (lines 186-188). No Loops are left (line 191).
+- **Limits:**
+  - Only the controller image changed. The runner, model-proxy, tool-proxy and egress-proxy images stayed the lab's (the `--*-image` args, line 2), as in R1.
+  - The run is linux/amd64 only. arm64 is built, not run (D137).
+  - r2-across wrote a lesson. So the lesson write path works end to end on the candidate: claim, then writer Job, then curator-keep, then written. Why r2-smoke and E1's honest Loop reported no lessons file is not shown. The runner writes the file only when the model's Implementing answer has a `LESSON:` line (`runner/lessons.go:162`, `runner/phase.go:360`), and those runner logs were not kept.
 
 ## New features
 
@@ -182,6 +211,18 @@ Zero `forbidden` errors in the operator log (the counting `grep` matches its own
 **On upgrade:** both fields are optional; a Loop without them is unchanged — its Judge still goes through the Loop's own model proxy, exactly as before.
 
 **Covered by:** unit specs in `internal/controller/loop_j5b_judge_proxy_unit_test.go` (the jproxy name, the own-endpoint decision, `COX_JUDGE_BASE_URL` pointing at the jproxy, the pod shape and its disjoint labels), the jproxy NetPol specs (`internal/controller/loop_judge_proxy_netpol_test.go`), the proxy's full life (`loop_j5b_judge_proxy_life_envtest_test.go`) and the NetPol update envtest spec (`loop_jproxy_netpol_update_envtest_test.go`).
+
+### E1: the exit run on kind — #497 (dcd3e42)
+
+The Phase 8 exit run (`docs/PLAN-PHASE8.md`:104-106), on kind-ref at main `9dfa68a`, is recorded in `docs/CANARY-CHANNEL.md` under "E1". The #371 probe read `Suspicious`: the scan flagged it and the Judge said false. The hardcoded change read `False`. Both were delivered as drafts with their lessons withheld. The honest Loop read `True` and was delivered ready.
+
+### J5b docs: the Judge proxy objects and their lifetimes — #496 (180f7b3)
+
+`docs/OPERATOR.md` gains "The Judge's own proxy (J5b)". It lists the pod, the Service and the NetworkPolicy, which live only while judging (D141). It also lists the `coxswain-<loop>-jproxy` KubeArmorPolicy, which lives for the whole Loop while the Judge has its own endpoint.
+
+### CI: shellcheck SC2329 — #495 (1e5ac5d)
+
+CI's shellcheck now reports the trap-invoked function in `hack/run-envtest.sh` as SC2329, so the directive covers both codes. This is CI only, with no product change.
 
 ## Known issues
 

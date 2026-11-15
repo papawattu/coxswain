@@ -224,9 +224,16 @@ func EffectiveHash(p EffectivePolicy) string {
 // so the operator's cached Get missed and CreateOrUpdate fell through to
 // Create every reconcile).
 const (
-	ComponentLabelKey         = "app.kubernetes.io/component"
-	ComponentAgentLabel       = "agent"
-	ComponentProxyLabel       = "model-proxy"
+	ComponentLabelKey   = "app.kubernetes.io/component"
+	ComponentAgentLabel = "agent"
+	ComponentProxyLabel = "model-proxy"
+	// ComponentJudgeProxyLabel (J5b, D132): the Judge's own model proxy pod.
+	// The Judge proxy MUST carry this value (not ComponentProxyLabel): it is
+	// a second, separately-labeled proxy the operator Gets through the same
+	// scoped cache, and a component label absent from ProxyComponentSelector
+	// is a cache miss that turns into a spurious Create (AlreadyExists) on
+	// the first reconcile.
+	ComponentJudgeProxyLabel  = "judge-proxy"
 	ComponentEgressProxyLabel = "egress-proxy"
 	ComponentToolProxyLabel   = "tool-proxy"
 )
@@ -238,11 +245,12 @@ const (
 const DefaultClusterDomain = "cluster.local"
 
 // ProxyComponentSelector is the label selector for the operator's Pod and
-// Service cache. It matches the model proxy, the egress proxy and the
-// tool proxies — the operator-owned per-Loop proxy components the operator
-// Gets through the cache. It must stay in sync with proxyLabels,
-// egressProxyLabels and toolProxyLabels (internal/controller);
-// TestProxyComponentSelectorMatchesBothProxies pins all three label sets.
+// Service cache. It matches the model proxy, the Judge proxy, the egress
+// proxy and the tool proxies — the operator-owned per-Loop proxy components
+// the operator Gets through the cache. It must stay in sync with
+// proxyLabels, judgeProxyLabels, egressProxyLabels and toolProxyLabels
+// (internal/controller); TestProxyComponentSelectorMatchesBothProxies pins
+// all four label sets.
 //
 // NOTE (I45): the agent component is deliberately EXCLUDED from this
 // selector — the manager's pod cache must stay proxies-only. The I45
@@ -251,7 +259,7 @@ const DefaultClusterDomain = "cluster.local"
 // denial, but that is a separate concern from the operator's cache scoping.
 func ProxyComponentSelector() labels.Selector {
 	r, _ := labels.NewRequirement(ComponentLabelKey, selection.In,
-		[]string{ComponentProxyLabel, ComponentEgressProxyLabel, ComponentToolProxyLabel})
+		[]string{ComponentProxyLabel, ComponentJudgeProxyLabel, ComponentEgressProxyLabel, ComponentToolProxyLabel})
 	return labels.NewSelector().Add(*r)
 }
 

@@ -39,6 +39,18 @@ func modelProxyLabels(loopName string) map[string]string {
 	}
 }
 
+// judgeProxyLabelsMirror mirrors internal/controller.judgeProxyLabels (the
+// Judge proxy pod/Service label set, J5b/D132). It is DISJOINT from the
+// model proxy: the Judge proxy carries component=judge-proxy and its own
+// -for label, so the Loop's own proxy Service (which selects proxyLabels)
+// never routes agent calls to the Judge's endpoint.
+func judgeProxyLabelsMirror(loopName string) map[string]string {
+	return map[string]string{
+		ComponentLabelKey:             ComponentJudgeProxyLabel,
+		"coxswain.io/judge-proxy-for": loopName,
+	}
+}
+
 // egressProxyLabelsMirror mirrors internal/controller.egressProxyLabels (the
 // egress proxy pod/Service label set, I42b). It is DISJOINT from the model
 // proxy and the agent (no coxswain.io/loop) — see the I42b review P1.
@@ -67,15 +79,16 @@ func toolProxyLabelsMirror(loopName, toolName string) map[string]string {
 }
 
 // TestProxyComponentSelectorMatchesBothProxies asserts the selector matches
-// all three operator-owned proxy label sets (model proxy, egress proxy,
-// tool proxy — the I44 pin, widened for D41c so a new operator-owned
-// component without a selector entry is a test failure: the spurious
-// AlreadyExists create loop the I42b kind acceptance found).
+// all four operator-owned proxy label sets (model proxy, Judge proxy,
+// egress proxy, tool proxy — the I44 pin, widened for D41c and J5b so a new
+// operator-owned component without a selector entry is a test failure: the
+// spurious AlreadyExists create loop the I42b kind acceptance found).
 func TestProxyComponentSelectorMatchesBothProxies(t *testing.T) {
 	sel := ProxyComponentSelector()
 
 	for name, lset := range map[string]map[string]string{
 		"model-proxy":  modelProxyLabels("some-loop"),
+		"judge-proxy":  judgeProxyLabelsMirror("some-loop"),
 		"egress-proxy": egressProxyLabelsMirror("some-loop"),
 		"tool-proxy":   toolProxyLabelsMirror("some-loop", "gh"),
 	} {

@@ -1,6 +1,6 @@
 # Release notes: v0.3.0
 
-Draft: the `TODO(<slice>)` lines are filled as J5a, M1, S1 and J5b merge.
+Draft: the pre-tag smoke and the v0.2.0 upgrade proof are added by the reviewer.
 The pre-tag smoke and the v0.2.0 upgrade proof are added by the reviewer (R2's
 method, R1's upgrade method).
 
@@ -16,7 +16,7 @@ landed as in the heading, like `RELEASE-NOTES-v0.2.0.md`.
 - **arm64:** built, not run (D137, carried over from v0.2.0).
 - **A Judge-flagged Loop writes no lessons** (M1, #487, 8f73d0b): a Loop the Judge flags (verdict `false`, `Unknown`, or a truncated diff: the D133 set) creates no memory-writer Job and records `MemoryWriteDone` with the reason `LessonsWithheld`, plus a Normal Event of the same reason (D140).
 - **A diff scan watches for subversion** (S1, #489, 019feec): the verify Job's two new `scan-prep` + `scan` init containers grep the base→verified diff of non-protected `.go` files for five subversion patterns and record the advisory `VerifySuspicious` condition; a hit (`True`, reason `SubversionPatternInDiff`) forces a draft PR, reads `Suspicious` in the new `Judge` column value, and withholds shared-memory lessons (D135). The scan never blocks the checks.
-- TODO(J5b): filled when J5b merges
+- **A Judge can call its own model server** (J5b, #491, 9dfa68a): `spec.verify.judge.modelEndpoint` + `spec.verify.judge.endpointSecretRef` give the Judge its own model endpoint and credential, reached through its own model proxy (`<loop>-jproxy`) that exists only while judging; its usage is metered into the Loop's totals (D132, D141).
 
 ## Upgrade
 
@@ -24,9 +24,9 @@ landed as in the heading, like `RELEASE-NOTES-v0.2.0.md`.
 
 The Loop CRD gains a new top-level status field `status.judgeSummary` and the new `Judge` print column (jsonPath `.status.judgeSummary`). As for v0.2.0: apply this release's `install.yaml` (or chart) so the CRD is current **before** the new operator starts, so the operator's status writes are not pruned and the column renders.
 
-### The new Judge fields (`spec.verify.judge.model`, J5a; TODO(J5b) `judge.modelEndpoint` + `judge.endpointSecretRef`)
+### The new Judge fields (`spec.verify.judge.model` (J5a), `judge.modelEndpoint` + `judge.endpointSecretRef` (J5b))
 
-Both are new optional fields on `spec.verify.judge`. A Loop without them is unchanged: the Judge uses the Loop's model and the Loop's own model proxy endpoint. (Filled when the slices merge.)
+All three are new optional fields on `spec.verify.judge`; a Loop without any of them is unchanged — the Judge uses the Loop's model and the Loop's own model proxy endpoint. (See the J5a and J5b entries under New features.)
 
 ### The diff scan's two init containers (S1, #489)
 
@@ -78,7 +78,7 @@ The release workflow no longer passes `--prerelease` to `gh release create`, so 
 
 **How it works:** the verify Job's `COX_JUDGE_MODEL` is set to `spec.verify.judge.model` when it names a model, else to the Loop's model (`internal/controller/loop_judge_job.go`'s `judgeEnvValueMap`); the call still goes through the Loop's model proxy — no new credential or egress. The proxy's usage reading still names the Loop's model for every call, the Judge's included (ADR-0011's 2026-11-13 amendment).
 
-**On upgrade:** a new optional field; a Loop without it is unchanged. TODO(J5b): the field is proven on kind with J5b (the lab endpoint serves no clean second model on one address).
+**On upgrade:** a new optional field; a Loop without it is unchanged. Proven on kind with J5b (the lab endpoint serves no clean second model on one address).
 
 **Covered by:** unit specs for the `COX_JUDGE_MODEL` choice in `internal/controller/loop_j5a_judge_model_unit_test.go` (the Judge's own model when named, the Loop's model when empty, and no key with no endpoint).
 
@@ -123,9 +123,66 @@ forbidden=0 control=1
 
 The scan init exited 0 (the hit never blocked the checks: `init scan exit=0`); the forced draft is the deliver Job script's `DRAFT=true`; the operator log had zero `forbidden` errors (positive control: the counting `grep` matches its own pattern, `control=1`).
 
-### TODO(J5b): `judge.modelEndpoint` + `judge.endpointSecretRef` (D132, D141)
+### J5b: `judge.modelEndpoint` + `judge.endpointSecretRef` — a Judge endpoint of its own (D132, D141) — #491 (9dfa68a)
 
-Filled when J5b merges.
+**What it is:** two new optional fields on `spec.verify.judge`:
+
+- `modelEndpoint` (host:port, MaxLength 253, port 1–65535) is the Judge's own model server, reached through the Judge's own model proxy (`<loop>-jproxy`), metered into the Loop's totals (D132, ADR-0009). Empty = the Loop's proxy and endpoint.
+- `endpointSecretRef` names the Secret with the Judge endpoint's API key, mounted only into the Judge's proxy. Set together with `modelEndpoint`.
+
+Both are immutable: `modelEndpoint` is fixed because the Judge proxy NetworkPolicy cannot change, and `endpointSecretRef` is fixed for the same reason the Loop's `spec.agent.endpointSecretRef` is (the proxy pod's `spec.volumes` is immutable).
+
+**The Judge proxy (`<loop>-jproxy`):** when the Judge names its own endpoint, the operator creates a second model-proxy pod + Service (`<loop>-jproxy`) carrying the Judge endpoint's Secret, right before the Judge Job (`ensureJudgeProxy`, `internal/controller/loop_judge_proxy.go`). The Judge Job's `COX_JUDGE_BASE_URL` points at it, and the Judge Job's proxy egress rule targets the Judge proxy pods instead of the Loop's own proxy. Its NetworkPolicy admits ingress on 8080 only from the Judge Job's pods and egress only to the Judge's endpoint + DNS (the agent's endpoint is never a peer). It exists only while judging: once the verdict (or `JudgeUnavailable`) is recorded, `settleJudgeProxy` takes the FINAL usage reading — folded into `status.budget` under the new `judgeProxy` share — and deletes the pod, Service and NetworkPolicy; a failed final read surfaces a `JudgeUsageUnread` Warning Event, never a silent zero. The proxy carries its own label set (`component: judge-proxy`, `coxswain.io/judge-proxy-for: <loop>`), disjoint from the Loop proxy's labels, so the Loop's proxy Service never selects it and the agent's model calls are never routed to the Judge's endpoint. Its name suffix is `-jproxy` (7 chars), so a 55-char Loop name stays within the 63-char Service-name limit. The VAP's coxswain component list gains `judge-proxy`, and the KubeArmor fence for the Judge proxy is emitted only for own-endpoint Judges (the same hardening spec as the model proxy, re-pointed at the Judge proxy's selector).
+
+**Proven on kind** (run 5; `.samples/j5b-kind/` in the `coxswain-j5bkind` worktree).
+
+Metering and the NetPol controls:
+
+```bash
+$ sed -n '86p' .samples/j5b-kind/j5b-kind.run5.log
+01:01:55Z positive attempt 1 rc=1: wget: server returned error: HTTP/1.1 404 Not Found command terminated with exit code 1 
+$ sed -n '87p' .samples/j5b-kind/j5b-kind.run5.log
+  01:01:57Z negative rep 1 rc=1 (jproxy present afterwards): wget: download timed out command terminated with exit code 1 
+$ sed -n '88p' .samples/j5b-kind/j5b-kind.run5.log
+  01:01:59Z negative rep 2 rc=1 (jproxy gone afterwards): wget: download timed out command terminated with exit code 1 
+$ sed -n '89p' .samples/j5b-kind/j5b-kind.run5.log
+(3) positive CONNECTED (HTTP response)
+$ sed -n '90p' .samples/j5b-kind/j5b-kind.run5.log
+(3) negative BLOCKED (timeout with the jproxy still present)
+$ sed -n '129p' .samples/j5b-kind/j5b-kind.run5.log
+status.budget.judgeProxy: lastBootID='7bdd4a423f12651c1e83a24ad7c09091' lastPromptTokens='731' lastCompletionTokens='43'
+$ sed -n '130p' .samples/j5b-kind/j5b-kind.run5.log
+status.budget totals: prompt='14909' completion='309' (Loop-proxy-only share = total - judgeProxy.last*: prompt=14178 completion=266)
+```
+
+The jproxy's own NetworkPolicy: the positive attempt reached the jproxy's 8080 port (an HTTP 404 response — a connection the proxy's ingress answered), and both negative attempts timed out (blocked) — one with the jproxy still present and one after it was deleted.
+
+The VAP denial and its positive control (`j5b-vap-check.log`):
+
+```bash
+$ grep -n 'PASS' .samples/j5b-kind/j5b-vap-check.log
+23:PASS (4): j5b-vap-jp DENIED by the VAP (rc=1, message names the policy); j5b-vap-ctl ALLOWED (rc=0)
+$ grep -n 'rc=' .samples/j5b-kind/j5b-vap-check.log
+19:debug j5b-vap-jp rc=1: --profile=legacy is deprecated and will be removed in the future. It is recommended to explicitly specify a profile, for example "--profile=general". Defaulting debug container name to debugger-l2cp8. The pods "j5b-vap-jp" is invalid: : ValidatingAdmissionPolicy 'coxswain-deny-ephemeral-containers' with binding 'coxswain-deny-ephemeral-containers' denied request: Adding ephemeral containers to coxswain component pods (agent, model-proxy, judge-proxy, egress-proxy, tool-proxy) is denied: the container would run outside the KubeArmor fence and share the pod's network namespace. 
+20:debug j5b-vap-ctl rc=0: --profile=legacy is deprecated and will be removed in the future. It is recommended to explicitly specify a profile, for example "--profile=general". Defaulting debug container name to debugger-v6p5c. 
+23:PASS (4): j5b-vap-jp DENIED by the VAP (rc=1, message names the policy); j5b-vap-ctl ALLOWED (rc=0)
+```
+
+The jproxy pod was DENIED (rc=1, the VAP message names the `coxswain-deny-ephemeral-containers` policy and lists `judge-proxy` among the protected components); the positive-control pod was ALLOWED (rc=0).
+
+The RBAC `forbidden` count (the operator log, over the whole run):
+
+```bash
+$ grep 'forbidden=' .samples/j5b-kind/j5b-kind.run5.log
+  (6) can-i yes for every jproxy verb/resource as the operator SA; operator log forbidden=0.
+forbidden=0 control=1
+```
+
+Zero `forbidden` errors in the operator log (the counting `grep` matches its own pattern, `control=1` — the positive control); line 18 is the run script's own check, which also reports the `can-i` yes on every jproxy verb and resource.
+
+**On upgrade:** both fields are optional; a Loop without them is unchanged — its Judge still goes through the Loop's own model proxy, exactly as before.
+
+**Covered by:** unit specs in `internal/controller/loop_j5b_judge_proxy_unit_test.go` (the jproxy name, the own-endpoint decision, `COX_JUDGE_BASE_URL` pointing at the jproxy, the pod shape and its disjoint labels), the jproxy NetPol specs (`internal/controller/loop_judge_proxy_netpol_test.go`), the proxy's full life (`loop_j5b_judge_proxy_life_envtest_test.go`) and the NetPol updates on kind (`loop_jproxy_netpol_update_envtest_test.go`).
 
 ## Known issues
 

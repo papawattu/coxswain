@@ -18,6 +18,7 @@ see `docs/QUICKSTART.md`.
   - [ClusterAgentPolicy (P6a)](#clusteragentpolicy-p6a)
   - [Learn mode: auditOnly policies (P6b)](#learn-mode-auditonly-policies-p6b)
   - [How the network probe measures enforcement (D103)](#how-the-network-probe-measures-enforcement-d103)
+  - [The Judge's own proxy (J5b)](#the-judges-own-proxy-j5b)
 - [Reading the egress proxy log](#reading-the-egress-proxy-log)
 - [Pinning Loops to a node pool (C2)](#pinning-loops-to-a-node-pool-c2)
 - [k3s / flannel / SMB profile (C3)](#k3s--flannel--smb-profile-c3)
@@ -787,6 +788,26 @@ waits for that proxy to be Ready).
 The tool proxies. The allowlist adds one egress peer per tool proxy, one per
 tool in the effective policy (the `toolProxyNetpolPeer` rule in
 `ensureNetworkPolicy`; 0006-A1 row 16).
+
+### The Judge's own proxy (J5b)
+
+When the Judge is enabled and names its own endpoint
+(`spec.verify.judge.enabled` and `spec.verify.judge.modelEndpoint` —
+`judgeOwnEndpoint`, `internal/controller/loop_judge_proxy.go:50`), the Judge
+verifies through its own copy of the model proxy instead of the Loop's. These
+are the objects the operator manages for it, and their lifetimes:
+
+| Object | Name | Lifetime |
+| --- | --- | --- |
+| pod | `<loop>-jproxy` (`judgeProxyName`, `internal/controller/loop_judge_proxy.go:39`) | only while the Judge Job runs (D141): created right before the Job, deleted by `settleJudgeProxy` once the verdict or JudgeUnavailable is recorded (`internal/controller/loop_judge_proxy.go:169`) |
+| Service | `<loop>-jproxy` | same as the pod |
+| NetworkPolicy | `<loop>-jproxy-netpol` (`judgeProxyNetPolName`, `internal/controller/loop_judge_proxy_netpol.go:51`) | same as the pod |
+| KubeArmorPolicy | `coxswain-<loop>-jproxy` (`EmitJudgeProxyKubeArmorPolicy`, `internal/engine/kubearmor_i42.go:323`) | the whole Loop's life, for as long as the Judge has its own endpoint: the enforcer applies it with the Loop's other policies whenever `judgeOwnEndpoint` is true and cleans it up only when that stops holding (`internal/engine/kubearmor_enforcer.go:147-153`). It selects only the jproxy-labelled pods (`internal/engine/kubearmor_i42.go:295`) |
+
+Their usage is metered like the Loop proxy's and added to the Loop's budget
+totals (`status.budget.judgeProxy`, `internal/controller/loop_p2d_budget.go:905`;
+the delta fields fold into `status.budget`,
+`internal/controller/loop_p2d_budget.go:939`).
 
 Reference policies ship in `config/samples/policies/`: a minimal `default-deny`
 and a `go-toolchain` network allow list. They are ordinary AgentPolicy objects

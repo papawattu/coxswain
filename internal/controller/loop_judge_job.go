@@ -763,6 +763,10 @@ func (r *LoopReconciler) ensureJudgeAndSettle(ctx context.Context, loop *coxv1al
 	}
 	// D141: the Judge's own proxy (pod + Service + NetworkPolicy) lives only
 	// while the Judge Job runs; it is created right before the Job.
+	// The KubeArmorPolicy coxswain-<loop>-jproxy is the exception: the enforcer
+	// applies it for the Loop's whole life while judgeOwnEndpoint(loop) is
+	// true (internal/engine/kubearmor_enforcer.go, J5b step 3b) and it selects
+	// only the jproxy-labelled pods.
 	if requeue, perr := r.ensureJudgeProxy(ctx, loop); perr != nil {
 		return false, fmt.Errorf("ensure judge proxy: %w", perr)
 	} else if requeue {

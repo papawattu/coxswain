@@ -794,7 +794,7 @@ tool in the effective policy (the `toolProxyNetpolPeer` rule in
 When the Judge is enabled and names its own endpoint
 (`spec.verify.judge.enabled` and `spec.verify.judge.modelEndpoint` —
 `judgeOwnEndpoint`, `internal/controller/loop_judge_proxy.go:50`), the Judge
-verifies through its own copy of the model proxy instead of the Loop's. These
+calls its model through its own copy of the model proxy instead of the Loop's. These
 are the objects the operator manages for it, and their lifetimes:
 
 | Object | Name | Lifetime |
@@ -807,7 +807,7 @@ are the objects the operator manages for it, and their lifetimes:
 Their usage is metered like the Loop proxy's and added to the Loop's budget
 totals (`status.budget.judgeProxy`, `internal/controller/loop_p2d_budget.go:905`;
 the delta fields fold into `status.budget`,
-`internal/controller/loop_p2d_budget.go:939`).
+`internal/controller/loop_p2d_budget.go:941-944`).
 
 Reference policies ship in `config/samples/policies/`: a minimal `default-deny`
 and a `go-toolchain` network allow list. They are ordinary AgentPolicy objects

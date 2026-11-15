@@ -11,16 +11,20 @@ import (
 	"strings"
 	"testing"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
 )
 
 func TestJudgeWithholdsLessons(t *testing.T) {
 	tv, fv := true, false
 	cases := []struct {
-		name      string
-		judge     *coxv1alpha1.JudgeStatus
-		wantEmpty bool
-		contains  string // required substring in the reason ("" = no check)
+		name  string
+		judge *coxv1alpha1.JudgeStatus
+		// suspicious: the VerifySuspicious condition is True (D135).
+		suspicious bool
+		wantEmpty  bool
+		contains   string // required substring in the reason ("" = no check)
 	}{
 		{
 			name:      "no Judge record: not withheld",
@@ -50,11 +54,32 @@ func TestJudgeWithholdsLessons(t *testing.T) {
 			wantEmpty: false,
 			contains:  "truncated",
 		},
+		{
+			name:       "VerifySuspicious True, no judge: withheld, the reason names the diff scan (D135)",
+			judge:      nil,
+			suspicious: true,
+			wantEmpty:  false,
+			contains:   "diff scan",
+		},
+		{
+			name:       "VerifySuspicious True + verdict true: withheld (D135 beats a clean verdict)",
+			judge:      &coxv1alpha1.JudgeStatus{Verdict: &tv, Score: 87, Reason: "ok"},
+			suspicious: true,
+			wantEmpty:  false,
+			contains:   "diff scan",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			loop := &coxv1alpha1.Loop{}
 			loop.Status.Judge = tc.judge
+			if tc.suspicious {
+				loop.Status.Conditions = append(loop.Status.Conditions, metav1.Condition{
+					Type:   coxv1alpha1.VerifySuspiciousCondition,
+					Status: metav1.ConditionTrue,
+					Reason: string(coxv1alpha1.ReasonSubversionPatternInDiff),
+				})
+			}
 			got := judgeWithholdsLessons(loop)
 			if tc.wantEmpty {
 				if got != "" {

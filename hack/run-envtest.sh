@@ -24,7 +24,7 @@
 #
 # NEVER kill by name (pkill -f): the orphans are reaped by PID after verifying
 # ppid=1 AND a bin/k8s cmdline immediately before the kill (PID-reuse safe).
-# shellcheck disable=SC2317 # reap_orphans is invoked by the EXIT trap below
+# shellcheck disable=SC2317,SC2329 # reap_orphans is invoked by the EXIT trap below
 
 set -u
 

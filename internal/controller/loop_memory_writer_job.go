@@ -1206,13 +1206,17 @@ func (r *LoopReconciler) recordMemoryWriterOutcomeNoPod(loop *coxv1alpha1.Loop, 
 // ("" = not withheld). The D133 set is the three Judge records that flag a
 // Loop: a false verdict, a nil verdict (Unknown), or a truncated diff (the
 // Judge saw a truncated diff and its verdict is about a partial change, not
-// the whole change). A Loop the Judge flagged writes no shared-memory
-// lessons — a gamed Loop's lessons would teach the next Loop the trick (E0,
-// docs/CANARY-CHANNEL.md). A nil record (the Judge did not run) does NOT
-// withhold.
+// the whole change). A VerifySuspicious True (the S1 diff scan found a
+// subversion pattern, D135) withholds too, even with no Judge record. A
+// Loop the Judge flagged writes no shared-memory lessons — a gamed Loop's
+// lessons would teach the next Loop the trick (E0, docs/CANARY-CHANNEL.md).
+// A nil record (the Judge did not run) does NOT withhold on its own.
 func judgeWithholdsLessons(loop *coxv1alpha1.Loop) string {
 	if loop == nil {
 		return ""
+	}
+	if hasConditionTrue(loop, coxv1alpha1.VerifySuspiciousCondition) {
+		return "the diff scan found a subversion pattern"
 	}
 	j := loop.Status.Judge
 	switch {

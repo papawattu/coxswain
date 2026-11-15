@@ -440,11 +440,16 @@ func deliverBranchPrefix(loop *coxv1alpha1.Loop) string {
 }
 
 // deliverDraft resolves spec.delivery.draft (default true). A false Judge
-// verdict, a nil verdict (Unknown) or a truncated diff (status.judge.
-// truncated) forces a draft whatever spec.delivery.draft says (ADR-0011
-// "Effect (D122, advisory)", amendment D133); a clean true verdict or no
-// status.judge leaves spec.delivery.draft exactly as it is.
+// verdict, a nil verdict (Unknown), a truncated diff (status.judge.
+// truncated), or a VerifySuspicious True (the S1 diff scan found a
+// subversion pattern, D135) forces a draft whatever spec.delivery.draft
+// says (ADR-0011 "Effect (D122, advisory)", amendment D133; D135); a clean
+// true verdict or no status.judge leaves spec.delivery.draft exactly as it
+// is.
 func deliverDraft(loop *coxv1alpha1.Loop) bool {
+	if hasConditionTrue(loop, coxv1alpha1.VerifySuspiciousCondition) {
+		return true
+	}
 	if j := loop.Status.Judge; j != nil && (j.Verdict == nil || !*j.Verdict || j.Truncated) {
 		return true
 	}

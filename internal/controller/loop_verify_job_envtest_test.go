@@ -356,28 +356,86 @@ func s5aVerifyPod(ctx context.Context, ns, name, jobName string, checkExit int32
 		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: verifyNoopContainer, Image: verifyBusybox}}},
 	}
 	Expect(k8sClient.Create(ctx, pod)).To(Succeed())
-	pod.Status.InitContainerStatuses = []corev1.ContainerStatus{
-		{Name: s5aCloneBase, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
-		{Name: s5aImportAgent, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
-		{Name: s5aTamper, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
+	pod.Status.InitContainerStatuses = s5aVerifyAllPassInitStatuses(checkExit)
+	Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+}
+
+// s5aVerifyAllPassInitStatuses is the "every gate and check passes" init status
+// list in the verify Job's init ORDER (S1 3a added scan-prep and scan between
+// artifact and the canary; the canary itself is absent from the pod status —
+// absent gates fall through to the next gate, the pre-F60 decision path). The
+// list is one helper so a new scan init can never be forgotten from a
+// fixture: every gate is terminated with exit 0, check-0 terminates with
+// checkExit (0 = pass, non-zero = the check failed).
+func s5aVerifyAllPassInitStatuses(checkExit int32) []corev1.ContainerStatus {
+	zero := corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}
+	return []corev1.ContainerStatus{
+		{Name: s5aCloneBase, State: zero},
+		{Name: s5aImportAgent, State: zero},
+		{Name: s5aTamper, State: zero},
+		{Name: s5aArtifact, State: zero},
+		{Name: verifyScanPrepInit, State: zero},
+		{Name: verifyScanInit, State: zero},
 		{Name: s5aCheck0, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: checkExit}}},
 	}
+}
+
+// s5aVerifyPodWithScanMessage is s5aVerifyPod with the scan init's termination
+// message set: every gate and check passes, and the S1 scan (exit 0 — the
+// scan is advisory and always exits 0) reports the given report through its
+// termination message. message is the raw termination message (the v==1
+// JSON report in production; any string for the garbled case).
+func s5aVerifyPodWithScanMessage(ctx context.Context, ns, name, jobName, message string) {
+	// I65 P1-A: the fixture Job must exist (else readVerifyJobPod's UID filter
+	// skips the pod — the operator's ensureVerifyJob creates it in the S5a
+	// happy path, but the spec drives its own verify Job directly).
+	job := &batchv1.Job{}
+	if err := k8sClient.Get(ctx, types.NamespacedName{Name: jobName, Namespace: ns}, job); err != nil {
+		job = plantVerifyJob(ctx, ns, name, jobName)
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name + "-verify-pod",
+			Namespace: ns,
+			Labels:    map[string]string{s5aJobNameLabel: jobName, verifyForLabel: name},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: batchv1.SchemeGroupVersion.String(),
+				Kind:       i65JobKind,
+				Name:       jobName,
+				UID:        job.UID,
+			}},
+		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: verifyNoopContainer, Image: verifyBusybox}}},
+	}
+	Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+	inits := s5aVerifyAllPassInitStatuses(0)
+	for i := range inits {
+		if inits[i].Name == verifyScanInit {
+			inits[i].State = corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+				ExitCode: 0, Message: message,
+			}}
+		}
+	}
+	pod.Status.InitContainerStatuses = inits
 	Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
 }
 
 // s5aVerifyInitStatuses returns the standard I47 init status list (trusted
-// inits 0, tamper 0, artifact per the given state, checks per the given
-// exit codes by index — a nil entry = the check is absent from the pod
-// status, an empty-state entry = in progress). The helper is the I47
-// spec's single construction point so the specs read as "the artifact
-// container did X" instead of a 6-element literal each time.
+// inits 0, tamper 0, artifact per the given state, the S1 scan inits 0, and
+// the checks per the given exit codes by index — a nil entry = the check is
+// absent from the pod status, an empty-state entry = in progress). The helper
+// is the I47 spec's single construction point so the specs read as "the
+// artifact container did X" instead of a literal each time.
 func s5aVerifyInitStatuses(artifact corev1.ContainerState, checkExits []int32) []corev1.ContainerStatus {
-	inits := make([]corev1.ContainerStatus, 0, 4+len(checkExits))
+	zero := corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}
+	inits := make([]corev1.ContainerStatus, 0, 6+len(checkExits))
 	inits = append(inits,
-		corev1.ContainerStatus{Name: s5aCloneBase, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
-		corev1.ContainerStatus{Name: s5aImportAgent, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
-		corev1.ContainerStatus{Name: s5aTamper, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
+		corev1.ContainerStatus{Name: s5aCloneBase, State: zero},
+		corev1.ContainerStatus{Name: s5aImportAgent, State: zero},
+		corev1.ContainerStatus{Name: s5aTamper, State: zero},
 		corev1.ContainerStatus{Name: s5aArtifact, State: artifact},
+		corev1.ContainerStatus{Name: verifyScanPrepInit, State: zero},
+		corev1.ContainerStatus{Name: verifyScanInit, State: zero},
 	)
 	for i, code := range checkExits {
 		inits = append(inits, corev1.ContainerStatus{
@@ -413,15 +471,11 @@ func s5aVerifyPodInProg(ctx context.Context, ns, name, jobName string) {
 		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: verifyNoopContainer, Image: verifyBusybox}}},
 	}
 	Expect(k8sClient.Create(ctx, pod)).To(Succeed())
-	// Trusted inits + tamper + artifact terminated (exit 0); check-0 still
-	// Running (Terminated == nil).
-	pod.Status.InitContainerStatuses = []corev1.ContainerStatus{
-		{Name: s5aCloneBase, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
-		{Name: s5aImportAgent, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
-		{Name: s5aTamper, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
-		{Name: s5aArtifact, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
-		{Name: s5aCheck0, State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}}},
-	}
+	// Trusted inits + tamper + artifact + scan terminated (exit 0); check-0
+	// still Running (Terminated == nil).
+	inits := s5aVerifyAllPassInitStatuses(0)
+	inits[len(inits)-1] = corev1.ContainerStatus{Name: s5aCheck0, State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}}}
+	pod.Status.InitContainerStatuses = inits
 	Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
 }
 
@@ -469,13 +523,15 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 
 		By("ordering the init containers: clone-base, import-agent, tamper, artifact, then the checks")
 		inits := job.Spec.Template.Spec.InitContainers
-		Expect(inits).To(HaveLen(6), "clone + import + tamper + artifact + canary + 1 check")
+		Expect(inits).To(HaveLen(8), "clone + import + tamper + artifact + scan-prep + scan + canary + 1 check")
 		Expect(inits[0].Name).To(Equal("clone-base"))
 		Expect(inits[1].Name).To(Equal("import-agent"))
 		Expect(inits[2].Name).To(Equal("tamper"))
 		Expect(inits[3].Name).To(Equal("artifact"))
-		Expect(inits[4].Name).To(Equal("canary"), "F60: the canary sits after artifact, before the checks")
-		Expect(inits[5].Name).To(Equal("check-0"))
+		Expect(inits[4].Name).To(Equal("scan-prep"), "S1: the scan's inits sit after artifact, before the canary")
+		Expect(inits[5].Name).To(Equal("scan"))
+		Expect(inits[6].Name).To(Equal("canary"), "F60: the canary sits after the scan, before the checks")
+		Expect(inits[7].Name).To(Equal("check-0"))
 		Expect(job.Spec.Template.Spec.Containers).To(HaveLen(1))
 		Expect(job.Spec.Template.Spec.Containers[0].Name).To(Equal("noop"))
 
@@ -551,6 +607,9 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 
 		By("carrying safe.directory=/verify on EVERY verify container (the emptyDir is root-owned)")
 		for i := range inits {
+			if inits[i].Name == verifyScanInit {
+				continue // the operator binary runs no git
+			}
 			requireVerifyGitSafeEnv(inits[i], "container "+inits[i].Name)
 		}
 		// The user-authored check containers carry it too (covers arbitrary
@@ -1151,11 +1210,11 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 		job := &batchv1.Job{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: jobName, Namespace: ns}, job)).To(Succeed())
 		inits := job.Spec.Template.Spec.InitContainers
-		Expect(inits).To(HaveLen(6), "clone + import + tamper + artifact + canary + 1 check")
+		Expect(inits).To(HaveLen(8), "clone + import + tamper + artifact + scan-prep + scan + canary + 1 check")
 		Expect(inits[2].Name).To(Equal("tamper"))
-		Expect(inits[3].Name).To(Equal("artifact"), "the artifact check sits AFTER tamper, BEFORE the canary and the checks")
-		Expect(inits[4].Name).To(Equal("canary"), "F60: the canary sits after artifact, before the checks")
-		Expect(inits[5].Name).To(Equal("check-0"))
+		Expect(inits[3].Name).To(Equal("artifact"), "the artifact check sits AFTER tamper, BEFORE the scan, the canary and the checks")
+		Expect(inits[6].Name).To(Equal("canary"), "F60: the canary sits after the scan, before the checks")
+		Expect(inits[7].Name).To(Equal("check-0"))
 
 		By("the artifact container is a trusted git container: base image, safe.directory env, hardened profile, NO credential mount")
 		art := inits[3]
@@ -1557,8 +1616,8 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 		inits := job.Spec.Template.Spec.InitContainers
 		// check-0 uses the Loop's verify.image... (it sits AFTER the artifact
 		// check — clone + import + tamper + artifact are the trusted inits).
-		Expect(inits[5].Name).To(Equal("check-0"))
-		Expect(inits[5].Image).To(Equal(verifyDefaultCheckImage),
+		Expect(inits[7].Name).To(Equal("check-0"))
+		Expect(inits[7].Image).To(Equal(verifyDefaultCheckImage),
 			"check-* containers must run on spec.verify.image (they may need a Go toolchain)")
 		// ...while the trusted inits stay on the git image (they never run
 		// user commands — the I47 artifact check is one of them: it runs the
@@ -1594,10 +1653,10 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 		inits := job.Spec.Template.Spec.InitContainers
 		// check-0 sits after the I47 artifact check (clone + import + tamper
 		// + artifact = indices 0-3).
-		Expect(inits[5].Name).To(Equal("check-0"))
-		Expect(inits[5].Image).To(Equal(verifyDefaultCheckImage),
+		Expect(inits[7].Name).To(Equal("check-0"))
+		Expect(inits[7].Image).To(Equal(verifyDefaultCheckImage),
 			"without spec.verify.image the checks run on the built-in Go default (go: not found fix)")
-		Expect(inits[5].Image).NotTo(Equal("docker.io/alpine/git:v2.54.0"),
+		Expect(inits[7].Image).NotTo(Equal("docker.io/alpine/git:v2.54.0"),
 			"the git image has no Go toolchain — the S5a check-0 exit 127 root cause")
 	})
 

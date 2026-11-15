@@ -41,7 +41,7 @@ The reviewer's R2 run on kind-ref, 2026-11-15, at main `dcd3e42`. The script is 
 
 - **Images:** `ghcr.io/papawattu/coxswain-controller:v0.2.0` → `local/coxswain/main:r2-dcd3e42` (line 3).
 - **The CRD:** `judgeSummary` is absent on v0.2.0 (line 30) and present after the upgrade (line 58).
-- **The Loop across the upgrade:** `r2-across` was created on v0.2.0 and reached Implementing (lines 46-49). The upgrade ran while it was still Implementing (lines 50 and 52; `window=open`). The new operator rolled out with `r2-across` still Implementing (lines 68-69). It then moved to Verifying and Succeeded under the candidate (lines 75 and 78).
+- **The Loop across the upgrade:** `r2-across` was created on v0.2.0 and reached Implementing (lines 46-49). The upgrade ran while it was still Implementing (lines 50 and 52; `window=open`). The new operator rolled out with `r2-across` still Implementing (lines 68-69). It then moved to Verifying and Succeeded under the candidate (lines 75 and 78). Its final conditions also show `AgentFailed=False Recovered: the agent recovered from the sandbox failure (a fresh phase claim arrived)` (line 104): the sandbox failed once during the run and recovered. Neither operator log records when it failed, so it is not shown whether the upgrade caused it; the cause is unknown. Its `PolicyBlocked=Unknown AuditStreamGap` (line 102) says the audit stream re-attached, which is expected when the operator pod is replaced.
 - **Results:**
 
 ```
@@ -58,11 +58,11 @@ r2-smoke    Succeeded   0           True    3m57s
 
 - **RBAC:** `can-i` says yes for each verb checked (lines 136-140). The candidate operator log has `forbidden=0` over 13674 lines (positive control `control=1`, line 141); the v0.2.0 log has `forbidden=0` (line 142).
 - **Verdict:** every check printed PASS (lines 143-156), and the run printed `R2 RESULT: PASS` (line 157).
-- **Restore:** the lab operator image and args are back (lines 172-173). The lab's admission objects are back (lines 183-185), and so are its CRDs (lines 186-188). No Loops are left (line 191).
+- **Restore:** the lab operator image and args are back (lines 172-173). The lab's admission objects are back (lines 183-185). The CRDs were re-applied from the saved originals (lines 186-188). The log's `judgeSummary after restore: 1 (lab original: 4)` (line 190) compares two different counts (`grep -c` on the live JSON vs on the saved YAML), so the reviewer compared them directly after the run: each of the three coxswain CRDs' live `spec` is identical to its saved original (a python3 `json.dumps(sort_keys=True)` comparison of `kubectl get crd -o json` against `r2-crd-before.yaml`). No Loops are left (line 191).
 - **Limits:**
   - Only the controller image changed. The runner, model-proxy, tool-proxy and egress-proxy images stayed the lab's (the `--*-image` args, line 2), as in R1.
   - The run is linux/amd64 only. arm64 is built, not run (D137).
-  - r2-across wrote a lesson. So the lesson write path works end to end on the candidate: claim, then writer Job, then curator-keep, then written. Why r2-smoke and E1's honest Loop reported no lessons file is not shown. The runner writes the file only when the model's Implementing answer has a `LESSON:` line (`runner/lessons.go:162`, `runner/phase.go:360`), and those runner logs were not kept.
+  - r2-across wrote a lesson. So the lesson write path worked end to end once on the candidate: claim, then writer Job, then curator-keep, then written (one Loop, one run). Why r2-smoke and E1's honest Loop reported no lessons file is not shown. The runner writes the file only when the model's Implementing answer has a `LESSON:` line (`runner/lessons.go:167`, `runner/phase.go:360`), and those runner logs were not kept.
 
 ## New features
 

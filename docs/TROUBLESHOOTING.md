@@ -1255,6 +1255,33 @@ clone-pending stage takes the ordinary 5s work requeue first (that is the
 cadence a fresh Loop shows on kind), and a terminal Loop takes no window at all,
 so no restart is needed for the hold to clear once the cause does.
 
+**A labelled node with no Ready agent.** KubeArmor being installed and its
+agents Ready on the other nodes is not enough: `Enforcing` requires a Ready,
+DaemonSet-owned agent pod on **every** node carrying the BPF-LSM node label
+(`kubearmor.io/enforcer=bpf` by default), so a labelled node with no Ready
+agent still reports `NodeNotEnforcing` and holds every Loop. The symptom is
+`PolicyEnforced=False` with reason `NodeNotEnforcing` even though KubeArmor is
+installed and its agents are Ready elsewhere. Check which nodes carry the
+label and whether each one actually has a Ready agent:
+
+```
+kubectl get nodes -l kubearmor.io/enforcer=bpf
+# and, for each labelled node:
+kubectl -n kubearmor get pods -l kubearmor-app=kubearmor --field-selector spec.nodeName=<node>
+# and compare the agent DaemonSet's DESIRED count with the labelled node count:
+kubectl -n kubearmor get ds
+```
+
+A DESIRED count above the Ready-agent count (or below the labelled node count)
+means at least one labelled node has no agent running on it. Fix it one of two
+ways: let the agent run on that node (for example, a toleration for the node's
+taint), or remove the label from a node that should not run Loops:
+`kubectl label node <node> kubearmor.io/enforcer-`. A tainted control-plane
+node carrying the label is one way this happens (seen on kind, 2026-11-14:
+all three kind-ref nodes carried the label but the agent DaemonSet had only
+DESIRED 2 — the control-plane node's `NoSchedule` taint kept the agent off it
+and every Loop sat held); why the label was there was not determined.
+
 **The model proxy hold (`ModelProxyNotReady`).** With
 `spec.agent.endpointSecretRef` set, the sandbox is held `Suspended` until the
 Loop's model proxy pod is Ready (`modelProxyHold` in

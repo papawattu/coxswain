@@ -153,6 +153,16 @@ tags every coxswain image in `dist/install.yaml` with `<tag>` — see
 The install is done when the rollout reports success and the operator pod is
 Ready in `coxswain-system`.
 
+If you pre-load the release images into kind yourself (instead of letting the
+cluster pull them from GHCR), `kind load docker-image` of the multi-arch
+release tag fails when only one platform was pulled, because kind imports
+every platform in the manifest. Load one platform into an archive instead:
+
+```sh
+docker save --platform linux/amd64 -o img.tar <image>
+kind load image-archive img.tar
+```
+
 ## 3. The GitHub token Secret
 
 The deliver Job (the operator-owned Job that opens the Loop's PR) opens the
@@ -595,6 +605,19 @@ kubectl --context kind-coxswain-ref -n agent-sandbox-system rollout status deplo
 ```
 
 ### Step 5: Build and load the coxswain images
+
+The build needs a Docker with the buildx component, because the Makefile
+exports `DOCKER_BUILDKIT=1` (Makefile:24) and the Dockerfiles use
+`FROM --platform=$BUILDPLATFORM`. A Docker without the buildx component fails
+the build with:
+
+    ERROR: BuildKit is enabled but the buildx component is missing or broken.
+           Install the buildx component to build images with BuildKit:
+           https://docs.docker.com/go/buildx/
+
+A Docker 20.10 client built without the buildx component does not hit this:
+BuildKit is not the default there, so the build runs through the classic
+builder instead and succeeds.
 
 On the devbox (where the build dependencies live):
 

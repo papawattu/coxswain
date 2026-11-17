@@ -531,6 +531,37 @@ stall in Implementing (vLLM backends, environmental)"):**
    is itself evidence that the runner is not even reaching the model client
    (look at the agent log and the proxy usage lines, as #124 did).
 
+## Building and loading images: buildx and multi-arch kind load
+
+Two traps that affect building the images and loading them into kind (both
+listed as known issues in `docs/RELEASE-NOTES-v0.3.0.md`).
+
+### `make docker-build` fails: "BuildKit is enabled but the buildx component is missing or broken"
+
+- Symptom: `make docker-build` (or any build via the Makefile) fails with
+  `ERROR: BuildKit is enabled but the buildx component is missing or broken.`
+- Check: the Makefile exports `DOCKER_BUILDKIT=1` (Makefile:24) because the
+  Dockerfiles use `FROM --platform=$BUILDPLATFORM`. Whether it bites depends
+  on the Docker client: a Docker 29.1.3 without the buildx component fails
+  with the error above; a Docker 20.10 client built without it does not, and
+  builds through the classic builder.
+- Fix: build on a Docker that has buildx, or install the buildx component
+  (https://docs.docker.com/go/buildx/). See QUICKSTART §9, Step 5
+  (`docs/QUICKSTART.md`, "Step 5: Build and load the coxswain images").
+
+### `kind load docker-image` of a release tag fails: multi-arch manifest
+
+- Symptom: `kind load docker-image ghcr.io/papawattu/coxswain-<component>:<release-tag>`
+  fails when only one platform of the multi-arch release tag was pulled: kind
+  imports every platform in the manifest.
+- Check: which platforms the local image has — `docker image inspect
+  --format '{{json .RepoDigests}}' <image>` or `docker manifest inspect
+  <image>`.
+- Fix: save one platform into an archive and load that:
+  `docker save --platform linux/amd64 -o img.tar <image>` then
+  `kind load image-archive img.tar`. See QUICKSTART §2
+  (`docs/QUICKSTART.md`, "Install the operator").
+
 ## Why is my Loop Suspended or Failed?
 
 The gates and failure paths added on 2026-10-24 (F42, F55, F38, F35, F36, F39)

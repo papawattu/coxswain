@@ -568,6 +568,13 @@ and writes nothing to the agent pod's stdout. coxswain's relay reads exactly
 that stdout, so without this patch the blocked-action count and the audit trail
 stay empty:
 
+Apply this patch once, **before any Loop runs**: it rolls the agent DaemonSet
+(the same agent restart that the "Known limitations" section warns against —
+never restart the KubeArmor agent while Loops run), and `Makefile:433` notes
+"A post-install config edit + agent rollout-restart is also host-disruptive: on
+kernel 6.1 a BPF-LSM agent stop can hang in bpf_trampoline teardown and wedge
+the node's BPF subsystem (see ADR-0007, findings)."
+
 ```bash
 # Point the KubeArmor agent pods at stdout (the KubeArmor operator reads
 # LOGPATH from the agent's environment and rolls the DaemonSet)
@@ -698,6 +705,7 @@ pieces make it work:
 ### Step 7: Create Secrets
 
 ```bash
+scp hack/github-secret.sh <vm>:/tmp/github-secret.sh
 ssh <vm> "
   NS=d61
   kubectl --context kind-coxswain-ref create namespace $NS
@@ -706,7 +714,7 @@ ssh <vm> "
     --from-literal='model-key=d61-dummy-key' \
     --from-literal='MODEL_BASE_URL=http://192.168.1.20:8000'
   # GitHub secret (the token file must be on the VM at ~/.config/coxswain/github-token)
-  bash hack/github-secret.sh $NS
+  bash /tmp/github-secret.sh $NS
   # Secret opt-in (D76/D102; §3): without these the Loop is held
   # SecretsUsable=False (NamespaceNotEnabled, then SecretNotOptedIn).
   # install.yaml names the ClusterRole coxswain-coxswain-secret-reader.

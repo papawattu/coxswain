@@ -30,12 +30,12 @@ agent-sandbox, KubeArmor), so the next two subsections are already done.
 **The kind path, in order.** `make kind-up`, `hack/github-secret.sh` and
 `config/samples/` all live in the repo, so get it at the release tag first
 (`<release tag>` is the tag whose `install.yaml` you use in §2; the example
-is `v0.2.0`):
+is `v0.3.0`):
 
 1. Get the repo at the release tag:
    ```sh
    git clone https://github.com/papawattu/coxswain.git && cd coxswain
-   git checkout v0.2.0        # your <release tag>
+   git checkout v0.3.0        # your <release tag>
    ```
 2. `make kind-up` (this section).
 3. Install the operator (§2).
@@ -133,10 +133,10 @@ kubectl -n coxswain-system rollout status deploy/coxswain-controller-manager
 
 Fetch the release's `install.yaml` and apply it. It installs the controller
 into the `coxswain-system` namespace (the manifest is namespaced + prefixed
-`coxswain-`). From a release tag (pin it; v0.2.0 is the latest release):
+`coxswain-`). From a release tag (pin it; v0.3.0 is the latest release):
 
 ```sh
-curl -sfL "https://github.com/papawattu/coxswain/releases/download/v0.2.0/install.yaml" \
+curl -sfL "https://github.com/papawattu/coxswain/releases/download/v0.3.0/install.yaml" \
   -o install.yaml
 kubectl apply -f install.yaml
 kubectl rollout status deploy/coxswain-controller-manager -n coxswain-system
@@ -330,7 +330,7 @@ Without a checkout, `go install` builds the same binary from the module
 (into `$(go env GOBIN)`, default `~/go/bin`, which must be on `PATH`):
 
 ```sh
-go install github.com/papawattu/coxswain/cmd/kubectl-cox@v0.2.0    # your <release tag>
+go install github.com/papawattu/coxswain/cmd/kubectl-cox@v0.3.0    # your <release tag>
 ```
 
 The `cox` CLI (also installed as the `kubectl cox` plugin — `cmd/cox` and

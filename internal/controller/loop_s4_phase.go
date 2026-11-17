@@ -704,12 +704,21 @@ func (r *LoopReconciler) advancePhaseFromClaim(ctx context.Context, loop *coxv1a
 		return false, false, ""
 	}
 	// F6 (review follow-up): the AgentFailed condition is cleared to
-	// False/Recovered on ANY valid fresh claim — BEFORE the other early
-	// returns (the Verifying hold, the exhausted-failure terminal phase,
-	// the F6 failure path). A fresh claim is evidence the agent recovered
-	// from a prior sandbox failure (the pod that failed without a claim is
-	// gone, its replacement is doing the work), so a healthy Loop must not
-	// still show AgentFailed=True (the API doc promise on AgentFailedCondition).
+	// False/Recovered on the FIRST reconcile pass that reaches this point
+	// after it went True (every pass except Paused/Succeeded/Failed, which
+	// returned above) — whatever the pod is doing and whether or not any
+	// claim exists: no claim is read before this line. The clear runs BEFORE
+	// sandboxFailureStep below; if the failure is still detected there
+	// (sandboxFailure), applySandboxFailure sets the condition True again in
+	// the same pass, so the persisted state is True only while the failure is
+	// detected. A False/Recovered condition therefore means "the sandbox
+	// failure check found no failure on a pass" (the failed pod and Sandbox
+	// may simply be gone after the retry delete, with no replacement pod
+	// started or having done any work yet), NOT "the agent made progress".
+	// A pass where the sandbox pod read FAILED also leaves it False/Recovered
+	// (sandboxFailureStep logs "no decision" and returns, and the clear above
+	// is still persisted): the check did not run to a result, and a later
+	// pass sets it True again if it then detects the failure.
 	// A no-op when the condition is absent (the common path: no failure ever
 	// happened); it does NOT change the phase machine (ADR-0005: the claim
 	// channel is the only thing that advances).
@@ -1023,9 +1032,13 @@ const (
 	// sandbox pod failure without a claim (F6, I90): True with the pod's
 	// termination reason (Evicted, Error, OOMKilled, …) and the kubelet
 	// message ("Usage of EmptyDir volume tmp exceeds the limit 100Mi") while
-	// the operator is deciding what to do. Cleared (to False/Recovered) once
-	// the Loop advances past the failure (a fresh claim arrives) or the bound
-	// is exhausted (the Failed condition carries the durable record).
+	// the operator is deciding what to do. Set to False/Recovered by the next
+	// reconcile pass (advancePhaseFromClaim, before the failure check) and
+	// set True again in that pass if the failure is still detected; removed
+	// when the bound is exhausted (the Failed condition carries the durable
+	// record). It does not wait for a claim. A pass where the sandbox pod
+	// read fails (no decision) also leaves it False/Recovered until a later
+	// pass detects the failure again.
 	sandboxFailedCondition = "AgentFailed"
 	// sandboxInfraRetryEventReason / sandboxInfraFinalEventReason are the
 	// stable Warning Event reasons for the sandbox infra retry and the final
@@ -1833,7 +1846,7 @@ func clearRecoveredCondition(loop *coxv1alpha1.Loop, condType string) bool {
 			}
 			loop.Status.Conditions[i].Status = metav1.ConditionFalse
 			loop.Status.Conditions[i].Reason = "Recovered"
-			loop.Status.Conditions[i].Message = "the agent recovered from the sandbox failure (a fresh phase claim arrived)"
+			loop.Status.Conditions[i].Message = "the sandbox failure is no longer detected"
 			loop.Status.Conditions[i].LastTransitionTime = metav1.Now()
 			return true
 		}

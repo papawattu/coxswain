@@ -173,11 +173,12 @@ var _ = Describe("F6: a sandbox pod that failed without a claim is surfaced and 
 	})
 
 	// The F6 review follow-up (P1): the condition is CLEARED to
-	// False/Recovered once a fresh claim arrives (the agent recovered from a
-	// prior sandbox failure). The dogfood kind run observed AgentFailed=True
+	// False/Recovered on the next reconcile pass when the failure is no longer
+	// detected (this spec plants a fresh pod WITH a claim; the clear does not
+	// depend on the claim). The dogfood kind run observed AgentFailed=True
 	// sticking on a healthy Loop at AwaitingApproval — the condition was set
 	// by the F6 check but never cleared once the fresh pod claimed.
-	It("clears the AgentFailed condition to False/Recovered on a fresh claim (the recovery)", func() {
+	It("clears the AgentFailed condition to False/Recovered when the failure is no longer detected (the recovery)", func() {
 		const ns, name = "f6-recover-ns", "f6-recover"
 		r := f6NewReconciler(ns, name)
 		// Plant the failing sandbox + Evicted pod (the original F6 scenario).
@@ -250,7 +251,7 @@ var _ = Describe("F6: a sandbox pod that failed without a claim is surfaced and 
 		_, _, _ = r.advancePhaseFromClaim(ctx, loop)
 		cond = findConditionFn(loop.Status.Conditions, cov.AgentFailedCondition)
 		Expect(cond).ToNot(BeNil(), "the AgentFailed condition must still be present (the audit record)")
-		Expect(cond.Status).To(Equal(metav1.ConditionFalse), "AgentFailed must be cleared to False on a fresh claim")
+		Expect(cond.Status).To(Equal(metav1.ConditionFalse), "AgentFailed must be cleared to False when the failure is no longer detected")
 		Expect(cond.Reason).To(Equal("Recovered"))
 	})
 

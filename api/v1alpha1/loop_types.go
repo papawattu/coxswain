@@ -1689,7 +1689,9 @@ const (
 	// It is set to False / Recovered by the first reconcile pass after it
 	// went True (no claim is required) and set True again in that same pass
 	// if the failure is still detected, so False / Recovered means the
-	// failure check found no failure, not that the agent has made progress;
+	// failure check found no failure (or its pod read failed and gave no
+	// decision; a later pass sets it True again if the failure is detected),
+	// not that the agent has made progress;
 	// it is removed once the bounded retry is
 	// exhausted (the distinct SandboxFailed Failed-condition carries the
 	// durable record). The condition is a SURFACE (I90), not a gate input:

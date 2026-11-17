@@ -715,6 +715,10 @@ func (r *LoopReconciler) advancePhaseFromClaim(ctx context.Context, loop *coxv1a
 	// failure check found no failure on a pass" (the failed pod and Sandbox
 	// may simply be gone after the retry delete, with no replacement pod
 	// started or having done any work yet), NOT "the agent made progress".
+	// A pass where the sandbox pod read FAILED also leaves it False/Recovered
+	// (sandboxFailureStep logs "no decision" and returns, and the clear above
+	// is still persisted): the check did not run to a result, and a later
+	// pass sets it True again if it then detects the failure.
 	// A no-op when the condition is absent (the common path: no failure ever
 	// happened); it does NOT change the phase machine (ADR-0005: the claim
 	// channel is the only thing that advances).
@@ -1032,7 +1036,9 @@ const (
 	// reconcile pass (advancePhaseFromClaim, before the failure check) and
 	// set True again in that pass if the failure is still detected; removed
 	// when the bound is exhausted (the Failed condition carries the durable
-	// record). It does not wait for a claim.
+	// record). It does not wait for a claim. A pass where the sandbox pod
+	// read fails (no decision) also leaves it False/Recovered until a later
+	// pass detects the failure again.
 	sandboxFailedCondition = "AgentFailed"
 	// sandboxInfraRetryEventReason / sandboxInfraFinalEventReason are the
 	// stable Warning Event reasons for the sandbox infra retry and the final

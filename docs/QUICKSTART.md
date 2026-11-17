@@ -359,8 +359,9 @@ pattern in the diff) makes the column read `Suspicious`, forces a **draft** PR
 the shared-memory lessons (`judgeWithholdsLessons`,
 `internal/controller/loop_memory_writer_job.go:1214`); see
 `docs/RELEASE-NOTES-v0.3.0.md` ("The diff scan's `VerifySuspicious` flag
-applies to every Loop"). A false verdict, no verdict or a truncated diff
-force a draft the same way. Otherwise `delivery.draft` decides, and its CRD
+applies to every Loop"). A Judge verdict of false, an Unknown verdict (the
+Judge ran but gave none) or a truncated diff force a draft the same way, and
+withhold the lessons too (`judgeWithholdsLessons`). Otherwise `delivery.draft` decides, and its CRD
 default is `true` (`config/crd/bases/coxswain.wattu.com_loops.yaml:314`), so
 PRs are drafts unless you set `draft: false`.
 

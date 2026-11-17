@@ -615,9 +615,8 @@ the build with:
            Install the buildx component to build images with BuildKit:
            https://docs.docker.com/go/buildx/
 
-A Docker 20.10 client built without the buildx component does not hit this:
-BuildKit is not the default there, so the build runs through the classic
-builder instead and succeeds.
+Docker 20.10 (20.10.24) builds with `DOCKER_BUILDKIT=1` without the buildx
+component (rc=0); Docker 29.1.3 without it fails as above.
 
 On the devbox (where the build dependencies live):
 

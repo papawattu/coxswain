@@ -542,9 +542,9 @@ listed as known issues in `docs/RELEASE-NOTES-v0.3.0.md`).
   `ERROR: BuildKit is enabled but the buildx component is missing or broken.`
 - Check: the Makefile exports `DOCKER_BUILDKIT=1` (Makefile:24) because the
   Dockerfiles use `FROM --platform=$BUILDPLATFORM`. Whether it bites depends
-  on the Docker client: a Docker 29.1.3 without the buildx component fails
-  with the error above; a Docker 20.10 client built without it does not, and
-  builds through the classic builder.
+  on the Docker client: Docker 20.10 (20.10.24) builds with
+  `DOCKER_BUILDKIT=1` without the buildx component (rc=0); Docker 29.1.3
+  without it fails as above.
 - Fix: build on a Docker that has buildx, or install the buildx component
   (https://docs.docker.com/go/buildx/). See QUICKSTART §9, Step 5
   (`docs/QUICKSTART.md`, "Step 5: Build and load the coxswain images").
@@ -554,9 +554,6 @@ listed as known issues in `docs/RELEASE-NOTES-v0.3.0.md`).
 - Symptom: `kind load docker-image ghcr.io/papawattu/coxswain-<component>:<release-tag>`
   fails when only one platform of the multi-arch release tag was pulled: kind
   imports every platform in the manifest.
-- Check: which platforms the local image has — `docker image inspect
-  --format '{{json .RepoDigests}}' <image>` or `docker manifest inspect
-  <image>`.
 - Fix: save one platform into an archive and load that:
   `docker save --platform linux/amd64 -o img.tar <image>` then
   `kind load image-archive img.tar`. See QUICKSTART §2

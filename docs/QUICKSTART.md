@@ -11,7 +11,10 @@ is Phase 7 work). A `v*` release tag publishes the public images and the
 When something is not working, start with `docs/TROUBLESHOOTING.md` — the
 symptoms alpha users have hit (ModelUnavailable, fresh-kind DNS, the
 configmaps RBAC wedge, kubectl debug denials, NetworkEnforced, the #124
-Implementing stall), each with its documented cause and fix.
+Implementing stall, `SecretsUsable=False`), each with its documented cause and
+fix. `ModelConfigValid=False reason=NoModelEndpoint` is in the condition table
+in `docs/OPERATOR.md`. If a hand edit of `loops/status` is rejected, that is
+the status admission policy (§6), not a fault.
 
 ## 1. Prerequisites
 
@@ -289,7 +292,7 @@ spec:
     gitCredentialSecret: git-cred     # the Secret from §3
   agent:
     endpointSecretRef: model-creds    # the Secret above (key model-key)
-    modelEndpoint: "<host>:<port>"    # FILL: your model server, host:port, no scheme
+    modelEndpoint: "<host>:<port>"    # FILL: your model server, host:port, no scheme (plain HTTP)
     model: "<model name>"             # FILL: the model name your server serves
   delivery:
     mode: PullRequest
@@ -306,6 +309,13 @@ kubectl apply -f my-loop.yaml
 
 `agent.endpointSecretRef` and `agent.modelEndpoint` must be set together and
 are immutable, so a new endpoint means a new Loop.
+
+**The model endpoint is plain HTTP.** `modelEndpoint` is an
+OpenAI-compatible server at `host:port`; the CRD pattern
+(`^[a-z0-9]([a-z0-9.-]*[a-z0-9])?:[0-9]{1,5}$`, `config/crd/bases/coxswain.wattu.com_loops.yaml:141`)
+rejects a scheme, and the operator prefixes `http://` itself
+(`modelEndpointValue`, `internal/controller/loop_controller.go:5970`). An
+HTTPS-only hosted API cannot be named here.
 `config/samples/loop-fix-failing-test.yaml` and `loop-d61-proof.yaml` show the
 same fields.
 
@@ -323,6 +333,37 @@ What you will see, in order:
 4. If the verify keeps failing, the Loop hits its `maxIterations` budget and
    stops with the iteration history in `status` (read it back with
    `kubectl cox history <loop>`).
+
+**The optional Judge, and the `Judge` column.** `spec.verify.judge` opts the
+Loop into an advisory Judge (ADR-0011): after the checks pass, a Judge Job
+asks the model whether the change meets the goal without gaming the
+acceptance. It never changes `Succeeded`. Its fields are `enabled`,
+`maxTokens`, `model`, `modelEndpoint` and `endpointSecretRef`
+(`config/crd/bases/coxswain.wattu.com_loops.yaml:498-563`). Admission rules:
+`maxTokens` is required when `enabled` is true (`!self.enabled ||
+has(self.maxTokens)`), `maxTokens` is 1-32768, and `modelEndpoint` and
+`endpointSecretRef` must be set together (`has(self.modelEndpoint) ==
+has(self.endpointSecretRef)`); with neither, the Judge uses the Loop's own
+endpoint. Without `spec.verify.judge` no Judge Job runs. The Judge's own proxy
+is described in `docs/OPERATOR.md` ("The Judge's own proxy (J5b)").
+
+`kubectl get loop` always has a `Judge` column (`+kubebuilder:printcolumn`
+on `.status.judgeSummary`, `api/v1alpha1/loop_types.go:1861`). Its values are
+`Suspicious`, `False`, `Truncated`, `Unknown` and `True`, most serious first
+(`judgeSummary`, `internal/controller/loop_judge_job.go:1084`). It is **empty**
+for a Loop with no Judge and no scan hit, so a blank column is normal.
+
+Even with no Judge, the diff scan's `VerifySuspicious=True` (a subversion
+pattern in the diff) makes the column read `Suspicious`, forces a **draft** PR
+(`deliverDraft`, `internal/controller/loop_deliver_job.go:449`) and withholds
+the shared-memory lessons (`judgeWithholdsLessons`,
+`internal/controller/loop_memory_writer_job.go:1214`); see
+`docs/RELEASE-NOTES-v0.3.0.md` ("The diff scan's `VerifySuspicious` flag
+applies to every Loop"). A Judge verdict of false, an Unknown verdict (the
+Judge ran but gave none) or a truncated diff force a draft the same way, and
+withhold the lessons too (`judgeWithholdsLessons`). Otherwise `delivery.draft` decides, and its CRD
+default is `true` (`config/crd/bases/coxswain.wattu.com_loops.yaml:314`), so
+PRs are drafts unless you set `draft: false`.
 
 ## 5. Reading results with `kubectl cox`
 
@@ -394,6 +435,12 @@ kubectl cox approve <loop>
 # the next Planning pass.
 kubectl cox reject <loop> --reason "the plan does not address the error handling; add retry logic"
 ```
+
+`loops/status` can be written only by the operator: a
+ValidatingAdmissionPolicy (`coxswain-deny-loop-status-writes` in the v0.3.0
+`install.yaml`) denies every other `loops/status` write, even from a cluster
+admin (`docs/RELEASE-NOTES-v0.2.0.md`, "The status VAP (P6c, #416)"). Use
+`cox approve` / `cox reject`, not `kubectl patch`.
 
 A Loop with `approval.mode: Manual` is held at `AwaitingApproval` until
 the user runs `cox approve` or `cox reject`. The plan's hash (SHA-256) is
@@ -712,7 +759,7 @@ ssh <vm> "
   # Model secret (vLLM is no-auth; the metering proxy needs a non-empty key)
   kubectl --context kind-coxswain-ref -n $NS create secret generic beta-model-creds \
     --from-literal='model-key=d61-dummy-key' \
-    --from-literal='MODEL_BASE_URL=http://192.168.1.20:8000'
+    --from-literal='MODEL_BASE_URL=http://192.168.1.20:8000'   # NOT READ by the operator or runner: the URL comes from spec.agent.modelEndpoint; only model-key is read (§4)
   # GitHub secret (the token file must be on the VM at ~/.config/coxswain/github-token)
   bash /tmp/github-secret.sh $NS
   # Secret opt-in (D76/D102; §3): without these the Loop is held

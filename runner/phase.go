@@ -589,8 +589,8 @@ func drivePhaseOnce(cfg PhaseConfig, prompt, phase string, conversation []chatMe
 	go func() {
 		select {
 		case <-stop:
-			cancel()
 			stopCancelled.Store(1)
+			cancel()
 		case <-ctx.Done():
 		}
 	}()

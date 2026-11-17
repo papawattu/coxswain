@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -29,16 +30,16 @@ import (
 func s4StopFakeModel(t *testing.T) (*testhelper.FakeModel, func() int) {
 	t.Helper()
 	fm := testhelper.New()
-	requests := 0
+	var requests atomic.Int32
 	fm.SetHandler(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/chat/completions" {
 			http.NotFound(w, r)
 			return
 		}
-		requests++
+		requests.Add(1)
 		<-r.Context().Done()
 	})
-	return fm, func() int { return requests }
+	return fm, func() int { return int(requests.Load()) }
 }
 
 // s4SigtermSpec runs the I273 spec for one phase against a blocking model:

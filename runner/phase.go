@@ -68,6 +68,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -381,10 +382,15 @@ func PhaseRun(cfg PhaseConfig, stop <-chan any) Result {
 	}
 
 	var res Result
+	stopClosed := false
 	switch phase {
 	case PhasePlanning:
-		res = drivePhaseOnce(cfg, planningPrompt(cfg.Workspace, cfg.Goal, planCap), phase, conversation,
+		res, stopClosed = drivePhaseOnce(cfg, planningPrompt(cfg.Workspace, cfg.Goal, planCap), phase, conversation, stop,
 			func(answer string) { writePlan(cfg.Workspace, answer, planCap) })
+		if stopClosed {
+			return Result{}
+		}
+
 		// B3 (PLAN-BETA / PLAN.md Phase 4): the plan-change check. After
 		// writing the fresh PLAN.md, the runner reads the approved hash
 		// (the operator wrote it to .coxswain/plan-hash from the
@@ -438,62 +444,15 @@ func PhaseRun(cfg PhaseConfig, stop <-chan any) Result {
 			break
 		}
 		var implAnswer string
-		res = drivePhaseOnce(cfg, implementingPrompt(cfg.Workspace, cfg.Goal), phase, conversation,
+		res, stopClosed = drivePhaseOnce(cfg, implementingPrompt(cfg.Workspace, cfg.Goal), phase, conversation, stop,
 			// P5b: capture the implementing answer so the lessons proposal
 			// (the LESSON: lines) is written to the workspace file on success
 			// (the writeLessonsFile call below).
 			func(answer string) { implAnswer = answer })
-		// S5a (B3): at the end of a successful Implementing, commit the work in
-		// the workspace repo (excluding the operator-owned .coxswain dir) and
-		// record the head SHA in the claim. A CLAIM (ADR-0005): the operator
-		// strictly validates the 40-hex shape before pinning it to
-		// status.currentVerify.verifiedCommit; a failed commit leaves the field
-		// empty (the operator then blocks the advance). On a BLOCKED run the
-		// work is not committed (nothing succeeded) and the claim carries no
-		// headCommit (no evidence to pin).
-		// I47: the staged paths go into Result.Summary (result.json only, F43
-		// P2-2: not the claim), and a refused commit (an oversized or
-		// binary new file) BLOCKS the claim with the reason — no headCommit,
-		// the operator holds the Verifying advance.
-		if res.Status == statusSuccess {
-			// P5b: propose the lessons this run learned (into
-			// <workspace>/.coxswain/lessons.json on the workspace volume) BEFORE
-			// the commit (the file is in the operator-owned .coxswain dir,
-			// which the commit excludes — it rides the workspace PVC to the
-			// operator, who reads it with `kubectl exec cat` and screens it with
-			// pkg/memorywrite before the writer Job persists it). A write
-			// failure is non-fatal (ADR-0004: a failed memory write does not
-			// fail the Loop).
-			writeLessonsFile(cfg.Workspace, parseLessons(implAnswer))
-			sha, staged, commitErr := commitWorkspace(cfg.Workspace)
-			if sha != "" {
-				res.HeadCommit = sha
-				res.Summary = stagedClaimSummary(res.Summary, staged)
-				log.Printf("runner: headCommit=%s staged=%d", sha, len(staged))
-			} else {
-				// The commit failed (I47 rejection or git failure): the work is
-				// not safe to verify (a build artifact would ride into the
-				// verified commit, or the commit itself failed). The claim is
-				// BLOCKED with the reason — the operator sees it in progress
-				// and the advance is held (ADR-0005 fail-closed: no evidence,
-				// no advance).
-				res.Status = statusBlocked
-				if commitErr != "" {
-					res.VerificationNotes = "commit failed: " + commitErr
-				} else {
-					res.VerificationNotes = "commit failed: commitWorkspace returned empty headCommit"
-				}
-				res.Summary = res.Summary + "; " + res.VerificationNotes
-				log.Printf("runner: %s; emitting blocked claim (operator will hold the advance)", res.VerificationNotes)
-			}
-		} else {
-			// F34: a blocked Implementing proposes nothing. Clear any file an
-			// EARLIER iteration left, or the epilogue's lessonsFileAvailable
-			// would put that stale proposal in this run's claim. (The restart
-			// re-commit paths above are left alone: they resume the SAME
-			// iteration, whose own run wrote the file.)
-			writeLessonsFile(cfg.Workspace, nil)
+		if stopClosed {
+			return Result{}
 		}
+		res = commitAndLessons(cfg, res, implAnswer)
 	}
 	// A4: persist the conversation for a next phase run WITHOUT a pod
 	// recycle (the test seam / a future multi-phase single-pod design). The
@@ -585,8 +544,15 @@ func awaitDesiredPhase(workspace string, poll time.Duration, stop <-chan any) (s
 // conversation history), runs the optional onAnswer hook (the phase's
 // post-processing, e.g. the PLAN.md write), and returns the phase's Result
 // (with the observedPhase set and the conversation captured for A4).
+// R58 I273 (D142 "separately"): the model loop runs under a ctx cancelled
+// when the stop channel (SIGTERM) closes, so a pod deletion during the model
+// loop is acted on promptly — without it, the runner ignored SIGTERM until
+// the kubelet's SIGKILL at the grace deadline. stopClosed reports whether
+// that ctx ended because stop closed, not because the model loop finished or
+// the per-request model timeout fired; the caller returns a zero Result for
+// it (no claim, no PLAN.md write, no commit, no lesson file).
 func drivePhaseOnce(cfg PhaseConfig, prompt, phase string, conversation []chatMessage,
-	onAnswer ...func(string)) Result {
+	stop <-chan any, onAnswer ...func(string)) (Result, bool) {
 	modelTimeout := cfg.ModelTimeout
 	if modelTimeout <= 0 {
 		modelTimeout = defaultModelTimeout
@@ -609,12 +575,31 @@ func drivePhaseOnce(cfg PhaseConfig, prompt, phase string, conversation []chatMe
 	messages = append(messages, chatMessage{Role: jsonRoleUser, Content: prompt})
 
 	client := &http.Client{}
+	// R58 I273 (D142): a ctx cancelled when stop closes (SIGTERM). driveModel
+	// honours it for every model request and the retry backoff, so the loop
+	// ends promptly on a pod deletion. Shell tool commands keep their own
+	// timeout (execShell's shellTimeout); only the model loop is bounded here.
+	// stopCancelled is set by the watcher when it cancels the ctx (a stop that
+	// arrives during the model work); the stopClosed result below is true only
+	// when the watcher cancelled the ctx, not when the phase's model work
+	// simply finished (the watcher exits on ctx.Done without setting it).
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var stopCancelled atomic.Int32
+	go func() {
+		select {
+		case <-stop:
+			cancel()
+			stopCancelled.Store(1)
+		case <-ctx.Done():
+		}
+	}()
 	// F79: the phase drive (the runner binary's path, runner/cmd/main.go) runs
 	// the PRODUCTION ladder. The injectable seam is runConfig's
 	// ModelRetries/ModelRetryBackoff, which the F79 specs use against the same
 	// shared driveModel; PhaseConfig has no operator knob for it.
 	answer, trace, modelErr := driveModel(
-		context.Background(), client, cfg.BaseURL, cfg.APIKey, cfg.Model, cfg.Workspace,
+		ctx, client, cfg.BaseURL, cfg.APIKey, cfg.Model, cfg.Workspace,
 		messages, maxSteps, shellTimeout, modelTimeout, modelRetryLadderFor(0, 0), cfg.ExtraBody,
 	)
 
@@ -640,6 +625,74 @@ func drivePhaseOnce(cfg PhaseConfig, prompt, phase string, conversation []chatMe
 	// writing it would truncate a PLAN.md the user already approved.
 	if modelErr == "" && len(onAnswer) > 0 && onAnswer[0] != nil {
 		onAnswer[0](answer)
+	}
+	// R58 I273 (D142): SIGTERM during the model loop. stopCancelled is set by
+	// the watcher only when it cancels the ctx (a stop that arrives during the
+	// model work). stopClosed is true when the watcher cancelled the ctx (the
+	// phase did not complete); the caller returns a zero Result for it (no
+	// claim, no PLAN.md write, no commit, no lesson file). A stop that arrives
+	// after the phase completed (the watcher exited on ctx.Done without setting
+	// stopCancelled) is not a stop during the phase: the phase ran to
+	// completion and its claim is written as usual.
+	stopClosed := stopCancelled.Load() == 1
+	return res, stopClosed
+}
+
+// commitAndLessons (S5a / P5b) commits the workspace repo on a successful
+// Implementing run and writes the lessons file. It is the post-model work for
+// the Implementing phase, extracted from PhaseRun to keep PhaseRun's cyclomatic
+// complexity within the lint budget.
+func commitAndLessons(cfg PhaseConfig, res Result, implAnswer string) Result {
+	// S5a (B3): at the end of a successful Implementing, commit the work in
+	// the workspace repo (excluding the operator-owned .coxswain dir) and
+	// record the head SHA in the claim. A CLAIM (ADR-0005): the operator
+	// strictly validates the 40-hex shape before pinning it to
+	// status.currentVerify.verifiedCommit; a failed commit leaves the field
+	// empty (the operator then blocks the advance). On a BLOCKED run the
+	// work is not committed (nothing succeeded) and the claim carries no
+	// headCommit (no evidence to pin).
+	// I47: the staged paths go into Result.Summary (result.json only, F43
+	// P2-2: not the claim), and a refused commit (an oversized or
+	// binary new file) BLOCKS the claim with the reason — no headCommit,
+	// the operator holds the Verifying advance.
+	if res.Status == statusSuccess {
+		// P5b: propose the lessons this run learned (into
+		// <workspace>/.coxswain/lessons.json on the workspace volume) BEFORE
+		// the commit (the file is in the operator-owned .coxswain dir,
+		// which the commit excludes — it rides the workspace PVC to the
+		// operator, who reads it with `kubectl exec cat` and screens it with
+		// pkg/memorywrite before the writer Job persists it). A write
+		// failure is non-fatal (ADR-0004: a failed memory write does not
+		// fail the Loop).
+		writeLessonsFile(cfg.Workspace, parseLessons(implAnswer))
+		sha, staged, commitErr := commitWorkspace(cfg.Workspace)
+		if sha != "" {
+			res.HeadCommit = sha
+			res.Summary = stagedClaimSummary(res.Summary, staged)
+			log.Printf("runner: headCommit=%s staged=%d", sha, len(staged))
+		} else {
+			// The commit failed (I47 rejection or git failure): the work is
+			// not safe to verify (a build artifact would ride into the
+			// verified commit, or the commit itself failed). The claim is
+			// BLOCKED with the reason — the operator sees it in progress
+			// and the advance is held (ADR-0005 fail-closed: no evidence,
+			// no advance).
+			res.Status = statusBlocked
+			if commitErr != "" {
+				res.VerificationNotes = "commit failed: " + commitErr
+			} else {
+				res.VerificationNotes = "commit failed: commitWorkspace returned empty headCommit"
+			}
+			res.Summary = res.Summary + "; " + res.VerificationNotes
+			log.Printf("runner: %s; emitting blocked claim (operator will hold the advance)", res.VerificationNotes)
+		}
+	} else {
+		// F34: a blocked Implementing proposes nothing. Clear any file an
+		// EARLIER iteration left, or the epilogue's lessonsFileAvailable
+		// would put that stale proposal in this run's claim. (The restart
+		// re-commit paths above are left alone: they resume the SAME
+		// iteration, whose own run wrote the file.)
+		writeLessonsFile(cfg.Workspace, nil)
 	}
 	return res
 }

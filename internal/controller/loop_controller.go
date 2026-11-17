@@ -2924,13 +2924,61 @@ func (r *LoopReconciler) sandboxSuspendedByGate(ctx context.Context, loop *coxv1
 		return true
 	}
 	// D38: the CNI self-test gate (network layer, analogous to the D30 eBPF
-	// gate above). Unknown (no probe result yet), CNIUnenforced, and
+	// gate above). Unknown (no probe result yet; except D142(a), below),
+	// CNIUnenforced, and
 	// ProbeUnavailable all hold the sandbox Suspended (fail-closed) unless
 	// AllowUnenforcedNetwork is set. The condition is set in
 	// applyEffectivePolicyAndConditions (order-independent, like the
 	// PolicyEnforced condition).
+	//
+	// D142(a) (I273): before the FIRST probe result a new leader's holder is
+	// Unknown. A sandbox that already runs with NetworkEnforced=True recorded
+	// keeps running (only creation is held); the first result re-gates it.
+	if r.cniPreProbeRunning(ctx, loop) {
+		return false
+	}
 	run, _, _, _ := r.cniNetworkStatus()
 	return !run
+}
+
+// cniPreProbeRunning reports whether the D38 gate must let an EXISTING sandbox
+// keep running because the holder has no probe result yet (D142(a), I273).
+// All of these must hold:
+//   - the holder is still Unknown (a new leader before its first probe);
+//   - the escape hatch is off (with it on, the old EnforcementDisabled path
+//     already lets the Loop run);
+//   - the Loop records NetworkEnforced=True/CNIEnforced;
+//   - the Sandbox exists and its operating mode is Running.
+//
+// A sandbox that does not exist yet is still held (fail-closed for every new
+// pod). There is deliberately NO age bound on the recorded True: the window is
+// bounded by the first probe result (a probe error or timeout becomes
+// ProbeUnavailable, prober.go probeOnce, and the probe timeout defaults to
+// 120 s), and that first result re-gates every Loop (ProbeRunnable.retage).
+// The same predicate makes the NetworkEnforced write skip (see
+// applyEffectivePolicyAndConditions), so the recorded True is not replaced by
+// Unknown before the first result.
+func (r *LoopReconciler) cniPreProbeRunning(ctx context.Context, loop *coxv1alpha1.Loop) bool {
+	if r.CNIProber == nil || r.AllowUnenforcedNetwork ||
+		r.CNIProber.LatestResult().Reason != cni.ReasonUnknown {
+		return false
+	}
+	recorded := false
+	for i := range loop.Status.Conditions {
+		c := loop.Status.Conditions[i]
+		if c.Type == cni.NetworkEnforcedCondition {
+			recorded = c.Status == metav1.ConditionTrue && c.Reason == string(cni.ReasonCNIEnforced)
+			break
+		}
+	}
+	if !recorded {
+		return false
+	}
+	sbx := &sandboxv1beta1.Sandbox{}
+	if err := r.Get(ctx, client.ObjectKey{Namespace: loop.Namespace, Name: sandboxName(loop.Name)}, sbx); err != nil {
+		return false // absent or unreadable: fail closed
+	}
+	return sbx.Spec.OperatingMode == sandboxv1beta1.SandboxOperatingModeRunning
 }
 
 // sandboxDesiredPhaseAnnotation is the annotation the operator stamps on the
@@ -6256,7 +6304,9 @@ func (r *LoopReconciler) applyEffectivePolicyAndConditions(ctx context.Context, 
 	// PolicyEnforced). The escape hatch is AllowUnenforcedNetwork (separate
 	// from AllowUnenforced — the two flags are independent). A condition
 	// change emits a Kubernetes Event (design point 3).
-	if _, reason, status, msg := r.cniNetworkStatus(); status != "" {
+	// D142(a): before the first probe result a recorded True on a running
+	// sandbox is not rewritten to Unknown (cniPreProbeRunning).
+	if _, reason, status, msg := r.cniNetworkStatus(); status != "" && !r.cniPreProbeRunning(ctx, loop) {
 		if r.networkEnforcedChanged(loop, status, string(reason), msg) {
 			setCondition(loop, cni.NetworkEnforcedCondition, status, string(reason), msg)
 			r.emitNetworkEnforcedEvent(loop, status, string(reason), msg)
@@ -6340,7 +6390,9 @@ func (r *LoopReconciler) applyEffectivePolicyAndConditionsBestEffort(ctx context
 		}
 		setCondition(loop, string(PolicyEnforcedCondition), status, rs, msg)
 	}
-	if _, reason, status, msg := r.cniNetworkStatus(); status != "" {
+	// D142(a): before the first probe result a recorded True on a running
+	// sandbox is not rewritten to Unknown (cniPreProbeRunning).
+	if _, reason, status, msg := r.cniNetworkStatus(); status != "" && !r.cniPreProbeRunning(ctx, loop) {
 		if r.networkEnforcedChanged(loop, status, string(reason), msg) {
 			setCondition(loop, cni.NetworkEnforcedCondition, status, string(reason), msg)
 			r.emitNetworkEnforcedEvent(loop, status, string(reason), msg)

@@ -96,9 +96,12 @@ not police pod -> host-network egress; sandbox held Suspended",
 `internal/controller/loop_controller.go:1008`). The operator probes the CNI
 with a self-test pod + NetworkPolicy in the `coxswain-cni-probe` namespace
 (`cmd/main.go`, `--cni-probe-*` flags) and re-gates every Loop when the result
-changes. Until the first probe succeeds, the condition is `Unknown` and the
-sandbox is held Suspended (fail-closed from startup, not just from the first
-probe failure).
+changes. Until the first probe result, the condition is `Unknown` and a
+sandbox that does not exist yet is held Suspended (fail-closed from startup,
+not just from the first probe failure). A sandbox that already runs with
+`NetworkEnforced=True` recorded keeps running until that result (D142: an
+operator restart does not stop running agents); the first result then
+re-gates every Loop.
 
 **To run anyway on a non-enforcing CNI** (dev/kind only — never in
 production), add `--allow-unenforced-network` to the manager's args. This is

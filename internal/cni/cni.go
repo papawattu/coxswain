@@ -46,7 +46,8 @@ const (
 	// ReasonUnknown: initial state before the first probe result (status
 	// Unknown). The gate treats it as not enforced (Suspended), so the
 	// operator is fail-closed from startup, not just from the first probe
-	// failure.
+	// failure. Exception (D142(a)): a sandbox that already runs with
+	// NetworkEnforced=True recorded keeps running until the first result.
 	ReasonUnknown Reason = "Unknown"
 )
 
@@ -77,7 +78,9 @@ const NetworkEnforcedCondition = "NetworkEnforced"
 // Suspended. Every reason holds Suspended EXCEPT CNIEnforced (it's True) and
 // EnforcementDisabled (the escape hatch was set on purpose, so Loops run
 // anyway). Unknown and ProbeUnavailable hold Suspended: the operator is
-// fail-closed, including before the first probe result.
+// fail-closed, including before the first probe result. The reconciler
+// exempts an already-running, recorded-True sandbox from the Unknown hold
+// (D142(a), cniPreProbeRunning); this method does not know about it.
 func (r CNIProbeResult) HoldsSuspended() bool {
 	switch r.Reason {
 	case ReasonCNIEnforced, ReasonEnforcementDisabled:

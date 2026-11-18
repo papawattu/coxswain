@@ -2261,6 +2261,27 @@ func agentPodSpec(ctx context.Context, r *LoopReconciler, loop *coxv1alpha1.Loop
 		corev1.ResourceMemory:           resource.MustParse("512Mi"),
 		corev1.ResourceEphemeralStorage: *agentEphemeral,
 	}
+	// R59 I274 / D143(a): in the Planning phase the agent mounts the
+	// workspace READ-ONLY (the kubelet enforces it; a `git commit` or an
+	// edit to a tracked file fails because .git is read-only), with a
+	// second, writable subPath mount of the same volume at
+	// /workspace/.coxswain so the runner's own writes (PLAN.md, the claim,
+	// conversation.json, result.json, gotmp) still work. Every other phase
+	// mounts the workspace writable, as before.
+	workspaceMount := corev1.VolumeMount{Name: workspaceVolumeName, MountPath: agentWorkspaceMount}
+	if loop.Status.DesiredPhase == coxv1alpha1.LoopPhasePlanning {
+		workspaceMount.ReadOnly = true
+	}
+	agentMounts := []corev1.VolumeMount{workspaceMount}
+	if loop.Status.DesiredPhase == coxv1alpha1.LoopPhasePlanning {
+		// Writable .coxswain on top of the read-only tree; the phase-init
+		// container (still writable) has already created .coxswain/gotmp.
+		agentMounts = append(agentMounts, corev1.VolumeMount{
+			Name:      workspaceVolumeName,
+			MountPath: agentWorkspaceMount + "/.coxswain",
+			SubPath:   ".coxswain",
+		})
+	}
 	agentContainer := corev1.Container{
 		Name:  "agent",
 		Image: agentImage,
@@ -2285,13 +2306,12 @@ func agentPodSpec(ctx context.Context, r *LoopReconciler, loop *coxv1alpha1.Loop
 			Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{allCaps}},
 			SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 		},
-		VolumeMounts: []corev1.VolumeMount{
-			{Name: workspaceVolumeName, MountPath: agentWorkspaceMount},
-			{Name: "scratch", MountPath: agentScratchMount},
+		VolumeMounts: append(agentMounts,
+			corev1.VolumeMount{Name: "scratch", MountPath: agentScratchMount},
 			// P1 (R13): a writable /tmp so go build / mktemp / any tool that
 			// honors TMPDIR or hard-codes /tmp works under a read-only rootfs.
-			{Name: "tmp", MountPath: agentTmpMount},
-		},
+			corev1.VolumeMount{Name: "tmp", MountPath: agentTmpMount},
+		),
 	}
 	// S3a (GAP 1): the workspace init container materialises the workspace
 	// (clones spec.workspace.repo @ ref into the 'workspace' volume and

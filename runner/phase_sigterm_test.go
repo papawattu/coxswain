@@ -140,3 +140,70 @@ func TestPhaseRunStopDuringPlanningModelLoop(t *testing.T) {
 func TestPhaseRunStopDuringImplementingModelLoop(t *testing.T) {
 	s4SigtermSpec(t, PhaseImplementing)
 }
+
+// R58 I273 P2: a SIGTERM during a shell tool command ends the command
+// promptly. execShell now derives its timeout from the phase's stop ctx,
+// so a stop cancels the in-flight shell command (sleep 20) instead of
+// waiting for it to finish. PhaseRun must return within 5 s with a zero
+// Result (no claim, no commit).
+func TestPhaseRunStopDuringShellCommand(t *testing.T) {
+	fake := testhelper.New(testhelper.ModelResponse{
+		ToolCall: &testhelper.ToolCall{
+			ID:        "call_1",
+			Name:      "shell",
+			Arguments: `{"command":"sleep 20"}`,
+		},
+	})
+	defer fake.Close()
+	claimPath, cleanup := s4ClaimPath(t)
+	defer cleanup()
+
+	ws := t.TempDir()
+	writeDesiredPhase(t, ws, PhaseImplementing)
+	initTestRepo(t, ws)
+	baseHead := gitIn(t, ws, "rev-parse", "HEAD")
+
+	stop := make(chan any, 1)
+	done := make(chan Result, 1)
+	start := time.Now()
+	go func() {
+		done <- PhaseRun(PhaseConfig{Workspace: ws, Goal: "g", BaseURL: fake.URL, Model: "m",
+			PollInterval: 5 * time.Millisecond}, stop)
+	}()
+
+	// Let the shell command (sleep 20) be in flight, then SIGTERM it.
+	time.Sleep(time.Second)
+	stop <- struct{}{}
+	close(stop)
+
+	var res Result
+	select {
+	case res = <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("PhaseRun did not return within 5 s of SIGTERM during a shell command")
+	}
+	elapsed := time.Since(start)
+	if elapsed > 5*time.Second {
+		t.Fatalf("PhaseRun returned %s after start (stop at 1s); want within 5 s", elapsed.Round(time.Millisecond).String())
+	}
+
+	// Zero Result (no claim, no phase executed).
+	if res.Status != "" || res.ObservedPhase != "" || res.Summary != "" || res.HeadCommit != "" ||
+		res.VerificationNotes != "" || res.NextIterationPlan != "" || res.Iteration != 0 || res.PlanAttempt != 0 ||
+		res.PlanChanged || res.PlanMismatch || res.LessonsAvailable || len(res.FilesChanged) != 0 ||
+		len(res.Lessons) != 0 || len(res.ToolTrace) != 0 {
+		t.Fatalf("stop during shell command returned %+v; want a zero Result (no claim)", res)
+	}
+	// No result.json claim.
+	if _, err := os.Stat(filepath.Join(ws, resultDirName, resultFileName)); !os.IsNotExist(err) {
+		t.Fatalf("stop during shell command wrote result.json (stat err %v); want no claim file", err)
+	}
+	// No termination-log claim.
+	if _, err := os.Stat(claimPath); !os.IsNotExist(err) {
+		t.Fatalf("stop during shell command wrote a termination-log claim (stat err %v); want none", err)
+	}
+	// No new commit: HEAD is still the base commit.
+	if head := gitIn(t, ws, "rev-parse", "HEAD"); head != baseHead {
+		t.Fatalf("stop during shell command committed: HEAD moved from %s to %s", baseHead, head)
+	}
+}

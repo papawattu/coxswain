@@ -576,9 +576,9 @@ func drivePhaseOnce(cfg PhaseConfig, prompt, phase string, conversation []chatMe
 
 	client := &http.Client{}
 	// R58 I273 (D142): a ctx cancelled when stop closes (SIGTERM). driveModel
-	// honours it for every model request and the retry backoff, so the loop
-	// ends promptly on a pod deletion. Shell tool commands keep their own
-	// timeout (execShell's shellTimeout); only the model loop is bounded here.
+	// honours it for every model request, the retry backoff, and the shell
+	// tool command (execShell derives its timeout from this ctx), so the
+	// phase ends promptly on a pod deletion even mid-command.
 	// stopCancelled is set by the watcher when it cancels the ctx (a stop that
 	// arrives during the model work); the stopClosed result below is true only
 	// when the watcher cancelled the ctx, not when the phase's model work

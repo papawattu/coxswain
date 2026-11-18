@@ -401,11 +401,11 @@ func main() {
 		// speeds up voluntary leader transitions as the new leader don't have to wait
 		// LeaseDuration time first.
 		//
-		// In the default scaffold provided, the program ends immediately after
-		// the manager stops, so would be fine to enable this option. However,
-		// if you are doing or is intended to do any operation such as perform cleanups
-		// after the manager stops then its usage might be unsafe.
-		// LeaderElectionReleaseOnCancel: true,
+		// D142(a) (I273): enabled. Nothing runs after mgr.Start returns
+		// (it is followed only by the error check and os.Exit), so releasing
+		// the lease on stop is safe and removes the lease-expiry gap on an
+		// upgrade (18 s in R2c).
+		LeaderElectionReleaseOnCancel: true,
 	})
 	if err != nil {
 		setupLog.Error(err, "Failed to start manager")

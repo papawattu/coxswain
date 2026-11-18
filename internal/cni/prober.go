@@ -42,9 +42,14 @@ type resultHolder struct {
 }
 
 // probeHolder is the shared holder. Its initial state is Unknown
-// (fail-closed: the gate holds Loops Suspended until the first probe result
-// lands, design point 3).
+// (fail-closed: the gate holds new sandboxes Suspended until the first probe
+// result; D142(a) lets an already-running, recorded-True sandbox keep running
+// until then; design point 3).
 var probeHolder = &resultHolder{result: CNIProbeResult{Reason: ReasonUnknown}}
+
+// firstRegateRetry is the wait between list retries for the first result's
+// re-gate (D142(a)). A var so specs can shorten it.
+var firstRegateRetry = time.Second
 
 // testMux guards test-only holder resets.
 var testMux sync.Mutex
@@ -154,7 +159,18 @@ func (p *ProbeRunnable) probeOnce(ctx context.Context) error {
 	old, changed := Holder().Set(newResult)
 	if changed {
 		SetNetworkEnforcedMetric(newResult)
-		p.retage(rctx, old, newResult)
+		// D142(a): the FIRST result after startup (the holder was Unknown)
+		// must reach every Loop: a new leader let running sandboxes keep
+		// going until it. It is delivered with the operator's lifetime ctx
+		// (not the spent probe ctx), retrying the list and blocking on a
+		// full channel. A later change keeps the best-effort delivery: a
+		// dropped event leaves the Loop gated by its last result, and the
+		// next change re-gates it.
+		if old.Reason == ReasonUnknown {
+			p.retage(ctx, old, newResult, true)
+		} else {
+			p.retage(rctx, old, newResult, false)
+		}
 	}
 	return nil
 }
@@ -164,16 +180,34 @@ func (p *ProbeRunnable) probeOnce(ctx context.Context) error {
 // result from the holder — it never runs the probe. A nil Client (unit tests)
 // skips the Event and the channel send: the re-gate is a no-op and the result
 // is still stored in the holder (the metric is updated by the caller).
-func (p *ProbeRunnable) retage(ctx context.Context, old, new CNIProbeResult) {
+//
+// first is true for the first result after startup (D142(a), I273): the list
+// is retried until it succeeds and each send blocks until the controller takes
+// it, both bounded only by ctx (the operator's lifetime). Choice: blocking,
+// retried delivery rather than a requeue of Loops let run while the holder was
+// Unknown, because it needs no extra state and the first result is a single
+// bounded burst (one event per Loop) to a consumer that is always draining.
+func (p *ProbeRunnable) retage(ctx context.Context, old, new CNIProbeResult, first bool) {
 	log := ctrl.Log.WithName("cni-prober")
 	log.Info("CNI probe result changed", "old", string(old.Reason), "new", string(new.Reason))
 	if p.Client == nil {
 		return
 	}
 	var loops coxv1alpha1.LoopList
-	if err := p.Client.List(ctx, &loops); err != nil {
-		log.Error(err, "Could not list Loops for the CNI re-gate")
-		return
+	for {
+		err := p.Client.List(ctx, &loops)
+		if err == nil {
+			break
+		}
+		log.Error(err, "Could not list Loops for the CNI re-gate", "first", first)
+		if !first {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(firstRegateRetry):
+		}
 	}
 	for i := range loops.Items {
 		loop := &loops.Items[i]
@@ -193,11 +227,24 @@ func (p *ProbeRunnable) retage(ctx context.Context, old, new CNIProbeResult) {
 				"NetworkEnforced: %s (%s)", new.Reason, new.Describe())
 		}
 		if p.Ch != nil {
+			ev := event.GenericEvent{Object: loop}
+			if first {
+				select {
+				case p.Ch <- ev:
+				case <-ctx.Done():
+					return
+				}
+				continue
+			}
 			select {
-			case p.Ch <- event.GenericEvent{Object: loop}:
+			case p.Ch <- ev:
 			default:
-				// Drop on a full channel: the next periodic probe re-gates.
-				// Never block the Runnable.
+				// Drop on a full channel. This is NOT recovered by the next
+				// periodic probe: an unchanged result never re-gates (only a
+				// change does), so a dropped Loop keeps its previous gate
+				// until the result changes or the Loop reconciles for
+				// another reason. The first result after startup does not
+				// take this path (first above).
 			}
 		}
 	}

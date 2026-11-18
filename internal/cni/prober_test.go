@@ -16,6 +16,7 @@ package cni
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -27,6 +28,7 @@ import (
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
@@ -173,7 +175,7 @@ func TestRetageEventTracksResult(t *testing.T) {
 			p := &ProbeRunnable{Prober: nil, Client: cl, Recorder: recorder}
 			p.retage(context.Background(),
 				CNIProbeResult{Reason: ReasonUnknown},
-				CNIProbeResult{Reason: tc.reason})
+				CNIProbeResult{Reason: tc.reason}, false)
 			got, ok := <-recorder.Events
 			if !ok {
 				t.Fatalf("no Event emitted for reason %s", tc.reason)
@@ -186,5 +188,78 @@ func TestRetageEventTracksResult(t *testing.T) {
 				t.Fatalf("Event does not carry the reason: %q", got)
 			}
 		})
+	}
+}
+
+// D142(a) (I273): the FIRST result after startup reaches every Loop even when
+// the re-gate channel is full: delivery blocks instead of dropping. A later
+// change keeps the best-effort drop.
+func TestFirstResultRegatesEveryLoopThroughAFullChannel(t *testing.T) {
+	ResetForTest()
+	t.Cleanup(ResetForTest)
+
+	scheme := runtime.NewScheme()
+	_ = coxv1alpha1.AddToScheme(scheme)
+	objs := make([]client.Object, 0, 3)
+	for _, n := range []string{"a", "b", "c"} {
+		objs = append(objs, &coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: n, Namespace: "ns"}})
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
+
+	ch := make(chan event.TypedGenericEvent[client.Object], 1)
+	ch <- event.GenericEvent{Object: objs[0]} // full before the probe runs
+	f := NewFakeProber()
+	f.SetResult(CNIProbeResult{Reason: ReasonCNIUnenforced, Detail: "X"})
+	p := &ProbeRunnable{Prober: f, Client: cl, Timeout: time.Second, Ch: ch}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	done := make(chan struct{})
+	go func() { _ = p.probeOnce(ctx); close(done) }()
+
+	time.Sleep(200 * time.Millisecond) // the channel stays full: nobody drains yet
+	got := 0
+	for got < 4 { // the filler + the three Loops
+		select {
+		case <-ch:
+			got++
+		case <-time.After(5 * time.Second):
+			t.Fatalf("only %d of 4 events arrived: the first result was dropped on a full channel", got)
+		}
+	}
+	<-done
+}
+
+// A failed Loop list must not lose the first result either: it is retried.
+func TestFirstResultRetriesTheLoopList(t *testing.T) {
+	ResetForTest()
+	t.Cleanup(ResetForTest)
+	old := firstRegateRetry
+	firstRegateRetry = 10 * time.Millisecond
+	t.Cleanup(func() { firstRegateRetry = old })
+
+	scheme := runtime.NewScheme()
+	_ = coxv1alpha1.AddToScheme(scheme)
+	fails := 2
+	cl := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(&coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: "a", Namespace: "ns"}}).
+		WithInterceptorFuncs(interceptor.Funcs{List: func(ctx context.Context, c client.WithWatch, l client.ObjectList, o ...client.ListOption) error {
+			if fails > 0 {
+				fails--
+				return errors.New("transient")
+			}
+			return c.List(ctx, l, o...)
+		}}).Build()
+	ch := make(chan event.TypedGenericEvent[client.Object], 4)
+	f := NewFakeProber()
+	f.SetResult(CNIProbeResult{Reason: ReasonCNIUnenforced, Detail: "X"})
+	p := &ProbeRunnable{Prober: f, Client: cl, Timeout: time.Second, Ch: ch}
+	if err := p.probeOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-ch:
+	default:
+		t.Fatal("the first result was lost after a transient list failure")
 	}
 }

@@ -564,6 +564,18 @@ field is the most useful diagnostic:
 - `CNIUnenforced` → the network gate is not satisfied. The CNI does not
   enforce NetworkPolicy. Either install an enforcing CNI (Calico) or use the
   `--allow-unenforced-network` escape hatch (dev only).
+- `Unknown` → the operator has no CNI probe result yet (a new leader before its
+  first probe, D142). A sandbox that does not exist yet is held Suspended
+  (fail-closed). A sandbox that already runs with `NetworkEnforced=True`
+  recorded on its Loop **keeps running** until the first result, and the
+  recorded True is not rewritten meanwhile; there is no age bound on that
+  True. The first result re-gates every Loop: `CNIUnenforced` or
+  `ProbeUnavailable` then Suspends it. A probe that errors or times out gives
+  `ProbeUnavailable`; the probe timeout defaults to 120 s
+  (`--cni-probe-timeout`), so that is the longest a running sandbox goes
+  unchecked after an operator restart. The lease is released on a clean stop
+  (`LeaderElectionReleaseOnCancel`), so a handover does not wait for it to
+  expire.
 - `ProbeUnavailable` → the network probe ran but could not measure the fence
   because a row came out **UNRESOLVED** (a target could not be resolved, or it
   was refused while the no-policy control pod was BLOCKED or UNRESOLVED for it),

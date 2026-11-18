@@ -1155,6 +1155,9 @@ Suspended (fail-closed), not run.
        * `Unknown` — **initial state before the first probe result**; the
          gate treats it as not enforced (Suspended), so the manager is
          fail-closed from startup, not just from the first probe failure.
+         (D142(a): a sandbox that already runs with `NetworkEnforced=True`
+         recorded is the one exception and keeps running until the first
+         result; creation is still held.)
      (Status `True` only for `CNIEnforced`; every other reason is
      `False`/`Unknown`, and every reason **except `CNIEnforced` and
      `EnforcementDisabled`** holds Loops Suspended. `EnforcementDisabled`

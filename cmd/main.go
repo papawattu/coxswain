@@ -105,6 +105,13 @@ func main() {
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
 		"Enable leader election for controller manager. "+
 			"Enabling this will ensure there is only one active controller manager.")
+	leTimings := defaultLeaderElectionTimings()
+	flag.DurationVar(&leTimings.LeaseDuration, "leader-elect-lease-duration", leTimings.LeaseDuration,
+		"How long a non-leader waits before taking over an unrenewed lease (see leader_election_flag.go).")
+	flag.DurationVar(&leTimings.RenewDeadline, "leader-elect-renew-deadline", leTimings.RenewDeadline,
+		"How long the leader keeps retrying a lease renewal before giving up leadership and exiting.")
+	flag.DurationVar(&leTimings.RetryPeriod, "leader-elect-retry-period", leTimings.RetryPeriod,
+		"How long leader-election clients wait between attempts.")
 	flag.BoolVar(&secureMetrics, "metrics-secure", true,
 		"If set, the metrics endpoint is served securely via HTTPS. Use --metrics-secure=false to use HTTP instead.")
 	flag.StringVar(&webhookCertPath, "webhook-cert-path", "", "The directory that contains the webhook certificate.")
@@ -296,6 +303,10 @@ func main() {
 		setupLog.Error(err, "Invalid --loop-tolerations")
 		os.Exit(1)
 	}
+	if err := leTimings.validate(); err != nil {
+		setupLog.Error(err, "Invalid leader-election timings")
+		os.Exit(1)
+	}
 
 	// if the enable-http2 flag is false (the default), http/2 should be disabled
 	// due to its vulnerabilities. More specifically, disabling http/2 will
@@ -395,6 +406,9 @@ func main() {
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
 		LeaderElectionID:       "a54de9d2.coxswain.wattu.com",
+		LeaseDuration:          &leTimings.LeaseDuration,
+		RenewDeadline:          &leTimings.RenewDeadline,
+		RetryPeriod:            &leTimings.RetryPeriod,
 		// LeaderElectionReleaseOnCancel defines if the leader should step down voluntarily
 		// when the Manager ends. This requires the binary to immediately end when the
 		// Manager is stopped, otherwise, this setting is unsafe. Setting this significantly

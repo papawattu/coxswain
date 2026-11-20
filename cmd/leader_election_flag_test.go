@@ -22,16 +22,17 @@ func TestDefaultLeaderElectionTimingsRideThroughStalls(t *testing.T) {
 }
 
 func TestLeaderElectionTimingsValidate(t *testing.T) {
+	const s = time.Second
 	cases := []struct {
 		name    string
 		in      leaderElectionTimings
 		wantErr string
 	}{
-		{"ok", leaderElectionTimings{60 * time.Second, 40 * time.Second, 5 * time.Second}, ""},
-		{"lease not above renew", leaderElectionTimings{40 * time.Second, 40 * time.Second, 5 * time.Second}, "--leader-elect-lease-duration"},
+		{"ok", leaderElectionTimings{60 * s, 40 * s, 5 * s}, ""},
+		{"lease not above renew", leaderElectionTimings{40 * s, 40 * s, 5 * s}, "--leader-elect-lease-duration"},
 		// client-go requires RenewDeadline > JitterFactor(1.2) * RetryPeriod.
-		{"renew not above jittered retry", leaderElectionTimings{60 * time.Second, 12 * time.Second, 10 * time.Second}, "--leader-elect-renew-deadline"},
-		{"zero retry", leaderElectionTimings{60 * time.Second, 40 * time.Second, 0}, "--leader-elect-retry-period"},
+		{"renew not above jittered retry", leaderElectionTimings{60 * s, 12 * s, 10 * s}, "--leader-elect-renew-deadline"},
+		{"zero retry", leaderElectionTimings{60 * s, 40 * s, 0}, "--leader-elect-retry-period"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

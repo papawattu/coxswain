@@ -17,7 +17,7 @@
 
 ## P2
 
-- [ ] **I273: a new operator leader holds every Loop's sandbox Suspended until its first CNI probe, which stops agents mid-phase**
+- [x] **I273: a new operator leader holds every Loop's sandbox Suspended until its first CNI probe, which stops agents mid-phase** (`a6ebe62`, `0b4d419`)
 
   **Where:**
   - `internal/cni/prober.go:44-47`: the probe holder is in memory, and "Its initial state is Unknown".

@@ -552,10 +552,12 @@ func callModel(
 // execShell runs the shell command named in a tool call's arguments JSON in
 // the workspace and returns combined output. I5: the output is capped to
 // maxToolOutputBytes before being fed back to the model. I10: the command runs
-// in its own process group; on timeout (or after the command returns) the whole
-// group is killed so a backgrounded child can't hold the pipe open and hang the
-// runner past the timeout.
-func execShell(workspace, argsJSON string, timeout time.Duration) (string, error) {
+// in its own process group; on timeout or ctx cancellation (or after the
+// command returns) the whole group is killed so a backgrounded child can't
+// hold the pipe open and hang the runner past the timeout. R58 I273 (D142):
+// ctx is the phase's stop context — a stop (SIGTERM) during a shell command
+// ends the command promptly instead of waiting for it to finish.
+func execShell(ctx context.Context, workspace, argsJSON string, timeout time.Duration) (string, error) {
 	var args struct {
 		Command string `json:"command"`
 	}
@@ -563,7 +565,7 @@ func execShell(workspace, argsJSON string, timeout time.Duration) (string, error
 		return "", fmt.Errorf("bad tool args: %w", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "sh", "-c", args.Command)
 	cmd.Dir = workspace
@@ -747,7 +749,7 @@ func driveModel(
 				})
 				continue
 			}
-			out, err := execShell(workspace, tc.Function.Arguments, shellTimeout)
+			out, err := execShell(ctx, workspace, tc.Function.Arguments, shellTimeout)
 			if err != nil {
 				out = err.Error()
 			}

@@ -36,7 +36,7 @@
     - At 20:44:27, `sh -c sleep 40` and `sleep 40` were running in the Implementing agent (`r3-b-sleep.log`).
     - The Loop was suspended at 20:44:29.
     - Events: `20:44:29Z Paused`, `20:44:29Z Killing Stopping container agent`.
-    - The runner logged the stop result at 20:44:29.299.
+    - The runner logged the stop result at 20:44:29.299, in the same second as the Killing event (events have second resolution). The script's 1 s poll measured 2 s from the suspend to `terminated`.
     - A pod watch recorded the container `terminated` with `exitCode 0`, an empty message and `finishedAt 20:44:29Z` (`r3-b-podwatch.json`).
     - The Loop resumed and Succeeded.
   - The operator stream log has 36,896 lines and `forbidden` = 0.
@@ -92,7 +92,7 @@
   - **(a) Recommended: accept the kind evidence for the two edit/commit items, and drop the Manual-reject spec.**
     - Under (a), the kubelet blocks the write. A runner spec would have to fake the read-only tree (for example `chmod`), so it would test the fake, not the operator.
     - The envtest mutation already fails if the mount loses `ReadOnly`.
-    - The Manual-reject case cannot arise: Planning cannot write the tree, so a rejected plan leaves no edit behind.
+    - The Manual-reject case, as I274 states it, cannot arise: Planning cannot write the tree, so no tree edit survives a rejected plan. What does survive is R59's residual for (a): `.coxswain` (PLAN.md included) and `/scratch` stay writable by the Planning model. That residual is not part of I274.
     - I274 is then ticked at R61 with `bed9ba7`.
   - **(b)** b4 writes the runner specs on a chmod'd workspace (D143(a) step 2) and the Manual-reject spec, then I274 is ticked.
   - **Either way, R59's "whichever option" item stays owed:** capture `result.json`'s ToolTrace in the lab evidence, so a run can show which phase ran which command. R3 did not capture it.

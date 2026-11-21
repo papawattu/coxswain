@@ -386,6 +386,13 @@ type LoopReconciler struct {
 	// NetworkEnforced=False reason EnforcementDisabled rather than being held
 	// Suspended. For dev/kind only — never in production.
 	AllowUnenforcedNetwork bool
+	// FenceWaitImage is the image the sandbox's fence-wait init container
+	// runs (the CNI probe image, --cni-probe-image; empty =
+	// cni.PinnedProbeImage). It must provide python3.
+	FenceWaitImage string
+	// FenceWaitBudget bounds the sandbox's fence-wait (--cni-fence-wait-budget;
+	// zero = cni.DefaultFenceWaitBudget).
+	FenceWaitBudget time.Duration
 
 	// MemoryStorageClass is the P5a memory PVC's StorageClass (nil/empty =
 	// the cluster default). On kind clusters whose default StorageClass
@@ -2319,6 +2326,18 @@ func agentPodSpec(ctx context.Context, r *LoopReconciler, loop *coxv1alpha1.Loop
 	// spec.workspace.repo is set; the credential Secret is mounted into it
 	// ONLY (ADR-0006 — zero credentials in the agent).
 	var initContainers []corev1.Container
+	// fence-wait (D38; homelab brief 2026-11-07): the FIRST init container
+	// waits until the pod's own NetworkPolicy refuses the node's kubelet. CNIs
+	// that program policy asynchronously (k3s kube-router: 0.05-1.2s after the
+	// first container starts; Calico without policy_setup_timeout_seconds)
+	// leave a new pod unfenced for that window. Without this the clone below,
+	// and on later phases the agent itself, could start inside it. A budget
+	// that runs out exits FenceWaitTimeoutExit: the kubelet retries the init
+	// container and the agent never starts (fail-closed), surfaced as
+	// SandboxFenceNotReady (applySandboxFenceNotReady).
+	if fw, ok := r.sandboxFenceWait(); ok {
+		initContainers = append(initContainers, fw)
+	}
 	// S4 review P1 (R18, ADR-0006): the workspace init container (git clone
 	// with the credential mounted) runs ONLY on the first clone (baseCommit
 	// empty). Once status.baseCommit is pinned (immutable, ADR-0005 D10), the

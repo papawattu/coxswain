@@ -1631,6 +1631,13 @@ const (
 	// Failed:SandboxFailed). A wedge that produces no such Event is still only
 	// surfaced here.
 	SandboxNotStartingCondition = "SandboxNotStarting"
+	// SandboxFenceNotReadyCondition is True while the sandbox pod's fence-wait
+	// init container has run out of budget (reason FenceNotReady): the node's
+	// kubelet stayed reachable under the Loop's NetworkPolicy, so the CNI has
+	// not fenced the pod and the agent is held (the kubelet retries fence-wait).
+	// It returns to False (reason FenceUp) once fence-wait passes or the pod is
+	// gone. Surfacing only: the sandbox already fails closed.
+	SandboxFenceNotReadyCondition = "SandboxFenceNotReady"
 	// BudgetReadingStaleCondition (F44) is True while the operator cannot
 	// read the model proxy's usage endpoint (consecutive failures at or past
 	// the threshold): the token and cost caps are evaluating the last

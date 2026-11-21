@@ -1166,6 +1166,9 @@ func (r *LoopReconciler) sandboxFailureStep(ctx context.Context, loop *coxv1alph
 	if r.applySandboxNotStarting(ctx, loop) {
 		changed = true
 	}
+	if r.applySandboxFenceNotReady(ctx, loop) {
+		changed = true
+	}
 	return false, changed, false
 }
 

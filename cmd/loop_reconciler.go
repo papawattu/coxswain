@@ -9,6 +9,8 @@
 package main
 
 import (
+	"time"
+
 	"github.com/papawattu/coxswain/internal/alerts"
 	"github.com/papawattu/coxswain/internal/cni"
 	"github.com/papawattu/coxswain/internal/controller"
@@ -32,6 +34,10 @@ type newLoopReconcilerOptions struct {
 	AllowUnenforced bool
 	// AllowUnenforcedNetwork is the CNI escape hatch (--allow-unenforced-network).
 	AllowUnenforcedNetwork bool
+	// FenceWaitImage is the sandbox fence-wait image (--cni-probe-image).
+	FenceWaitImage string
+	// FenceWaitBudget bounds the sandbox fence-wait (--cni-fence-wait-budget).
+	FenceWaitBudget time.Duration
 	// MemoryStorageClass is the memory PVC's StorageClass (--memory-storage-class;
 	// empty = the cluster default).
 	MemoryStorageClass string
@@ -89,6 +95,8 @@ func newLoopReconciler(c client.Client, scheme *runtime.Scheme,
 		Enforcer:               kaEnforcer,
 		AllowUnenforced:        o.AllowUnenforced,
 		AllowUnenforcedNetwork: o.AllowUnenforcedNetwork,
+		FenceWaitImage:         o.FenceWaitImage,
+		FenceWaitBudget:        o.FenceWaitBudget,
 		MemoryStorageClass:     o.MemoryStorageClass,
 		// D76/D102: the Secret opt-in gate (--secret-opt-in, fail-closed by
 		// default). The cmd test asserts the default-flag mapping so a

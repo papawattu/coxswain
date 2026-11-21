@@ -34,8 +34,8 @@ func TestBuildPodPolicyPassStartsWithFenceWait(t *testing.T) {
 			t.Fatalf("the policy pod must have exactly one init container (fence-wait), got %d", len(pod.Spec.InitContainers))
 		}
 		fw := pod.Spec.InitContainers[0]
-		if fw.Name != fenceWaitContainerName {
-			t.Fatalf("initContainers[0] = %q, want %q", fw.Name, fenceWaitContainerName)
+		if fw.Name != FenceWaitContainerName {
+			t.Fatalf("initContainers[0] = %q, want %q", fw.Name, FenceWaitContainerName)
 		}
 		main := pod.Spec.Containers[0]
 		if fw.Image != main.Image || fw.ImagePullPolicy != main.ImagePullPolicy {
@@ -97,7 +97,7 @@ func TestFenceWaitScriptBehaviour(t *testing.T) {
 		t.Skip("python3 not on PATH")
 	}
 	const harness = `
-import os, sys, types, socket as real_socket
+import errno, os, sys, types, socket as real_socket
 seq = os.environ["FENCE_STUB_SEQ"].split(",")
 calls = {"n": 0}
 stub = types.ModuleType("socket")
@@ -112,6 +112,9 @@ class FakeSock:
         if o == "reach": return
         if o == "refused": raise ConnectionRefusedError(111, "Connection refused")
         if o == "timeout": raise real_socket.timeout("timed out")
+        if o == "hostunreach": raise OSError(errno.EHOSTUNREACH, "No route to host")
+        if o == "eperm": raise PermissionError(errno.EPERM, "Operation not permitted")
+        if o == "netunreach": raise OSError(errno.ENETUNREACH, "Network is unreachable")
         raise AssertionError(o)
 stub.socket = lambda *a, **k: FakeSock()
 stub.AF_INET = real_socket.AF_INET
@@ -130,7 +133,13 @@ exec(compile(sys.stdin.read(), "fence-wait", "exec"))
 		{"fence comes up: two consecutive non-REACHABLE", "reach,reach,refused,refused", "5", 0, "FENCE_UP"},
 		{"timeouts count as fenced too", "reach,timeout,timeout", "5", 0, "FENCE_UP"},
 		{"one blocked attempt is not enough", "reach,refused,reach,refused,refused", "5", 0, "attempts=5"},
-		{"never fenced: budget exhausted", "reach", "0.5", fenceWaitTimeoutExit, "FENCE_TIMEOUT"},
+		{"never fenced: budget exhausted", "reach", "0.5", FenceWaitTimeoutExit, "FENCE_TIMEOUT"},
+		{"an icmp-host-prohibited REJECT is a fence", "reach,hostunreach,hostunreach", "5", 0, "FENCE_UP"},
+		// An LSM denial (KubeArmor) or a missing route says nothing about the
+		// NetworkPolicy: it must never pass the fence.
+		{"EPERM is not a fence", "reach,eperm", "0.5", FenceWaitTimeoutExit, "ignoring connect error"},
+		{"ENETUNREACH is not a fence", "netunreach", "0.5", FenceWaitTimeoutExit, "FENCE_TIMEOUT"},
+		{"a non-fence error breaks the streak", "refused,eperm,refused,refused", "5", 0, "attempts=4"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			run := exec.Command(python3, "-c", harness)
@@ -157,7 +166,7 @@ exec(compile(sys.stdin.read(), "fence-wait", "exec"))
 		run.Env = []string{"FENCE_WAIT_BUDGET_SECONDS=1"}
 		out, err := run.CombinedOutput()
 		ee, ok := errors.AsType[*exec.ExitError](err)
-		if !ok || ee.ExitCode() == 0 || ee.ExitCode() == fenceWaitTimeoutExit {
+		if !ok || ee.ExitCode() == 0 || ee.ExitCode() == FenceWaitTimeoutExit {
 			t.Fatalf("want a non-zero exit other than the timeout code, got %v\n%s", err, out)
 		}
 	})
@@ -175,7 +184,7 @@ func fenceWaitFailedPod(exit int32) *corev1.Pod {
 		Status: corev1.PodStatus{
 			Phase: corev1.PodFailed,
 			InitContainerStatuses: []corev1.ContainerStatus{{
-				Name:  fenceWaitContainerName,
+				Name:  FenceWaitContainerName,
 				State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: exit, Message: "FENCE_TIMEOUT elapsed=30.0"}},
 			}},
 		},
@@ -183,7 +192,7 @@ func fenceWaitFailedPod(exit int32) *corev1.Pod {
 }
 
 func TestWaitForTerminationFenceTimeout(t *testing.T) {
-	cl := fake.NewClientBuilder().WithScheme(coreScheme()).WithObjects(fenceWaitFailedPod(fenceWaitTimeoutExit)).Build()
+	cl := fake.NewClientBuilder().WithScheme(coreScheme()).WithObjects(fenceWaitFailedPod(FenceWaitTimeoutExit)).Build()
 	p := NewPodProber(PodProberConfig{Namespace: probePodName, ProbeImage: probeTestImage, Client: cl, Reader: cl})
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

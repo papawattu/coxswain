@@ -22,6 +22,7 @@ package cni
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -56,6 +57,9 @@ type PodProberConfig struct {
 	// ClusterDomain is the cluster's service DNS domain (for the probe's
 	// apiserver-svc target FQDN). Defaults to cluster.local if empty.
 	ClusterDomain string
+	// FenceWaitBudget bounds the policy pass's fence-wait init container
+	// (fence_wait.go). Defaults to DefaultFenceWaitBudget if zero.
+	FenceWaitBudget time.Duration
 }
 
 // PodProber is the real CNIProber.
@@ -339,6 +343,15 @@ func (p *PodProber) Probe(ctx context.Context) (CNIProbeResult, error) {
 	// node so both passes measure the same node's host-network targets.
 	policyPod := p.buildPod(probePodName, probeLabelValue, node)
 	pmsg, _, err := p.run(probeCtx, policyPod)
+	if errors.Is(err, errFenceTimeout) {
+		// The kubelet stayed REACHABLE under the DNS-only policy for the whole
+		// fence-wait budget: that is a measurement, and it says unenforced.
+		return CNIProbeResult{
+			Reason: ReasonCNIUnenforced,
+			Rows:   []TargetRow{{Label: labelKubeletNode, Verdict: verdictReachable}},
+			Detail: fmt.Sprintf("%s (still reachable after the %s fence-wait budget)", labelKubeletNode, p.fenceWaitBudget()),
+		}, nil
+	}
 	if err != nil {
 		return unavailable("policy pass: " + err.Error()), nil
 	}
@@ -520,6 +533,11 @@ func (p *PodProber) buildPod(name, labelValue, nodeName string) *corev1.Pod {
 			AutomountServiceAccountToken: new(bool),
 		},
 	}
+	// The policy pass waits for its own fence before measuring (fence_wait.go).
+	// The control pass runs with no policy, so it must not.
+	if labelValue == probeLabelValue {
+		pod.Spec.InitContainers = []corev1.Container{p.fenceWaitContainer(pod.Spec.Containers[0])}
+	}
 	if nodeName != "" {
 		// Pin by the node's NAME via a required node affinity with a
 		// metadata.name MatchFields term. A kubernetes.io/hostname NodeSelector
@@ -594,6 +612,12 @@ func (p *PodProber) waitForTermination(ctx context.Context, pod *corev1.Pod) (st
 				return "", nil, fmt.Errorf("empty termination message (probe container terminated with no output)")
 			}
 			return msg, probe, nil
+		}
+		if fw := fenceWaitStatus(probe); fw != nil && fw.ExitCode != 0 {
+			if fw.ExitCode == fenceWaitTimeoutExit {
+				return "", nil, fmt.Errorf("%w (%s)", errFenceTimeout, strings.TrimSpace(fw.Message))
+			}
+			return "", nil, fmt.Errorf("fence-wait exited non-zero: %d", fw.ExitCode)
 		}
 		if probe.Status.Phase == corev1.PodFailed {
 			return "", nil, fmt.Errorf("probe pod failed")

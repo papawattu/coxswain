@@ -148,6 +148,11 @@ func main() {
 	var cniProbeTimeout time.Duration
 	flag.DurationVar(&cniProbeTimeout, "cni-probe-timeout", 120*time.Second,
 		"Per-run timeout for one CNI probe (both passes, D103: two probe pods, hence 120s).")
+	var cniFenceWaitBudget time.Duration
+	flag.DurationVar(&cniFenceWaitBudget, "cni-fence-wait-budget", cni.DefaultFenceWaitBudget,
+		"How long the probe's policy pass waits for its own NetworkPolicy to take effect before measuring "+
+			"(fence-wait; k3s/kube-router applies a new pod's rules 0.05-1.2s after it starts). "+
+			"Must be below --cni-probe-timeout. Exhausting it reports CNIUnenforced.")
 	// P5a: the memory PVC's StorageClass. Empty = the cluster default.
 	// Set to a RWX-capable class (e.g. local-shared) on kind clusters where
 	// the default (rancher.io/local-path, nodePathMap) is RWO-only.
@@ -303,6 +308,11 @@ func main() {
 		setupLog.Error(err, "Invalid --loop-tolerations")
 		os.Exit(1)
 	}
+	if cniFenceWaitBudget <= 0 || cniFenceWaitBudget >= cniProbeTimeout {
+		setupLog.Error(fmt.Errorf("--cni-fence-wait-budget (%s) must be positive and below --cni-probe-timeout (%s)",
+			cniFenceWaitBudget, cniProbeTimeout), "Invalid CNI probe timings")
+		os.Exit(1)
+	}
 	if err := leTimings.validate(); err != nil {
 		setupLog.Error(err, "Invalid leader-election timings")
 		os.Exit(1)
@@ -455,12 +465,13 @@ func main() {
 	// (registered below) calls Probe on an interval; the reconcile loop reads
 	// the cached result via LatestResult (never runs the probe).
 	cniProber := cni.NewPodProber(cni.PodProberConfig{
-		Client:        mgr.GetClient(),
-		Reader:        mgr.GetAPIReader(),
-		Namespace:     cniProbeNamespace,
-		ProbeImage:    cniProbeImage,
-		ProbeTimeout:  cniProbeTimeout,
-		ClusterDomain: clusterDomain,
+		Client:          mgr.GetClient(),
+		Reader:          mgr.GetAPIReader(),
+		Namespace:       cniProbeNamespace,
+		ProbeImage:      cniProbeImage,
+		ProbeTimeout:    cniProbeTimeout,
+		ClusterDomain:   clusterDomain,
+		FenceWaitBudget: cniFenceWaitBudget,
 	})
 	// D38: the leader-elected probe Runnable (first probe at startup, then
 	// every cniCheckInterval). It re-gates every Loop (via a K8s Event + a

@@ -189,7 +189,7 @@ func (p *ProbeRunnable) probeOnce(ctx context.Context) error {
 // bounded burst (one event per Loop) to a consumer that is always draining.
 func (p *ProbeRunnable) retage(ctx context.Context, old, new CNIProbeResult, first bool) {
 	log := ctrl.Log.WithName("cni-prober")
-	log.Info("CNI probe result changed", "old", string(old.Reason), "new", string(new.Reason))
+	log.Info("CNI probe result changed", "old", string(old.Reason), "new", string(new.Reason), "detail", new.Describe())
 	if p.Client == nil {
 		return
 	}

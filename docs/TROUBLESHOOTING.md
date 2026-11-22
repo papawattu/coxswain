@@ -773,6 +773,25 @@ The condition returns to `False` (reason `FenceUp`) once fence-wait passes or
 the pod is gone. Under `--allow-unenforced-network` the sandbox has no
 fence-wait.
 
+### A proxy pod stuck in `Init` on `fence-wait`
+
+**What you see:** a proxy pod (`<loop>-proxy`, the Judge's `<loop>-jproxy`, the
+egress proxy or a tool proxy) sits in `Init:Error` or `Init:CrashLoopBackOff` on
+its `fence-wait` init container. For the model proxy, the Loop also has
+`ModelProxyNotReady=True` with the message "its fence-wait ran out of budget",
+and the sandbox is held Suspended.
+
+**Why:** every proxy pod starts with the same `fence-wait` as the sandbox, so
+nothing in a proxy (the model and tool proxies hold a credential) runs before
+the proxy's own NetworkPolicy is up. Each proxy's policy refuses the node's
+kubelet: DNS plus the model endpoint on its port, or `0.0.0.0/0` minus the
+private carve-outs (which cover RFC 1918 node IPs). The checks are the same as
+for `SandboxFenceNotReady` above (`kubectl logs <pod> -c fence-wait --previous`).
+One more cause applies to the egress and tool proxies: a node whose IP is
+**public** is not carved out, so the proxy can reach that node's kubelet and
+fence-wait never passes. That is a real hole, so fence-wait holds the proxy
+rather than letting it run.
+
 ### Event `VerifyJobForeign` (F83b)
 
 **What you see:** a Warning Event: "the Job `<loop>-verify-<n>` is not owned

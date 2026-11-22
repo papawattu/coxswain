@@ -2775,6 +2775,11 @@ func modelProxyNotReady(pod *corev1.Pod, loop *coxv1alpha1.Loop, err error) (not
 	case !metav1.IsControlledBy(pod, loop):
 		return true, "it is not owned by this Loop", ""
 	case !isPodReady(pod):
+		if timedOut, _ := fenceWaitTimedOut(pod); timedOut {
+			// A fixed phrase (F84c): the termination message rides on no
+			// condition. The kubelet keeps retrying fence-wait.
+			return true, "its fence-wait ran out of budget (the node's kubelet stayed reachable under its NetworkPolicy: check that the CNI enforces NetworkPolicy)", ""
+		}
 		if pod.Status.PodIP == "" {
 			return true, "it has no pod IP (not scheduled or not started)", ""
 		}
@@ -3572,6 +3577,9 @@ func (r *LoopReconciler) buildModelProxyPod(loop *coxv1alpha1.Loop, podName, ns 
 			},
 		},
 	}
+	// fence-wait (D38): the proxy holds the model credential, so nothing in
+	// it starts before its own NetworkPolicy is up.
+	r.prependProxyFenceWait(&pod.Spec, proxyUID, proxyGID)
 	// C2 + D101: the model proxy pod carries the CURRENT Loop node placement
 	// (D101: it is Loop-scoped infrastructure — leaving it on the default
 	// pool is an invisible surprise). The pod's spec-hash delete+recreate
@@ -4199,6 +4207,9 @@ func (r *LoopReconciler) buildEgressProxyPod(loopName, ns, image string, network
 			},
 			}},
 	}
+	// fence-wait (D38): the egress proxy's policy is 0.0.0.0/0 minus the
+	// carve-outs; nothing in it starts before that policy is up.
+	r.prependProxyFenceWait(&pod.Spec, uid, gid)
 	// C2 + D101: the egress proxy pod carries the CURRENT Loop node
 	// placement (it is Loop-scoped infrastructure, like the model proxy).
 	r.applyLoopPlacement(&pod.Spec)
@@ -4800,6 +4811,10 @@ func (r *LoopReconciler) buildToolProxyPod(loopName, ns, image string, tool coxv
 			Volumes: volumes,
 		},
 	}
+	// fence-wait (D38): the tool proxy holds the tool credential and its
+	// policy is 0.0.0.0/0 minus the carve-outs; nothing in it starts before
+	// that policy is up.
+	r.prependProxyFenceWait(&pod.Spec, uid, gid)
 	// C2 + D101: the tool proxy pod carries the CURRENT Loop node placement
 	// (it is Loop-scoped infrastructure, like the model proxy).
 	r.applyLoopPlacement(&pod.Spec)

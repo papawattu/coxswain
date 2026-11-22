@@ -158,8 +158,8 @@ func TestSandboxFenceTimedOut(t *testing.T) {
 			if tc.cs != nil {
 				pod.Status.InitContainerStatuses = []corev1.ContainerStatus{*tc.cs}
 			}
-			if got, _ := sandboxFenceTimedOut(pod); got != tc.want {
-				t.Fatalf("sandboxFenceTimedOut = %v, want %v", got, tc.want)
+			if got, _ := fenceWaitTimedOut(pod); got != tc.want {
+				t.Fatalf("fenceWaitTimedOut = %v, want %v", got, tc.want)
 			}
 		})
 	}

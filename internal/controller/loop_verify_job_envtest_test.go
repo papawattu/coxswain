@@ -522,7 +522,7 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 		Expect(*job.Spec.BackoffLimit).To(Equal(int32(0)))
 
 		By("ordering the init containers: clone-base, import-agent, tamper, artifact, then the checks")
-		inits := job.Spec.Template.Spec.InitContainers
+		inits := afterFenceWait(job.Spec.Template.Spec.InitContainers)
 		Expect(inits).To(HaveLen(8), "clone + import + tamper + artifact + scan-prep + scan + canary + 1 check")
 		Expect(inits[0].Name).To(Equal("clone-base"))
 		Expect(inits[1].Name).To(Equal("import-agent"))
@@ -1209,7 +1209,7 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 		jobName := verifyJobName(&coxv1alpha1.Loop{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}})
 		job := &batchv1.Job{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: jobName, Namespace: ns}, job)).To(Succeed())
-		inits := job.Spec.Template.Spec.InitContainers
+		inits := afterFenceWait(job.Spec.Template.Spec.InitContainers)
 		Expect(inits).To(HaveLen(8), "clone + import + tamper + artifact + scan-prep + scan + canary + 1 check")
 		Expect(inits[2].Name).To(Equal("tamper"))
 		Expect(inits[3].Name).To(Equal("artifact"), "the artifact check sits AFTER tamper, BEFORE the scan, the canary and the checks")
@@ -1440,7 +1440,7 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 		job := &batchv1.Job{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: jobName, Namespace: ns}, job)).To(Succeed())
 
-		cloneCt := job.Spec.Template.Spec.InitContainers[0]
+		cloneCt := afterFenceWait(job.Spec.Template.Spec.InitContainers)[0]
 		Expect(cloneCt.Name).To(Equal(s5aCloneBase))
 		cloneCmd := cloneCt.Command[2]
 		// The auth header uses the printf '%s:%s' pattern with BOTH username and password.
@@ -1613,7 +1613,7 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 
 		job := &batchv1.Job{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name + "-verify-1", Namespace: ns}, job)).To(Succeed())
-		inits := job.Spec.Template.Spec.InitContainers
+		inits := afterFenceWait(job.Spec.Template.Spec.InitContainers)
 		// check-0 uses the Loop's verify.image... (it sits AFTER the artifact
 		// check — clone + import + tamper + artifact are the trusted inits).
 		Expect(inits[7].Name).To(Equal("check-0"))
@@ -1650,7 +1650,7 @@ var _ = Describe("S5a: verify Job (B3 Verifying evidence)", func() {
 
 		job := &batchv1.Job{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name + "-verify-1", Namespace: ns}, job)).To(Succeed())
-		inits := job.Spec.Template.Spec.InitContainers
+		inits := afterFenceWait(job.Spec.Template.Spec.InitContainers)
 		// check-0 sits after the I47 artifact check (clone + import + tamper
 		// + artifact = indices 0-3).
 		Expect(inits[7].Name).To(Equal("check-0"))

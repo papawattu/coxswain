@@ -625,6 +625,9 @@ func (r *LoopReconciler) buildJudgeJob(loop *coxv1alpha1.Loop) (*batchv1.Job, er
 	// C2 + D101: the Judge Job's pod template carries the CURRENT Loop node
 	// placement (Jobs are immutable and short-lived: a flag change re-places
 	// NEW Judge Jobs only — the memory-writer / verify Jobs' pattern).
+	// fence-wait (D38): the Judge (and its init) starts only once its
+	// NetworkPolicy is up.
+	r.prependFenceWait(&job.Spec.Template.Spec, memoryWriterNonRootUID, memoryWriterNonRootGID)
 	r.applyLoopPlacement(&job.Spec.Template.Spec)
 	return job, nil
 }

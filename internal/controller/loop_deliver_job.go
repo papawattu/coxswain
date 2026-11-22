@@ -1071,6 +1071,9 @@ func (r *LoopReconciler) buildDeliverJobSpec(loop *coxv1alpha1.Loop) batchv1.Job
 	// C2 + D101: the deliver Job's pod template carries the CURRENT Loop node
 	// placement (Jobs are immutable and short-lived: a flag change re-places
 	// NEW deliver Jobs only — documented in OPERATOR.md).
+	// fence-wait (D38): nothing in the deliver pod (the push holds the git
+	// credential) starts before the deliver NetworkPolicy is up.
+	r.prependFenceWait(&jobSpec.Template.Spec, deliverNonRootUID, deliverNonRootUID)
 	r.applyLoopPlacement(&jobSpec.Template.Spec)
 	return jobSpec
 }

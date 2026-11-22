@@ -19,6 +19,8 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/papawattu/coxswain/internal/cni"
+
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
@@ -589,7 +591,10 @@ func (r *LoopReconciler) applyVerifyIterate(ctx context.Context, loop *coxv1alph
 func trustedInitDecision(pod *corev1.Pod) *verifyDecision {
 	for j := range pod.Status.InitContainerStatuses {
 		ics := &pod.Status.InitContainerStatuses[j]
-		if ics.Name != verifyCloneBaseInit && ics.Name != verifyImportAgentInit {
+		// fence-wait (D38) runs first and is trusted too: a failed fence-wait
+		// (its budget ran out) means nothing after it ran — an infra
+		// failure naming fence-wait, never a verdict on the agent's work.
+		if ics.Name != cni.FenceWaitContainerName && ics.Name != verifyCloneBaseInit && ics.Name != verifyImportAgentInit {
 			continue
 		}
 		if ics.State.Terminated != nil && ics.Name == verifyImportAgentInit &&

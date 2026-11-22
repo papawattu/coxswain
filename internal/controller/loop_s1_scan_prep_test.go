@@ -115,7 +115,7 @@ func TestBuildVerifyJobSpecScanInits(t *testing.T) {
 		names = append(names, c.Name)
 		by[c.Name] = c
 	}
-	want := "clone-base,import-agent,tamper,artifact,scan-prep,scan,canary,check-0"
+	want := "fence-wait,clone-base,import-agent,tamper,artifact,scan-prep,scan,canary,check-0"
 	if strings.Join(names, ",") != want {
 		t.Fatalf("init order = %v, want %s", names, want)
 	}

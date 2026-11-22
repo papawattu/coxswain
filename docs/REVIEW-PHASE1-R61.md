@@ -20,6 +20,7 @@ v0.3.1 was tagged on `61bcacd` (11-20) and v0.3.2 on `c1da2f1` (11-21). Both rel
 ## Answered
 
 - **D144 = (a)** (owner, 11-22). The kind evidence stands for I274's edit and commit items, and the Manual-reject spec is dropped. The ToolTrace capture stays owed.
+- **D145 = (a)** (owner, 11-22, while this PR was open; the question is below). A behaviour PR from another session is reviewed on the PR before it merges. #522 (fence-wait in the Job pods) is the first one.
 
 ## Closed
 
@@ -64,7 +65,7 @@ This is the first kind run of #513, #515 and #521. kind-ref runs Calico.
   - R4 is the post-merge kind run for the probe, the sandbox and the model proxy. pi3's read-only audit is the post-merge code review. Its findings, as I re-graded them, are I278–I280 below.
   - The owner decides whether PRs from other sessions go through this review (D145).
 
-  **Acceptance:** D145 is answered, and the next fence-wait PR (verify or memory-writer) follows the answer.
+  **Acceptance:** the next fence-wait PR, #522, is reviewed on the PR before it merges (D145 = (a)).
 
 - [ ] **I277: the Phase 9 plan reuses decision IDs D140–D143**
 

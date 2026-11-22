@@ -70,9 +70,8 @@ slices created by defects land through the normal build→review→merge loop.
   egress/secret scoping, owner gate per goal).
 - **A3. Model.** The dogfood harness uses the configured model (qwen3.8-27b on
   the 5090 via vLLM) — the same as the build loop.
-- **A4. Cadence.** One real-repo goal per day during the dogfood window, each
-  producing a defect report. The owner sets the window (recommend 5 working
-  days).
+- **A4. Cadence.** Per D141: 5 working days, one real-repo goal per day, each
+  producing a defect report.
 
 ## Slices
 
@@ -310,6 +309,6 @@ is recorded in-tree.
 | ID | Question | Recommendation | Decision |
 |---|---|---|---|
 | D140 | Which owner repos for dogfood? | A new, simple web-based todo application (created fresh for this phase). | **As recommended — a new todo app** (owner, 2026-11-22). |
-| D141 | Dogfood cadence / window? | 5 working days, one real goal/day, each → defect report. | (pending owner) |
+| D141 | Dogfood cadence / window? | 5 working days, one real goal/day, each → defect report. | **5 working days** (owner, 2026-11-22). One real goal per day, each producing a defect report. |
 | D142 | Does a real-repo dogfood run ever target the live homelab cluster? | Yes — the owner wants runs on the live homelab cluster. Live-cluster runs follow the A0.1 guardrails (dedicated namespace, ResourceQuota, egress/secret scoping, CNI fence, owner gate per goal, snapshot+rollback). | **Yes — live homelab cluster** (owner, 2026-11-22). See A0.1. |
 | D143 | When to submit the CNCF entry? | After A2's proof is green (the entry cites it). Owner fires the PR. | (pending owner) |

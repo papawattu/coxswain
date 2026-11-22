@@ -4,7 +4,7 @@
 
 ## P2
 
-- [ ] **I274: Planning has the same write-capable shell as Implementing, nothing stops it editing the workspace, and Implementing's commit picks the edit up**
+- [x] **I274: Planning has the same write-capable shell as Implementing, nothing stops it editing the workspace, and Implementing's commit picks the edit up** (`bed9ba7`)
 
   **Where:**
   - `runner/runner.go:651`: `var knownTools = map[string]bool{toolNameShell: true}`. There is one tool map for every phase.

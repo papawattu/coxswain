@@ -24,7 +24,7 @@ v0.3.1 was tagged on `61bcacd` (11-20) and v0.3.2 on `c1da2f1` (11-21). Both rel
 ## Closed
 
 - **I274** is ticked in R59 (`bed9ba7`). D144 = (a) accepts R3 run 2 for the edit and commit items. The gate spec and its mutation are in #509.
-- **I275** (the reviewer's lab-script slips) is closed. R4 had one slip of the same kind, caught before the run. The first draft of `r4-lab.sh` selected proxy pods by `coxswain.io/loop`, which the proxies do not carry (`internal/controller/loop_controller.go:4075`). It would have logged no proxy fence-wait. I changed it to a name-prefix match before the run, and the run logged `r4-fence-proxy` (`fence-wait-logs.txt:1`). No slip reached a verdict.
+- **I275** (the reviewer's lab-script slips) is closed. R4 had one slip of the same kind, caught before the run. My first draft of `r4-lab.sh`, which was not kept, listed the Loop's pods with `-l coxswain.io/loop=$LP`. The proxies do not carry that label (`internal/controller/loop_controller.go:4075`), so it would have logged no proxy fence-wait. Before the run I replaced it with the name-prefix match the script has now (`get pods … | grep "^$LP-"`). The run logged `r4-fence-proxy` (`fence-wait-logs.txt:1`). No slip reached a verdict.
 
 ## R4: kind-ref on main `3aff005`
 
@@ -38,7 +38,7 @@ This is the first kind run of #513, #515 and #521. kind-ref runs Calico.
 - **Probe (#513).** The policy pod's fence-wait exited 0 with `FENCE_UP elapsed=1.10 attempts=2`. The control pod has no fence-wait (`fence-summary.txt:2-3`). The new operator's first result was `"old": "Unknown", "new": "CNIEnforced"` at 21:23:13, 34 s after the upgrade (`r4-lab.log:24`).
 - **Sandbox (#515).** Each of the Loop's three sandbox pods (Planning, Implementing, and the one after Verifying) has `fence-wait` as `initContainers[0]`, ahead of `init-workspace` in the first pod. Each exited 0 with `FENCE_UP elapsed=1.10 attempts=2`, read from `samples-podwatch.json`. Its security context is uid/gid 65532, a read-only root filesystem, `drop: [ALL]` and RuntimeDefault seccomp (`sandbox-pod.json`). `SandboxFenceNotReady` was never set (`poll.log`). The Loop went Planning → Implementing → Verifying → Succeeded, 21:23:18 → 21:26:34.
 - **Model proxy (#521).** `r4-fence-proxy` has fence-wait as its only init container. It exited 0 with `FENCE_UP` (`fence-wait-logs.txt:1-2`).
-- **Controls.** Both use the sandbox's real fence-wait container, copied from the live pod spec. Only the budget was changed, to 10 s. Both were pinned to the sandbox's node.
+- **Controls.** Both use the sandbox's real fence-wait container, copied from the pod spec the script saved while the first sandbox pod ran (`sandbox-pod.json`). Only the budget was changed, to 10 s. They ran at 21:26:34, before cleanup deleted the Loop at 21:27:44 (`r4-lab.log:35,47`). Both were pinned to the sandbox's node.
   - **C0, no NetworkPolicy:** exit 2, `FENCE_TIMEOUT elapsed=10.03 attempts=101` (`controls.txt:1`). The kubelet is reachable from a pod with no policy, so fence-wait does not pass when nothing fences the pod.
   - **C1, a deny-all egress policy:** exit 0, `FENCE_UP elapsed=1.10 attempts=2` (`controls.txt:2`).
 - **What the timings show.** Every pass is two 0.5 s connect timeouts in a row, with no successful connect before them. So on kind-ref's Calico, the fence was in place before fence-wait's first connect. R4 shows no k3s-style window here. It also cannot measure one smaller than fence-wait's first attempt.

@@ -34,11 +34,19 @@ const (
 )
 
 // sandboxFenceWait returns the sandbox's fence-wait init container, and false
-// when the sandbox must not have one: under --allow-unenforced-network the
-// operator runs Loops on a CNI that may never fence, so fence-wait would hold
-// every sandbox in Init forever. The owner opted out of the network guarantee
-// there; fence-wait has nothing to wait for.
+// when the sandbox must not have one (see fenceWaitContainer). It runs as the
+// sandbox's non-root UID/GID (agentPodSpec, the phase-init container).
 func (r *LoopReconciler) sandboxFenceWait() (corev1.Container, bool) {
+	return r.fenceWaitContainer(65532, 65532)
+}
+
+// fenceWaitContainer returns a fence-wait init container running as uid/gid
+// under the hardened security context every coxswain pod uses, and false when
+// the pod must not have one: under --allow-unenforced-network the operator
+// runs Loops on a CNI that may never fence, so fence-wait would hold every pod
+// in Init forever. The owner opted out of the network guarantee there;
+// fence-wait has nothing to wait for.
+func (r *LoopReconciler) fenceWaitContainer(uid, gid int64) (corev1.Container, bool) {
 	if r.AllowUnenforcedNetwork {
 		return corev1.Container{}, false
 	}
@@ -47,8 +55,6 @@ func (r *LoopReconciler) sandboxFenceWait() (corev1.Container, bool) {
 		image = cni.PinnedProbeImage
 	}
 	falseP, trueP := false, true
-	// The sandbox's non-root UID/GID (agentPodSpec, the phase-init container).
-	uid, gid := int64(65532), int64(65532)
 	return cni.NewFenceWaitContainer(image, corev1.PullIfNotPresent, r.FenceWaitBudget, &corev1.SecurityContext{
 		AllowPrivilegeEscalation: &falseP,
 		RunAsNonRoot:             &trueP,
@@ -60,12 +66,34 @@ func (r *LoopReconciler) sandboxFenceWait() (corev1.Container, bool) {
 	}), true
 }
 
-// sandboxFenceTimedOut reports whether the sandbox pod's fence-wait last
+// prependProxyFenceWait makes fence-wait the FIRST init container of a proxy
+// pod (model, Judge, egress and tool proxies), running as the proxy's own
+// uid/gid. A new proxy pod is unfenced for kube-router's programming window
+// (0.05-1.2s after its first container starts) just like the sandbox: the
+// model and tool proxies hold a credential, and every proxy's NetworkPolicy
+// is what keeps it from reaching in-cluster and private targets (the egress
+// and tool proxies allow 0.0.0.0/0 minus the private carve-outs). Each proxy's
+// policy refuses the node's kubelet (DNS plus a model peer on its port, or
+// the carve-outs, which cover RFC 1918 node IPs), so fence-wait can pass.
+//
+// A budget that runs out holds the proxy in Init (fail-closed): the proxy is
+// never Ready, and whatever waits on it (the D35a model-proxy gate, the
+// verify Job's egress gate) keeps holding. For the model proxy the hold says
+// so (modelProxyNotReady).
+func (r *LoopReconciler) prependProxyFenceWait(spec *corev1.PodSpec, uid, gid int64) {
+	fw, ok := r.fenceWaitContainer(uid, gid)
+	if !ok {
+		return
+	}
+	spec.InitContainers = append([]corev1.Container{fw}, spec.InitContainers...)
+}
+
+// fenceWaitTimedOut reports whether a pod's (the sandbox's, or a proxy's) fence-wait last
 // exited with FenceWaitTimeoutExit (the current or the last terminated state:
 // under the sandbox's restart policy the kubelet re-runs a failed init
 // container, so the timeout is usually in LastTerminationState while the next
 // attempt runs) and the agent has not started since.
-func sandboxFenceTimedOut(pod *corev1.Pod) (bool, string) {
+func fenceWaitTimedOut(pod *corev1.Pod) (bool, string) {
 	for i := range pod.Status.InitContainerStatuses {
 		cs := &pod.Status.InitContainerStatuses[i]
 		if cs.Name != cni.FenceWaitContainerName {
@@ -114,7 +142,7 @@ func (r *LoopReconciler) applySandboxFenceNotReady(ctx context.Context, loop *co
 	if !metav1.IsControlledBy(pod, sb) {
 		return false // a stale pod from a previous Sandbox: no decision
 	}
-	timedOut, detail := sandboxFenceTimedOut(pod)
+	timedOut, detail := fenceWaitTimedOut(pod)
 	if !timedOut {
 		return r.clearSandboxFenceNotReady(loop, true)
 	}

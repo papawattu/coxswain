@@ -53,12 +53,21 @@ slices created by defects land through the normal build→review→merge loop.
 
 ## Assumptions to confirm (open)
 
-- **A1. Which owner repos?** The day-to-day dogfood target. Recommendation:
-  the `coxswain` repo itself (meta) plus `homelab` (GitOps/Flux), since both
-  are on the owner's own domain and already in the loop's reach.
-- **A2. kind-ref vs. the real cluster.** Dogfood runs on kind-ref (isolated,
-  fast, safe) — not the owner's production homelab cluster — unless the owner
-  says otherwise.
+- **A1. Which owner repos?** The day-to-day dogfood target. **D140 = a new,
+  simple web-based todo application** (created fresh for this phase). Rationale:
+  a small, self-contained, well-understood app is the cleanest dogfood target —
+  its defects are easy to root-cause (no existing complexity to confuse the
+  signal), and the owner can verify the agent's PRs by eye against a working
+  page. The repo starts empty; Coxswain's first real goal is to *build it* (a
+  basic CRUD todo web app), and subsequent dogfood goals are incremental
+  features/fixes on top (search, auth, persistence, etc.). This is a new repo,
+  not an existing one — no risk of the agent's PRs colliding with real work.
+- **A2. kind-ref vs. the live homelab cluster.** Per D142 the owner wants runs
+  on the live homelab cluster, so dogfood targets **both**: kind-ref
+  (isolated, fast, safe — the default for most goals) and the live homelab
+  cluster (the real target the owner actually uses day-to-day). Live-cluster
+  runs follow the guardrails in **A0.1** (dedicated namespace, resource caps,
+  egress/secret scoping, owner gate per goal).
 - **A3. Model.** The dogfood harness uses the configured model (qwen3.8-27b on
   the 5090 via vLLM) — the same as the build loop.
 - **A4. Cadence.** One real-repo goal per day during the dogfood window, each
@@ -90,6 +99,63 @@ slices created by defects land through the normal build→review→merge loop.
 
 **Verification:** A `Loop` with a real (non-planted) `spec.goal` runs
 Planning→Implementing→Verify on kind-ref and produces a PR draft.
+
+### A0.1. Live-homelab-cluster runs (D142)
+
+**Objective:** Run real-repo dogfood goals on the live homelab cluster with
+guardrails so a run cannot disturb owner workloads. The operator and the
+dogfood Loop are already in-tree (the operator is installed on the cluster via
+GitOps/Flux); this slice adds the *isolation* procedure, not new operator code.
+
+**Guardrails (all required before any live-cluster run):**
+
+1. **Dedicated namespace.** Each live-cluster dogfood run gets its own
+   namespace (e.g. `dogfood-<goal>-<TS>`), not the owner's working namespaces.
+   The Loop, its pods, its PVC, and its Secrets live there and nowhere else.
+2. **Resource caps.** The Loop's agent/runner pods get explicit
+   `resources.limits` (CPU + memory) and the namespace gets a `ResourceQuota`
+   so a runaway run cannot starve owner workloads (vLLM on the 5090, ComfyUI,
+   the operator itself). The quota is sized to the goal, not the cluster.
+3. **Egress + secret scoping.** The run's egress proxy (J5b) and the GitHub
+   token Secret are scoped to the run's namespace — the token's repo access is
+   limited to the goal's repo, and egress is limited to the domains the goal
+   needs (GitHub, the model endpoint). No run gets cluster-wide or
+   cross-namespace access.
+4. **NetworkPolicy / CNI fence.** The CNI fence (the probe's policy pass)
+   enforces that the agent pod cannot reach owner workloads outside its
+   namespace. This is the I265 rule, applied to the live cluster.
+5. **Owner gate per goal.** The owner explicitly opts each live-cluster goal
+   in (a `Loop` with a note "target: homelab"). No auto-targeting of the live
+   cluster; kind-ref is the default, the live cluster is per-goal.
+6. **Snapshot + rollback.** Before a run, note the namespace's current state
+   (there should be none — it's fresh). After the run, the namespace is
+   deleted (the Loop's finalizer cleans up its pods/PVC). A failed run that
+   leaves orphaned resources is a defect (A1 intake).
+
+**Files:**
+- Modify: `docs/DOGFOOD.md` — the live-cluster procedure (steps 1–6 above).
+- Create: `config/samples/dogfood-homelab.yaml` (or a per-run sample) — the
+  Loop CR + ResourceQuota + NetworkPolicy for a live-cluster dogfood run,
+  parameterised on the namespace.
+
+**Steps:**
+1. On the live cluster (via the homelab GitOps path — the owner's cluster is
+   at `.21`, reached through the `papawattu/homelab` repo, not direct kubectl),
+   create a fresh namespace for the run.
+2. Apply the ResourceQuota + NetworkPolicy + egress-proxy + GitHub token
+   Secret, scoped to that namespace.
+3. Create the `Loop` with the real goal and `spec.goal` pointing at the
+   owner repo.
+4. Run it; capture the same evidence as A0 step 3.
+5. On completion (or owner stop), delete the namespace and verify no orphaned
+   resources remain.
+6. File any defect (orphaned resource, quota not respected, egress leak) via
+   A1 intake.
+
+**Verification:** A real-repo goal runs on the live homelab cluster in a
+dedicated namespace with a ResourceQuota + NetworkPolicy, completes (or is
+stopped cleanly), and leaves no orphaned resources. The owner has opted the
+goal in.
 
 ### A1. Defect→slice intake
 
@@ -190,9 +256,10 @@ is recorded in-tree.
 
 ## Done when
 
-- [ ] A0: at least one real (non-planted) owner-repo goal runs Planning→
-      Implementing→Verify on kind-ref and produces a PR draft; captured in
-      `.samples/dogfood-real-<TS>/`.
+- [ ] A0: at least one real (non-planted) goal on the **new todo-app repo**
+      runs Planning→Implementing→Verify and produces a PR draft (first on
+      kind-ref; at least one on the live homelab cluster per A0.1, owner-opted);
+      captured in `.samples/dogfood-real-<TS>/`.
 - [ ] A1: `docs/ADOPTION-DEFECTS.md` exists; every P1 defect has a slice
       merged; the defect that spawned the slice is re-run and gone.
 - [ ] A2: a fresh cluster built solely from `docs/QUICKSTART.md` reaches a
@@ -210,9 +277,11 @@ is recorded in-tree.
   Judge advisory; no slice here promotes it to a gate.
 - **arm64 hardware runs** (D137): still deferred. Dogfood runs on amd64
   (kind-ref on the devbox). The "built, not run" caveat carries.
-- **Production homelab cluster use:** out of scope for this phase. Dogfood
-  runs on kind-ref (A2), not the owner's live cluster, unless the owner
-  explicitly opts a goal into it.
+- **Production homelab cluster use:** *not* deferred — per D142 the owner
+  wants live-cluster runs. They follow the A0.1 guardrails (dedicated namespace,
+  ResourceQuota, egress/secret scoping, CNI fence, owner gate per goal,
+  snapshot+rollback). The default target is kind-ref; the live cluster is
+  per-goal, owner-opted.
 
 ## Risks / tradeoffs
 
@@ -221,11 +290,14 @@ is recorded in-tree.
   *Mitigation:* the plan-approval gate (QUICKSTART §6) means the owner reads
   the plan before Implementing advances — a wrong plan is caught there, not in
   the diff. Cap iterations per run (the Loop's existing iteration budget).
-- **A P1 defect on a real repo.** If a defect blocks (e.g. a security bypass),
-  the dogfood run stops and the slice is P1. *Mitigation:* kind-ref is
+- **A P1 defect on a real repo.** If a defect blocks (e.g. a security
+  bypass), the dogfood run stops and the slice is P1. *Mitigation:* kind-ref is
   isolated; the owner's repos are behind the GitHub token Secret with
-  read/write scope limited to the run's namespace. No run touches the live
-  homelab cluster.
+  read/write scope limited to the run's namespace. **Live-cluster runs** (D142)
+  add the A0.1 guardrails — dedicated namespace, ResourceQuota, egress/secret
+  scoping, CNI fence — so a live run cannot starve owner workloads or reach
+  cross-namespace resources. A live-run defect (orphaned resource, quota
+  ignored, egress leak) is P1 and stops further live runs until fixed.
 - **QUICKSTART drift.** The proof run (A2) is a snapshot; later merges can
   break a pasted command. *Mitigation:* the canary note (A2 step 5) is the
   standing check — a future run that diverges from the proof is flagged.
@@ -237,7 +309,7 @@ is recorded in-tree.
 
 | ID | Question | Recommendation | Decision |
 |---|---|---|---|
-| D140 | Which owner repos for dogfood? | `coxswain` (meta) + `homelab` (GitOps/Flux), both on-kind. | (pending owner) |
+| D140 | Which owner repos for dogfood? | A new, simple web-based todo application (created fresh for this phase). | **As recommended — a new todo app** (owner, 2026-11-22). |
 | D141 | Dogfood cadence / window? | 5 working days, one real goal/day, each → defect report. | (pending owner) |
-| D142 | Does a real-repo dogfood run ever target the live homelab cluster? | No — kind-ref only for this phase; opt-in per goal if the owner says so. | (pending owner) |
+| D142 | Does a real-repo dogfood run ever target the live homelab cluster? | Yes — the owner wants runs on the live homelab cluster. Live-cluster runs follow the A0.1 guardrails (dedicated namespace, ResourceQuota, egress/secret scoping, CNI fence, owner gate per goal, snapshot+rollback). | **Yes — live homelab cluster** (owner, 2026-11-22). See A0.1. |
 | D143 | When to submit the CNCF entry? | After A2's proof is green (the entry cites it). Owner fires the PR. | (pending owner) |

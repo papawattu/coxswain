@@ -553,6 +553,9 @@ func (r *LoopReconciler) buildMemoryWriterJob(loop *coxv1alpha1.Loop, pvcName, o
 	// C2 + D101: the memory-writer Job's pod template carries the CURRENT
 	// Loop node placement (Jobs are immutable and short-lived: a flag change
 	// re-places NEW memory-writer Jobs only — documented in OPERATOR.md).
+	// fence-wait (D38): the writer starts only once its deny-all (+ model
+	// proxy) NetworkPolicy is up.
+	r.prependFenceWait(&job.Spec.Template.Spec, memoryWriterNonRootUID, memoryWriterNonRootGID)
 	r.applyLoopPlacement(&job.Spec.Template.Spec)
 	return job
 }

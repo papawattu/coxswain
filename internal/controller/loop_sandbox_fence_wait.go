@@ -19,6 +19,7 @@ import (
 	"fmt"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -55,7 +56,7 @@ func (r *LoopReconciler) fenceWaitContainer(uid, gid int64) (corev1.Container, b
 		image = cni.PinnedProbeImage
 	}
 	falseP, trueP := false, true
-	return cni.NewFenceWaitContainer(image, corev1.PullIfNotPresent, r.FenceWaitBudget, &corev1.SecurityContext{
+	fw := cni.NewFenceWaitContainer(image, corev1.PullIfNotPresent, r.FenceWaitBudget, &corev1.SecurityContext{
 		AllowPrivilegeEscalation: &falseP,
 		RunAsNonRoot:             &trueP,
 		RunAsUser:                &uid,
@@ -63,12 +64,31 @@ func (r *LoopReconciler) fenceWaitContainer(uid, gid int64) (corev1.Container, b
 		ReadOnlyRootFilesystem:   &trueP,
 		Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{allCaps}},
 		SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
-	}), true
+	})
+	// F58: every container the operator creates is bounded (a namespace
+	// ResourceQuota also rejects a pod with an unbounded container).
+	// fence-wait is one python3 process connecting once per 100ms.
+	fw.Resources = fenceWaitResources()
+	return fw, true
 }
 
-// prependProxyFenceWait makes fence-wait the FIRST init container of a proxy
-// pod (model, Judge, egress and tool proxies), running as the proxy's own
-// uid/gid. A new proxy pod is unfenced for kube-router's programming window
+// fenceWaitResources is fence-wait's fixed requests/limits.
+func fenceWaitResources() corev1.ResourceRequirements {
+	return corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse("10m"),
+			corev1.ResourceMemory: resource.MustParse("16Mi"),
+		},
+		Limits: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse("100m"),
+			corev1.ResourceMemory: resource.MustParse("64Mi"),
+		},
+	}
+}
+
+// prependFenceWait makes fence-wait the FIRST init container of a proxy
+// pod (model, Judge, egress and tool proxies) or a Job pod (verify,
+// memory-writer, Judge, deliver), running as that pod's own uid/gid. A new proxy pod is unfenced for kube-router's programming window
 // (0.05-1.2s after its first container starts) just like the sandbox: the
 // model and tool proxies hold a credential, and every proxy's NetworkPolicy
 // is what keeps it from reaching in-cluster and private targets (the egress
@@ -80,7 +100,17 @@ func (r *LoopReconciler) fenceWaitContainer(uid, gid int64) (corev1.Container, b
 // never Ready, and whatever waits on it (the D35a model-proxy gate, the
 // verify Job's egress gate) keeps holding. For the model proxy the hold says
 // so (modelProxyNotReady).
-func (r *LoopReconciler) prependProxyFenceWait(spec *corev1.PodSpec, uid, gid int64) {
+//
+// The Jobs run RestartPolicy Never with backoffLimit 0, so there a budget
+// that runs out fails the pod (and the Job) instead of being retried. Each
+// Job's failure path already reads that as "no evidence", never as a verdict
+// on the agent's work: verify counts a failed fence-wait as a trusted-init
+// infra failure (trustedInitDecision: bounded retry, then
+// Failed:VerifyInfraFailed); deliver as DeliveryFailed (re-run with
+// coxswain.io/redeliver); the Judge as JudgeUnavailable; the memory writer as
+// a failed write. Every Job's NetworkPolicy refuses the kubelet: DNS plus
+// the repo, the egress proxy or the model proxy on its port, or nothing.
+func (r *LoopReconciler) prependFenceWait(spec *corev1.PodSpec, uid, gid int64) {
 	fw, ok := r.fenceWaitContainer(uid, gid)
 	if !ok {
 		return

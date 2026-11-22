@@ -23,6 +23,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
+	"github.com/papawattu/coxswain/internal/cni"
 )
 
 // judgeTestLoop builds a Loop with a goal, a judge (maxTokens 512), a model,
@@ -121,11 +122,11 @@ func TestJudgeBuildSpec(t *testing.T) {
 	if pod.AutomountServiceAccountToken == nil || *pod.AutomountServiceAccountToken != false {
 		t.Fatalf("automountServiceAccountToken: got %v, want false", pod.AutomountServiceAccountToken)
 	}
-	// The init container.
-	if len(pod.InitContainers) != 1 {
-		t.Fatalf("init containers: got %d, want 1", len(pod.InitContainers))
+	// The init containers: fence-wait (D38) first, then judge-diff.
+	if len(pod.InitContainers) != 2 || pod.InitContainers[0].Name != cni.FenceWaitContainerName {
+		t.Fatalf("init containers: got %d, want fence-wait + judge-diff", len(pod.InitContainers))
 	}
-	diffInit := pod.InitContainers[0]
+	diffInit := pod.InitContainers[1]
 	if diffInit.Name != "judge-diff" {
 		t.Fatalf("init name: got %q, want judge-diff", diffInit.Name)
 	}

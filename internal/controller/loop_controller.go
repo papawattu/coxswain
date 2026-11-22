@@ -3579,7 +3579,7 @@ func (r *LoopReconciler) buildModelProxyPod(loop *coxv1alpha1.Loop, podName, ns 
 	}
 	// fence-wait (D38): the proxy holds the model credential, so nothing in
 	// it starts before its own NetworkPolicy is up.
-	r.prependProxyFenceWait(&pod.Spec, proxyUID, proxyGID)
+	r.prependFenceWait(&pod.Spec, proxyUID, proxyGID)
 	// C2 + D101: the model proxy pod carries the CURRENT Loop node placement
 	// (D101: it is Loop-scoped infrastructure — leaving it on the default
 	// pool is an invisible surprise). The pod's spec-hash delete+recreate
@@ -4209,7 +4209,7 @@ func (r *LoopReconciler) buildEgressProxyPod(loopName, ns, image string, network
 	}
 	// fence-wait (D38): the egress proxy's policy is 0.0.0.0/0 minus the
 	// carve-outs; nothing in it starts before that policy is up.
-	r.prependProxyFenceWait(&pod.Spec, uid, gid)
+	r.prependFenceWait(&pod.Spec, uid, gid)
 	// C2 + D101: the egress proxy pod carries the CURRENT Loop node
 	// placement (it is Loop-scoped infrastructure, like the model proxy).
 	r.applyLoopPlacement(&pod.Spec)
@@ -4814,7 +4814,7 @@ func (r *LoopReconciler) buildToolProxyPod(loopName, ns, image string, tool coxv
 	// fence-wait (D38): the tool proxy holds the tool credential and its
 	// policy is 0.0.0.0/0 minus the carve-outs; nothing in it starts before
 	// that policy is up.
-	r.prependProxyFenceWait(&pod.Spec, uid, gid)
+	r.prependFenceWait(&pod.Spec, uid, gid)
 	// C2 + D101: the tool proxy pod carries the CURRENT Loop node placement
 	// (it is Loop-scoped infrastructure, like the model proxy).
 	r.applyLoopPlacement(&pod.Spec)

@@ -792,6 +792,28 @@ One more cause applies to the egress and tool proxies: a node whose IP is
 fence-wait never passes. That is a real hole, so fence-wait holds the proxy
 rather than letting it run.
 
+### A Job pod failed on `fence-wait`
+
+**What you see:** a verify, memory-writer, Judge or deliver Job's pod is
+`Init:Error` on its `fence-wait` init container (`kubectl logs <pod> -c
+fence-wait` prints `FENCE_TIMEOUT …`).
+
+**Why:** every Job pod starts with the same `fence-wait` as the sandbox and the
+proxies. The Jobs run `restartPolicy: Never` with `backoffLimit: 0`, so a
+fence-wait that runs out of budget fails the pod instead of being retried by
+the kubelet. Each Job reads that as "no evidence", never as a verdict on the
+agent's work:
+
+- **verify:** an infra failure naming `fence-wait` (the bounded infra retry,
+  then `Failed:VerifyInfraFailed`);
+- **deliver:** `Delivered=False` / `DeliveryFailed`; re-run with the
+  `coxswain.io/redeliver` annotation once the CNI is fixed;
+- **Judge:** `JudgeUnavailable` (advisory; it never changes the outcome);
+- **memory writer:** a failed write (the lessons are not saved).
+
+The checks are the same as for `SandboxFenceNotReady` above. A repo-less
+Loop's verify pod has no NetworkPolicy and so no fence-wait.
+
 ### Event `VerifyJobForeign` (F83b)
 
 **What you see:** a Warning Event: "the Job `<loop>-verify-<n>` is not owned

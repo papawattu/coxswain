@@ -1605,6 +1605,14 @@ func (r *LoopReconciler) buildVerifyJobSpec(loop *coxv1alpha1.Loop) batchv1.JobS
 			},
 		},
 	}
+	// fence-wait (D38): nothing in the verify pod (clone-base holds the git
+	// credential; the checks run agent-authored code) starts before the
+	// verify NetworkPolicy is up. That policy exists only for a Loop with a
+	// repo (ensureVerifyNetworkPolicy), so a repo-less verify pod would never
+	// see a fence and gets no fence-wait.
+	if repo != "" {
+		r.prependFenceWait(&jobSpec.Template.Spec, 65532, 65532)
+	}
 	// C2 + D101: the verify Job's pod template carries the CURRENT Loop node
 	// placement. Jobs are immutable and short-lived: a flag change re-places
 	// NEW verify Jobs only (documented in OPERATOR.md).

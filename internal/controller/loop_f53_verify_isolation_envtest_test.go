@@ -51,6 +51,7 @@ import (
 	"k8s.io/client-go/tools/record"
 
 	coxv1alpha1 "github.com/papawattu/coxswain/api/v1alpha1"
+	"github.com/papawattu/coxswain/internal/cni"
 )
 
 var _ = Describe("F53: the verify Job isolates the checks and is time-bounded", func() {
@@ -86,6 +87,10 @@ var _ = Describe("F53: the verify Job isolates the checks and is time-bounded", 
 		spec := f53JobSpec("go build -o /tmp/app ./...", "go test ./...")
 		var checks, trusted int
 		for _, ct := range spec.Template.Spec.InitContainers {
+			if ct.Name == cni.FenceWaitContainerName {
+				Expect(ct.VolumeMounts).To(BeEmpty(), "fence-wait mounts nothing, the checkout least of all")
+				continue
+			}
 			if strings.HasPrefix(ct.Name, "check-") {
 				checks++
 				m := f53Mount(ct, verifyVol)

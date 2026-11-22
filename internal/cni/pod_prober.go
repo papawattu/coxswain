@@ -613,8 +613,8 @@ func (p *PodProber) waitForTermination(ctx context.Context, pod *corev1.Pod) (st
 			}
 			return msg, probe, nil
 		}
-		if fw := fenceWaitStatus(probe); fw != nil && fw.ExitCode != 0 {
-			if fw.ExitCode == fenceWaitTimeoutExit {
+		if fw := FenceWaitStatus(probe); fw != nil && fw.ExitCode != 0 {
+			if fw.ExitCode == FenceWaitTimeoutExit {
 				return "", nil, fmt.Errorf("%w (%s)", errFenceTimeout, strings.TrimSpace(fw.Message))
 			}
 			return "", nil, fmt.Errorf("fence-wait exited non-zero: %d", fw.ExitCode)

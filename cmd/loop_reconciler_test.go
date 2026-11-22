@@ -12,6 +12,8 @@
 package main
 
 import (
+	"time"
+
 	"flag"
 	"testing"
 
@@ -83,6 +85,8 @@ func TestNewLoopReconcilerWiresFlagDerivedOptions(t *testing.T) {
 		SecretOptInRequired:    true,
 		AllowUnenforced:        true,
 		AllowUnenforcedNetwork: true,
+		FenceWaitImage:         "fence:pin",
+		FenceWaitBudget:        7 * time.Second,
 		MemoryStorageClass:     "local-shared",
 		MemoryWriterImage:      "op:tag",
 		ClusterDomain:          "cluster.local",
@@ -111,6 +115,10 @@ func TestNewLoopReconcilerWiresFlagDerivedOptions(t *testing.T) {
 		t.Error("AllowUnenforced not wired")
 	case !r.AllowUnenforcedNetwork:
 		t.Error("AllowUnenforcedNetwork not wired")
+	case r.FenceWaitImage != "fence:pin":
+		t.Errorf("FenceWaitImage not wired: %q", r.FenceWaitImage)
+	case r.FenceWaitBudget != 7*time.Second:
+		t.Errorf("FenceWaitBudget not wired: %s", r.FenceWaitBudget)
 	case r.MemoryStorageClass != "local-shared":
 		t.Errorf("MemoryStorageClass not wired: %q", r.MemoryStorageClass)
 	case r.MemoryWriterImage != "op:tag":

@@ -81,8 +81,7 @@ func init() {
 const (
 	defaultSecretOptIn = true // D76/D102: the Secret opt-in gate is fail-closed by default
 
-	pinnedCNIProbeImage = "docker.io/library/python:3.13-alpine@sha256:" +
-		"bf12ecc0bea3f171d55145dd02c78b5eeb09f30ee2ac9cc2b4c9e4e8f5e30741"
+	pinnedCNIProbeImage     = cni.PinnedProbeImage
 	pinnedWorkspaceGitImage = "docker.io/alpine/git:v2.54.0@sha256:" +
 		"e8ceedc73bd80992ae8d58a7d24c58b8322146c354f1d2e81a97db4452068ec0"
 	pinnedVerifyImage = "docker.io/library/golang:1.26@sha256:" +
@@ -150,9 +149,11 @@ func main() {
 		"Per-run timeout for one CNI probe (both passes, D103: two probe pods, hence 120s).")
 	var cniFenceWaitBudget time.Duration
 	flag.DurationVar(&cniFenceWaitBudget, "cni-fence-wait-budget", cni.DefaultFenceWaitBudget,
-		"How long the probe's policy pass waits for its own NetworkPolicy to take effect before measuring "+
-			"(fence-wait; k3s/kube-router applies a new pod's rules 0.05-1.2s after it starts). "+
-			"Must be below --cni-probe-timeout. Exhausting it reports CNIUnenforced.")
+		"How long a new pod's fence-wait init container waits for the pod's own NetworkPolicy to take effect "+
+			"(k3s/kube-router applies a new pod's rules 0.05-1.2s after it starts). It bounds both the CNI probe's "+
+			"policy pass and the Loop sandbox pod (whose fence-wait runs --cni-probe-image). "+
+			"Must be below --cni-probe-timeout. Exhausting it reports CNIUnenforced (probe) or holds the "+
+			"sandbox with SandboxFenceNotReady.")
 	// P5a: the memory PVC's StorageClass. Empty = the cluster default.
 	// Set to a RWX-capable class (e.g. local-shared) on kind clusters where
 	// the default (rancher.io/local-path, nodePathMap) is RWO-only.
@@ -516,6 +517,8 @@ func main() {
 			SecretOptInRequired:    *optIn,
 			AllowUnenforced:        allowUnenforced,
 			AllowUnenforcedNetwork: allowUnenforcedNetwork,
+			FenceWaitImage:         cniProbeImage,
+			FenceWaitBudget:        cniFenceWaitBudget,
 			MemoryStorageClass:     memoryStorageClass,
 			MemoryWriterImage:      memoryWriterImage,
 			ClusterDomain:          clusterDomain,

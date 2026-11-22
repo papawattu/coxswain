@@ -737,6 +737,42 @@ and surfaces nothing; and if the operator's own Events read fails
 (`SandboxEventsUnreadable` Warning Event, repeated once every 5 minutes while
 the read keeps failing) the mount case is not bounded until it works.
 
+### `SandboxFenceNotReady=True` / `FenceNotReady` — the sandbox's NetworkPolicy never took effect
+
+**What you see:** the Loop has `SandboxFenceNotReady=True` with reason
+`FenceNotReady`, plus one Warning Event `FenceNotReady`. The sandbox pod sits in
+`Init:Error` or `Init:CrashLoopBackOff` on its `fence-wait` init container, and
+the agent never starts.
+
+**Why:** the sandbox pod's first init container, `fence-wait`, waits until the
+pod's own NetworkPolicy refuses the node's kubelet (`NODE_IP:10250`), so that
+neither the workspace clone nor the agent starts before the CNI has fenced the
+pod. Some CNIs program a new pod's policy asynchronously: k3s's kube-router
+takes 0.05–1.2s, and Calico takes a similar time unless `policy_setup_timeout_seconds` is set. If
+the kubelet is still reachable when `--cni-fence-wait-budget` (default 30s) runs
+out, fence-wait exits 2. The kubelet retries it, and the agent is held. This is
+fail-closed: the sandbox never runs unfenced.
+
+**What to check:**
+
+```sh
+kubectl logs <loop>-sandbox -c fence-wait --previous   # FENCE_TIMEOUT elapsed=… attempts=…
+kubectl get loop <loop> -o jsonpath='{.status.conditions[?(@.type=="NetworkEnforced")]}'
+```
+
+- If the CNI probe also says `CNIUnenforced`, the CNI does not enforce
+  NetworkPolicy for pods; see `NetworkEnforced=False` above.
+- If the probe says `CNIEnforced`, the policy is slow to land on this node, or
+  the node's kubelet is reachable some other way. Compare
+  `kubectl get networkpolicy -n <ns>` with the pod's labels.
+- A log line `fence-wait: ignoring connect error …` names an error that is not
+  a NetworkPolicy verdict (for example `EPERM` from an LSM such as KubeArmor),
+  which fence-wait deliberately does not count as a fence.
+
+The condition returns to `False` (reason `FenceUp`) once fence-wait passes or
+the pod is gone. Under `--allow-unenforced-network` the sandbox has no
+fence-wait.
+
 ### Event `VerifyJobForeign` (F83b)
 
 **What you see:** a Warning Event: "the Job `<loop>-verify-<n>` is not owned

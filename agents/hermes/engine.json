@@ -1,0 +1,22 @@
+{
+  "name": "hermes",
+  "command": [
+    "/opt/hermes/.venv/bin/hermes",
+    "-z",
+    "${COX_PROMPT}",
+    "--yolo"
+  ],
+  "env": {
+    "HERMES_HOME": "${HOME}/hermes",
+    "HERMES_WRITE_SAFE_ROOT": "${COX_WORKSPACE}",
+    "XDG_RUNTIME_DIR": "/tmp/hermes-runtime",
+    "OPENAI_API_KEY": "unused",
+    "HERMES_DISABLE_LAZY_INSTALLS": "1"
+  },
+  "files": [
+    {
+      "path": "${HOME}/hermes/config.yaml",
+      "content": "model:\n  default: \"${COX_MODEL}\"\n  provider: \"custom\"\n  base_url: \"${COX_MODEL_BASE_URL}/v1\"\n  api_key: \"unused\"\nsecurity:\n  allow_lazy_installs: false\n"
+    }
+  ]
+}

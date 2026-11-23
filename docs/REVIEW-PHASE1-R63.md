@@ -106,7 +106,7 @@ Checked on `76b5d4d` just now:
 - **I282:** `git reflog --date=iso --since='2026-11-22 21:49' | grep -v 'pull -q --ff-only'` prints nothing: the shared tree stayed on `main` this window. I leave it open for one more round, because this window is one day.
 - **I283:** #522's two P3s, not yet picked up.
 
-The next free IDs are I287 and D147 (D146 is used below). If I277 renumbers Phase 9's D140–D143 to D146–D149, as it proposes, D146 here clashes with it. In that case I277 should use D147–D150 instead.
+The next free IDs are I287 and D150. D146 is used below, and D147–D149 by `docs/PLAN-AGENT-ADAPTERS.md` (#527). If I277 renumbers Phase 9's D140–D143, it uses D150–D153.
 
 ## Owner decision
 

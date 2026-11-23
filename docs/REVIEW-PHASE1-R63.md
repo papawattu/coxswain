@@ -38,7 +38,7 @@ The unit specs alone would have passed a fix that does nothing on a real cluster
 |---|---|---|
 | Hold | 20:50:32 → 20:51:17 | 21:11:45 → 21:12:30 |
 | First probe result | 20:50:34 `ProbeUnavailable … object is being deleted … already exists` | 21:13:01 `CNIEnforced` |
-| Recovery | 20:51:52 `CNIEnforced`, 78 s later (10 min 18 s in R62's run on main) | not needed; the new control pod was created at 21:12:31, 1 s after the release (`probe-podwatch.json`) |
+| Recovery | 20:51:52 `CNIEnforced`, 78 s after the unavailable result (on main in R62's run, the same gap was 10 min 32 s: 21:56:58 → 22:07:30) | not needed; the new control pod was created at 21:12:31, 1 s after the release (`probe-podwatch.json`) |
 | Loop | Succeeded | Succeeded |
 | `forbidden` (positive control) | 0 (2) | 0 (1) |
 

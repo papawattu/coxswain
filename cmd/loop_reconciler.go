@@ -53,6 +53,9 @@ type newLoopReconcilerOptions struct {
 	// RunnerImage is the runner image the operator recognises
 	// (--runner-image).
 	RunnerImage string
+	// AgentHarnesses is the agent adapters a Loop may select, name to pinned
+	// image (--agent-harness, D147).
+	AgentHarnesses map[string]string
 	// VerifyImage is the verify Job's default check image (--verify-image).
 	VerifyImage string
 	// ToolProxyImage is the tool proxy pods' image (--tool-proxy-image;
@@ -109,6 +112,7 @@ func newLoopReconciler(c client.Client, scheme *runtime.Scheme,
 		ClusterDomain:       o.ClusterDomain,
 		WorkspaceGitImage:   o.WorkspaceGitImage,
 		RunnerImage:         o.RunnerImage,
+		AgentHarnesses:      o.AgentHarnesses,
 		VerifyImage:         o.VerifyImage,
 		ToolProxyImage:      o.ToolProxyImage,
 		EgressProxyImage:    o.EgressProxyImage,

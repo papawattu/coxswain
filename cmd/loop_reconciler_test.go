@@ -92,6 +92,7 @@ func TestNewLoopReconcilerWiresFlagDerivedOptions(t *testing.T) {
 		ClusterDomain:          "cluster.local",
 		WorkspaceGitImage:      "git:pin",
 		RunnerImage:            "runner:tag",
+		AgentHarnesses:         map[string]string{"pi": "pi:pin"},
 		VerifyImage:            "go:pin",
 		ToolProxyImage:         "tp:tag",
 		EgressProxyImage:       "ep:tag",
@@ -129,6 +130,8 @@ func TestNewLoopReconcilerWiresFlagDerivedOptions(t *testing.T) {
 		t.Errorf("WorkspaceGitImage not wired: %q", r.WorkspaceGitImage)
 	case r.RunnerImage != "runner:tag":
 		t.Errorf("RunnerImage not wired: %q", r.RunnerImage)
+	case r.AgentHarnesses["pi"] != "pi:pin":
+		t.Errorf("AgentHarnesses not wired: %v", r.AgentHarnesses)
 	case r.VerifyImage != "go:pin":
 		t.Errorf("VerifyImage not wired: %q", r.VerifyImage)
 	case r.ToolProxyImage != "tp:tag":

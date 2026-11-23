@@ -1,0 +1,1 @@
+{"id":"chatcmpl-8d71c6f77db41d3c","type":"message","role":"assistant","content":[{"type":"text","text":"OK"}],"model":"qwen3.8-27b","stop_reason":"end_turn","usage":{"input_tokens":14,"output_tokens":2}}

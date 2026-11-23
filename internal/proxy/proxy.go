@@ -98,6 +98,17 @@ func New(cfg Config) (*Proxy, error) {
 
 var errNoUpstream = &errString{"MODEL_ENDPOINT not set (no upstream)"}
 
+// agentAuthHeaders are the auth headers the model APIs use (OpenAI and vLLM:
+// Authorization; Anthropic: x-api-key; Azure OpenAI: api-key). The proxy
+// drops all of them from the agent's request before injecting its own.
+var agentAuthHeaders = []string{"Authorization", "X-Api-Key", "Api-Key"}
+
+// isMessagesPath reports whether path is an Anthropic Messages endpoint
+// (/v1/messages or below it, e.g. /v1/messages/count_tokens).
+func isMessagesPath(path string) bool {
+	return path == "/v1/messages" || strings.HasPrefix(path, "/v1/messages/")
+}
+
 type errString struct{ s string }
 
 func (e *errString) Error() string { return e.s }
@@ -157,13 +168,25 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request) {
 	if isStreaming(newBody) {
 		r = r.WithContext(context.WithValue(r.Context(), streamKey, true))
 	}
-	// Inject the credential (never logged).
+	// The agent holds no credential (ADR-0006), so any key it sends is a
+	// dummy its CLI needed to start (docs/AGENT-HARNESSES.md). Drop every
+	// auth header it sent: only the proxy's credential reaches the upstream,
+	// in the header the API expects.
+	for _, h := range agentAuthHeaders {
+		r.Header.Del(h)
+	}
+	// Inject the credential (never logged). Anthropic Messages
+	// (/v1/messages, /v1/messages/count_tokens; Claude Code, D148) takes the
+	// key in x-api-key; every other API takes CredHeader (default
+	// Authorization: Bearer).
 	if p.cfg.Credential != "" {
-		val := p.cfg.Credential
-		if p.cfg.CredHeader == "Authorization" && !strings.HasPrefix(val, "Bearer ") {
+		header, val := p.cfg.CredHeader, p.cfg.Credential
+		if isMessagesPath(r.URL.Path) {
+			header = "X-Api-Key"
+		} else if header == "Authorization" && !strings.HasPrefix(val, "Bearer ") {
 			val = "Bearer " + val
 		}
-		r.Header.Set(p.cfg.CredHeader, val)
+		r.Header.Set(header, val)
 	}
 
 	// Forward (exactly one dial; no redirect following; a non-2xx upstream

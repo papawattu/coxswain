@@ -1,0 +1,27 @@
+event: response.created
+data: {"response":{"id":"resp_a2e7662d4fed4860","created_at":1795472929,"incomplete_details":null,"instructions":null,"metadata":null,"model":"qwen3.8-27b","object":"response","output":[],"parallel_tool_calls":true,"temperature":1.0,"tool_choice":"none","tools":[],"top_p":0.95,"background":false,"max_output_tokens":16,"max_tool_calls":null,"previous_response_id":null,"prompt":null,"reasoning":null,"service_tier":"auto","status":"in_progress","text":null,"top_logprobs":null,"truncation":"disabled","usage":null,"user":null,"presence_penalty":0.0,"frequency_penalty":0.0,"kv_transfer_params":null,"ec_transfer_params":null,"input_messages":null,"output_messages":null},"sequence_number":0,"type":"response.created"}
+
+event: response.in_progress
+data: {"response":{"id":"resp_a2e7662d4fed4860","created_at":1795472929,"incomplete_details":null,"instructions":null,"metadata":null,"model":"qwen3.8-27b","object":"response","output":[],"parallel_tool_calls":true,"temperature":1.0,"tool_choice":"none","tools":[],"top_p":0.95,"background":false,"max_output_tokens":16,"max_tool_calls":null,"previous_response_id":null,"prompt":null,"reasoning":null,"service_tier":"auto","status":"in_progress","text":null,"top_logprobs":null,"truncation":"disabled","usage":null,"user":null,"presence_penalty":0.0,"frequency_penalty":0.0,"kv_transfer_params":null,"ec_transfer_params":null,"input_messages":null,"output_messages":null},"sequence_number":1,"type":"response.in_progress"}
+
+event: response.output_item.added
+data: {"item":{"id":"b69038bf2cba8d7a","content":[],"role":"assistant","status":"in_progress","type":"message","phase":null},"output_index":0,"sequence_number":2,"type":"response.output_item.added"}
+
+event: response.content_part.added
+data: {"content_index":0,"item_id":"b69038bf2cba8d7a","output_index":0,"part":{"annotations":[],"text":"","type":"output_text","logprobs":[]},"sequence_number":3,"type":"response.content_part.added"}
+
+event: response.output_text.delta
+data: {"content_index":0,"delta":"OK","item_id":"b69038bf2cba8d7a","logprobs":[],"output_index":0,"sequence_number":4,"type":"response.output_text.delta"}
+
+event: response.output_text.done
+data: {"content_index":0,"item_id":"b69038bf2cba8d7a","logprobs":[],"output_index":0,"sequence_number":5,"text":"OK","type":"response.output_text.done"}
+
+event: response.content_part.done
+data: {"content_index":0,"item_id":"b69038bf2cba8d7a","output_index":0,"part":{"annotations":[],"text":"OK","type":"output_text","logprobs":null},"sequence_number":6,"type":"response.content_part.done"}
+
+event: response.output_item.done
+data: {"item":{"id":"b69038bf2cba8d7a","content":[{"annotations":[],"text":"OK","type":"output_text","logprobs":null}],"role":"assistant","status":"completed","type":"message","phase":null,"summary":[]},"output_index":0,"sequence_number":7,"type":"response.output_item.done"}
+
+event: response.completed
+data: {"response":{"id":"resp_a2e7662d4fed4860","created_at":1795472929,"incomplete_details":null,"instructions":null,"metadata":null,"model":"qwen3.8-27b","object":"response","output":[{"id":"msg_854f3369474bc83a","content":[{"annotations":[],"text":"OK","type":"output_text","logprobs":null}],"role":"assistant","status":"completed","type":"message","phase":null}],"parallel_tool_calls":true,"temperature":1.0,"tool_choice":"none","tools":[],"top_p":0.95,"background":false,"max_output_tokens":16,"max_tool_calls":null,"previous_response_id":null,"prompt":null,"reasoning":null,"service_tier":"auto","status":"completed","text":null,"top_logprobs":null,"truncation":"disabled","usage":{"input_tokens":14,"input_tokens_details":{"cached_tokens":0,"input_tokens_per_turn":[],"cached_tokens_per_turn":[]},"output_tokens":2,"output_tokens_details":{"reasoning_tokens":0,"tool_output_tokens":0,"output_tokens_per_turn":[],"tool_output_tokens_per_turn":[]},"total_tokens":16},"user":null,"presence_penalty":0.0,"frequency_penalty":0.0,"kv_transfer_params":null,"ec_transfer_params":null,"input_messages":null,"output_messages":null},"sequence_number":8,"type":"response.completed"}
+

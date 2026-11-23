@@ -82,7 +82,7 @@ func New(cfg Config) (*Proxy, error) {
 		return nil, errNoUpstream
 	}
 	if cfg.CredHeader == "" {
-		cfg.CredHeader = "Authorization"
+		cfg.CredHeader = authorizationHeader
 	}
 	p := &Proxy{cfg: cfg, upstream: cfg.Upstream}
 	rp := httputil.NewSingleHostReverseProxy(cfg.Upstream)
@@ -98,10 +98,13 @@ func New(cfg Config) (*Proxy, error) {
 
 var errNoUpstream = &errString{"MODEL_ENDPOINT not set (no upstream)"}
 
+// authorizationHeader is the default credential header (OpenAI, vLLM).
+const authorizationHeader = "Authorization"
+
 // agentAuthHeaders are the auth headers the model APIs use (OpenAI and vLLM:
 // Authorization; Anthropic: x-api-key; Azure OpenAI: api-key). The proxy
 // drops all of them from the agent's request before injecting its own.
-var agentAuthHeaders = []string{"Authorization", "X-Api-Key", "Api-Key"}
+var agentAuthHeaders = []string{authorizationHeader, "X-Api-Key", "Api-Key"}
 
 // isMessagesPath reports whether path is an Anthropic Messages endpoint
 // (/v1/messages or below it, e.g. /v1/messages/count_tokens).
@@ -183,7 +186,7 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request) {
 		header, val := p.cfg.CredHeader, p.cfg.Credential
 		if isMessagesPath(r.URL.Path) {
 			header = "X-Api-Key"
-		} else if header == "Authorization" && !strings.HasPrefix(val, "Bearer ") {
+		} else if header == authorizationHeader && !strings.HasPrefix(val, "Bearer ") {
 			val = "Bearer " + val
 		}
 		r.Header.Set(header, val)

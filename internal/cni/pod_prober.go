@@ -431,7 +431,7 @@ func (p *PodProber) waitProbePodsGone(ctx context.Context) error {
 	for _, name := range []string{probePodName, probeControlPod} {
 		for {
 			pod := &corev1.Pod{}
-			err := p.cfg.Client.Get(ctx, client.ObjectKey{Namespace: p.cfg.Namespace, Name: name}, pod)
+			err := p.getReader().Get(ctx, client.ObjectKey{Namespace: p.cfg.Namespace, Name: name}, pod)
 			if apierrors.IsNotFound(err) {
 				break // pod is gone
 			}

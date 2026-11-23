@@ -30,6 +30,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	rschema "k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -1145,21 +1146,39 @@ func TestProbeWaitsForStalePodWithFinalizer(t *testing.T) {
 		},
 		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "c", Image: probeTestImage}}},
 	}
-	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(controlPod).Build()
+	// Reader: the plain fake holding the finalized pod (simulates the direct
+	// API reader). waitProbePodsGone polls this. The finalizer-removal
+	// goroutine and the stub's Create use this store.
+	reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(controlPod).Build()
+	// Client: a fake with an interceptor that returns NotFound for every Pod
+	// Get (simulates the label-scoped cache, which never has the probe pod).
+	// In the real operator the cache is scoped and a cached Get on the probe
+	// pod reads NotFound at once. The wait must use the Reader, not this.
+	// (I281 P1 fix 2.)
+	cl := fake.NewClientBuilder().WithScheme(scheme).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if _, ok := obj.(*corev1.Pod); ok {
+					return apierrors.NewNotFound(rschema.GroupResource{Resource: "pods"}, key.Name)
+				}
+				return c.Get(ctx, key, obj, opts...)
+			},
+		}).Build()
 
 	// A goroutine removes the finalizer after ~300ms so the pod goes away.
+	// Uses the plain reader (the direct API), not the cache-scoped client.
 	go func() {
 		time.Sleep(300 * time.Millisecond)
 		fresh := &corev1.Pod{}
-		if err := cl.Get(context.Background(), client.ObjectKey{Namespace: probePodName, Name: probeControlPod}, fresh); err == nil {
+		if err := reader.Get(context.Background(), client.ObjectKey{Namespace: probePodName, Name: probeControlPod}, fresh); err == nil {
 			fresh.Finalizers = nil
-			_ = cl.Update(context.Background(), fresh)
+			_ = reader.Update(context.Background(), fresh)
 		}
 	}()
 
 	p := NewPodProber(PodProberConfig{
 		Namespace: probePodName, ProbeImage: probeTestImage,
-		ProbeTimeout: 10 * time.Second, Client: cl, Reader: cl,
+		ProbeTimeout: 10 * time.Second, Client: cl, Reader: reader,
 	})
 	// Stub the run seam so the two passes succeed immediately. The stub
 	// creates the pod first (like runPod does) so the stale control pod is
@@ -1167,7 +1186,7 @@ func TestProbeWaitsForStalePodWithFinalizer(t *testing.T) {
 	// the Create path).
 	calls := 0
 	p.run = func(ctx context.Context, pod *corev1.Pod) (string, string, error) {
-		if err := cl.Create(ctx, pod.DeepCopy()); err != nil {
+		if err := reader.Create(ctx, pod.DeepCopy()); err != nil {
 			return "", "", err
 		}
 		calls++

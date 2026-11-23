@@ -1161,9 +1161,15 @@ func TestProbeWaitsForStalePodWithFinalizer(t *testing.T) {
 		Namespace: probePodName, ProbeImage: probeTestImage,
 		ProbeTimeout: 10 * time.Second, Client: cl, Reader: cl,
 	})
-	// Stub the run seam so the two passes succeed immediately.
+	// Stub the run seam so the two passes succeed immediately. The stub
+	// creates the pod first (like runPod does) so the stale control pod is
+	// actually hit if the wait is broken (I281 P2: the stub must exercise
+	// the Create path).
 	calls := 0
 	p.run = func(ctx context.Context, pod *corev1.Pod) (string, string, error) {
+		if err := cl.Create(ctx, pod.DeepCopy()); err != nil {
+			return "", "", err
+		}
 		calls++
 		if calls == 1 {
 			return controlOK, "n1", nil

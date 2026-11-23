@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -330,6 +331,24 @@ func (s *sequenceProber) LatestResult() CNIProbeResult {
 	return s.results[0]
 }
 
+// timedProber wraps a CNIProber and records the time of each Probe call
+// (S5: the backoff-reset spec asserts on the gap between calls).
+type timedProber struct {
+	inner  CNIProber
+	record func()
+}
+
+func (t *timedProber) Probe(ctx context.Context) (CNIProbeResult, error) {
+	if t.record != nil {
+		t.record()
+	}
+	return t.inner.Probe(ctx)
+}
+
+func (t *timedProber) LatestResult() CNIProbeResult {
+	return t.inner.LatestResult()
+}
+
 // I281 (S4): nextProbeDelay doubles on consecutive unavailable results and
 // caps at Interval; a non-unavailable result resets to Interval.
 func TestNextProbeDelay(t *testing.T) {
@@ -358,5 +377,81 @@ func TestNextProbeDelay(t *testing.T) {
 					tc.prev, tc.interval, tc.base, tc.unavail, got, tc.want)
 			}
 		})
+	}
+}
+
+// I281 P1 (S5): after a good result the backoff resets to 0, so the next
+// probe is at the full interval (not the leftover backoff). Prober results:
+// unavailable, enforced, enforced. Interval=400ms, RetryInitial=20ms.
+//
+// With the reset: call 1 (unavail) sets backoff=20ms; call 2 (enforced) resets
+// backoff=0, timer=interval=400ms; call 3 is 400ms after call 2.
+// Without the reset (M3): call 1 sets backoff=20ms; call 2 does not reset,
+// timer=20ms; call 3 is 20ms after call 2.
+//
+// Assertion: the gap between call 2 and call 3 is >= 300ms (the full interval
+// after the reset). Fails under M3 where the gap is ~20ms.
+func TestBackoffResetsAfterGoodResult(t *testing.T) {
+	ResetForTest()
+	t.Cleanup(ResetForTest)
+
+	scheme := runtime.NewScheme()
+	_ = coxv1alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+	cl := fake.NewClientBuilder().WithScheme(scheme).Build()
+
+	var mu sync.Mutex
+	var callTimes []time.Time
+	seqProber := &sequenceProber{results: []CNIProbeResult{
+		{Reason: ReasonProbeUnavailable, Detail: "simulated"},
+		{Reason: ReasonCNIEnforced, Detail: "ok"},
+		{Reason: ReasonCNIEnforced, Detail: "still ok"},
+	}}
+	// Wrap the prober to record call times.
+	tp := &timedProber{inner: seqProber}
+	tp.record = func() {
+		mu.Lock()
+		callTimes = append(callTimes, time.Now())
+		mu.Unlock()
+	}
+
+	p := &ProbeRunnable{
+		Prober:       tp,
+		Client:       cl,
+		Interval:     400 * time.Millisecond,
+		RetryInitial: 20 * time.Millisecond,
+		Timeout:      100 * time.Millisecond,
+		Ch:           make(chan event.TypedGenericEvent[client.Object], 8),
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	go func() { _ = p.Start(ctx) }()
+
+	// Wait until all three calls have been made.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		mu.Lock()
+		n := len(callTimes)
+		mu.Unlock()
+		if n >= 3 {
+			break
+		}
+		if time.Now().After(deadline) {
+			mu.Lock()
+			defer mu.Unlock()
+			t.Fatalf("only %d probe calls before deadline; want 3 (unavailable, enforced, enforced)", n)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	// Gap between call 2 (enforced) and call 3: with the reset, the timer is
+	// the full interval (400ms); without the reset (M3), the timer is the
+	// leftover backoff (20ms).
+	gap := callTimes[2].Sub(callTimes[1])
+	if gap < 300*time.Millisecond {
+		t.Fatalf("gap between enforced (call 2) and next probe (call 3) = %v; want >= 300ms (the full interval after a backoff reset, not the leftover backoff)",
+			gap.Round(time.Millisecond))
 	}
 }

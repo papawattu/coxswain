@@ -160,27 +160,33 @@ func (p *ProbeRunnable) Start(ctx context.Context) error {
 		}
 	}
 	go func() {
-		// First probe: never on the manager start path. After it completes,
-		// the next delay is computed from its result (I281: unavailable gets
-		// a short backoff, not the full interval).
+		// I281: the backoff state (0 = not in backoff) is tracked separately
+		// from the interval. A non-unavailable result resets it to 0 (the next
+		// probe is at the full interval); an unavailable result grows it via
+		// nextProbeDelay (starting at base, doubling, capped at interval).
+		backoff := time.Duration(0)
+		// First probe: never on the manager start path.
 		run()
-		unavail := Holder().Result().Reason == ReasonProbeUnavailable
-		nextDelay := nextProbeDelay(0, interval, base, unavail)
 		if ctx.Err() != nil {
 			return
 		}
-		timer := time.NewTimer(nextDelay)
+		if Holder().Result().Reason == ReasonProbeUnavailable {
+			backoff = nextProbeDelay(backoff, interval, base, true)
+		}
+		timer := time.NewTimer(waitForProbe(backoff, interval))
 		defer timer.Stop()
-		prevDelay := nextDelay
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-timer.C:
 				run()
-				unavail = Holder().Result().Reason == ReasonProbeUnavailable
-				prevDelay = nextProbeDelay(prevDelay, interval, base, unavail)
-				timer.Reset(prevDelay)
+				if Holder().Result().Reason == ReasonProbeUnavailable {
+					backoff = nextProbeDelay(backoff, interval, base, true)
+				} else {
+					backoff = 0
+				}
+				timer.Reset(waitForProbe(backoff, interval))
 			}
 		}
 	}()
@@ -188,6 +194,15 @@ func (p *ProbeRunnable) Start(ctx context.Context) error {
 	// manager shuts down; the probe loop runs in the goroutine above).
 	<-ctx.Done()
 	return nil
+}
+
+// waitForProbe returns the delay to wait before the next probe: the backoff
+// if non-zero, otherwise the full interval.
+func waitForProbe(backoff, interval time.Duration) time.Duration {
+	if backoff > 0 {
+		return backoff
+	}
+	return interval
 }
 
 // probeOnce runs one probe with the per-run timeout and re-gates on change.

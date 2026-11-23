@@ -43,7 +43,7 @@ Both runs give the same result. Each line below is from `fence-summary.txt` in t
 
 ## P2
 
-- [ ] **I281: after an upgrade, the first CNI probe can fail on a terminating probe pod and hold every Loop for a full check interval**
+- [x] **I281: after an upgrade, the first CNI probe can fail on a terminating probe pod and hold every Loop for a full check interval** (`76b5d4d`)
 
   **Where:** `internal/cni/pod_prober.go:316` (`cleanup` at the start of `Probe`), `:409-420` (`cleanup`), `:379` (`runPod`'s create); `internal/cni/prober.go:126,131` (one probe at start, then one every `--cni-check-interval`, 10 min by default, `cmd/main.go:145`).
 

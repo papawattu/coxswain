@@ -560,6 +560,10 @@ type LoopReconciler struct {
 	// Only images listed here run the contract: a Loop cannot name an
 	// arbitrary image to run as an agent.
 	AgentHarnesses map[string]string
+	// AgentHarnessLimits overrides the agent container's memory and CPU limits
+	// for a harness (--agent-harness name=image,memory=Q,cpu=Q). A harness
+	// not in it keeps the reference runner's limits.
+	AgentHarnessLimits map[string]corev1.ResourceList
 
 	// VerifyImage is the DEFAULT image the verify Job's check-* containers
 	// run when a Loop declares acceptance checks WITHOUT spec.verify.image
@@ -2345,6 +2349,16 @@ func agentPodSpec(ctx context.Context, r *LoopReconciler, loop *coxv1alpha1.Loop
 		corev1.ResourceCPU:              resource.MustParse("500m"),
 		corev1.ResourceMemory:           resource.MustParse("512Mi"),
 		corev1.ResourceEphemeralStorage: *agentEphemeral,
+	}
+	// D147: a harness may need more than the reference runner (a Node or
+	// Python CLI plus the repo's own build); the operator sets that per
+	// harness. Only memory and CPU are overridable.
+	if h := loop.Spec.Agent.Harness; h != "" && isRunner {
+		for _, res := range []corev1.ResourceName{corev1.ResourceMemory, corev1.ResourceCPU} {
+			if q, ok := r.AgentHarnessLimits[h][res]; ok {
+				agentLimits[res] = q
+			}
+		}
 	}
 	// R59 I274 / D143(a): in the Planning phase the agent mounts the
 	// workspace READ-ONLY (the kubelet enforces it; a `git commit` or an

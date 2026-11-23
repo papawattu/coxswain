@@ -56,6 +56,9 @@ type newLoopReconcilerOptions struct {
 	// AgentHarnesses is the agent adapters a Loop may select, name to pinned
 	// image (--agent-harness, D147).
 	AgentHarnesses map[string]string
+	// AgentHarnessLimits overrides the agent container's limits per harness
+	// (--agent-harness …,memory=Q,cpu=Q).
+	AgentHarnessLimits map[string]corev1.ResourceList
 	// VerifyImage is the verify Job's default check image (--verify-image).
 	VerifyImage string
 	// ToolProxyImage is the tool proxy pods' image (--tool-proxy-image;
@@ -113,6 +116,7 @@ func newLoopReconciler(c client.Client, scheme *runtime.Scheme,
 		WorkspaceGitImage:   o.WorkspaceGitImage,
 		RunnerImage:         o.RunnerImage,
 		AgentHarnesses:      o.AgentHarnesses,
+		AgentHarnessLimits:  o.AgentHarnessLimits,
 		VerifyImage:         o.VerifyImage,
 		ToolProxyImage:      o.ToolProxyImage,
 		EgressProxyImage:    o.EgressProxyImage,

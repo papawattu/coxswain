@@ -26,6 +26,7 @@ import (
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
@@ -141,7 +142,25 @@ var _ = Describe("D147: spec.agent.harness runs an operator-pinned agent adapter
 		Expect(agent.Image).To(Equal(piImage), "the harness's pinned image, not --runner-image")
 		Expect(agent.Command).NotTo(BeEmpty())
 		Expect(agent.Command[0]).To(Equal("/usr/local/bin/runner"), "the adapter entrypoint, not the sleep stand-in")
+		Expect(agent.Resources.Limits.Memory().String()).To(Equal("512Mi"), "no override: the reference runner's limit")
 		Expect(hEvents(recorder, HarnessUnknownEventReason)).To(BeEmpty())
+	})
+
+	It("H5: a harness's memory and CPU limits from --agent-harness apply to its agent container only", func() {
+		ns := hNs("h5")
+		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+		r := hReconciler(record.NewFakeRecorder(64), map[string]string{"opencode": "registry.example/agent-opencode:pin"})
+		r.AgentHarnessLimits = map[string]corev1.ResourceList{"opencode": {
+			corev1.ResourceMemory: resource.MustParse("2Gi"), corev1.ResourceCPU: resource.MustParse("1")}}
+		Expect(k8sClient.Create(ctx, hLoop(ns, "l5", "opencode"))).To(Succeed())
+		hReconcile(r, ns, "l5")
+
+		sbx, err := hSandbox(ns, "l5")
+		Expect(err).NotTo(HaveOccurred())
+		lim := hAgent(sbx).Resources.Limits
+		Expect(lim.Memory().String()).To(Equal("2Gi"))
+		Expect(lim.Cpu().String()).To(Equal("1"))
+		Expect(lim.StorageEphemeral().IsZero()).To(BeFalse(), "the ephemeral-storage limit is kept")
 	})
 
 	It("H2: an unlisted harness holds the Loop with no sandbox, once; listing it releases the Loop", func() {

@@ -1,6 +1,6 @@
 # Agent adapters: Claude Code, Codex, pi, Hermes and opencode on one template
 
-> **Status:** PLANNED, not started. Needs the owner's answers to D147–D149 (below) before S3.
+> **Status:** PLANNED, not started. D147, D148 and D149 were answered (a) by the owner on 11-23.
 >
 > **Ask (owner, 11-23):** create agents for Claude Code, Codex, pi, Hermes and opencode, all from the same template, plus tests that show each one is working and self-contained.
 
@@ -170,6 +170,8 @@ Every test has a positive control, and every gate spec names a mutation that mus
 Each slice is one PR, reviewed on the PR, with its kind evidence before merge. S5–S9 can run in parallel once S3 is in.
 
 ## Owner decisions
+
+**Answered (owner, 11-23): D147 = (a), D148 = (a), D149 = (a).** The questions are kept below as asked.
 
 - **D147: how does a Loop pick an agent?**
   - **(a) Recommended:** `spec.agent.harness: <name>`, mapped by the operator to an image it pins (`--agent-harness name=image@digest`). Only images the operator lists run the contract. A Loop author cannot point the operator's exec at an arbitrary image.

@@ -51,7 +51,7 @@ This is the first kind run of #513, #515 and #521. kind-ref runs Calico.
 
 ## P2
 
-- [ ] **I276: four behaviour PRs and two releases went to main with no review on the PR**
+- [x] **I276: four behaviour PRs and two releases went to main with no review on the PR** (`7ab11ec`)
 
   **Where:** #511, #513, #515, #521; tags v0.3.1 and v0.3.2.
 

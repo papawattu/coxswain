@@ -585,7 +585,11 @@ field is the most useful diagnostic:
   probe pod and the control pod combines to NOT_LISTENING — that is shown, not
   counted, and is not a `ProbeUnavailable` by itself. The condition's message
   names what was not measurable. Re-run the standalone check to see the
-  per-target table: run `make verify-cni`.
+  per-target table: run `make verify-cni`. A `ProbeUnavailable` result is
+  retried on a short backoff (15 s, doubling, capped at `--cni-check-interval`,
+  default 10 min) instead of waiting for the next full tick (I281): a stale
+  probe pod that was terminating at the moment of an operator restart no
+  longer holds every Loop for a full interval.
 - `PolicyEnforced=False` → the KubeArmor policy gate is not enforced. Check
   that KubeArmor is installed and the BPF-LSM hooks are active.
 - `PolicyEnforced=False` reason `AuditOnly` → learn mode (P6b): every policy the Loop references has `spec.auditOnly: true`, so KubeArmor records the agent's activity but blocks nothing. Remove `auditOnly` (or reference an enforcing policy) to enforce.

@@ -405,7 +405,9 @@ func (p *PodProber) LatestResult() CNIProbeResult {
 
 // cleanup deletes any leftover probe pods (BOTH passes — policy and control;
 // D103) and the probe NetworkPolicy (stale from a previous run — the PR #38
-// leak).
+// leak), then waits for the deleted pods to actually disappear (I281: a pod
+// with a grace period is still in the API after its delete is accepted, so
+// the create that follows can hit it).
 func (p *PodProber) cleanup(ctx context.Context) error {
 	for _, name := range []string{probePodName, probeControlPod} {
 		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: p.cfg.Namespace}}
@@ -416,6 +418,36 @@ func (p *PodProber) cleanup(ctx context.Context) error {
 	netpol := &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: probeNetpolName, Namespace: p.cfg.Namespace}}
 	if err := p.cfg.Client.Delete(ctx, netpol); err != nil && !apierrors.IsNotFound(err) {
 		return err
+	}
+	return p.waitProbePodsGone(ctx)
+}
+
+// waitProbePodsGone polls each probe pod until it is NotFound (the API no
+// longer has it). I281: a pod with a grace period (or a finalizer) can still
+// be present in the API after Delete is accepted; creating a new pod with the
+// same name while the old one is "being deleted" fails with
+// "object is being deleted". Bounded by ctx (the probe timeout).
+func (p *PodProber) waitProbePodsGone(ctx context.Context) error {
+	for _, name := range []string{probePodName, probeControlPod} {
+		for {
+			pod := &corev1.Pod{}
+			err := p.cfg.Client.Get(ctx, client.ObjectKey{Namespace: p.cfg.Namespace, Name: name}, pod)
+			if apierrors.IsNotFound(err) {
+				break // pod is gone
+			}
+			if err != nil {
+				// A non-NotFound error (API down etc.): return it so the caller
+				// can surface ProbeUnavailable.
+				return err
+			}
+			// Pod still exists; wait for the next poll.
+			select {
+			case <-ctx.Done():
+				return fmt.Errorf("%s still present (deletionTimestamp=%v) after ctx expired; stale cleanup failed",
+					name, pod.DeletionTimestamp != nil)
+			case <-time.After(250 * time.Millisecond):
+			}
+		}
 	}
 	return nil
 }

@@ -44,6 +44,16 @@
 //     pod where /dev/termination-log does not exist (the write is best-effort
 //     — a failure is logged; the result.json on the workspace is the full
 //     ADR-0004 file).
+//   - -engine-spec: the agent image's engine spec (agent adapters,
+//     docs/PLAN-AGENT-ADAPTERS.md; default /etc/coxswain/engine.json). When the
+//     file exists, the phase's agent work is done by that external CLI
+//     (runner.CLIEngine) instead of the built-in model + shell loop; the
+//     reference runner image has no such file. A file that exists but does not
+//     parse is fatal: an adapter image must never fall back silently to the
+//     built-in engine.
+//   - -selftest: check the image (engine spec, the CLI on PATH, a writable
+//     $HOME and /tmp), print one JSON line, and exit 0 or 1. Used by the agent
+//     image tests (T2); it needs no COX_* environment and runs no model call.
 package main
 
 import (
@@ -52,6 +62,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"os/signal"
 	"strconv"
 	"strings"
@@ -86,9 +97,20 @@ func parseModelTimeout(v string) time.Duration {
 
 func main() {
 	maxSteps := flag.Int("max-steps", 0, "cap on model rounds (0 = the runner default)")
+	engineSpec := flag.String("engine-spec", runner.DefaultEngineSpecPath,
+		"agent image engine spec; used when the file exists (agent adapters)")
+	selftest := flag.Bool("selftest", false, "check the image and exit (agent image tests)")
 	extraBody := flag.String("extra-body", "",
 		"JSON object merged into every chat-completions request body (server tuning knobs)")
 	flag.Parse()
+
+	engine, engineName, err := loadEngine(*engineSpec)
+	if err != nil {
+		log.Fatalf("runner: %v", err)
+	}
+	if *selftest {
+		os.Exit(runSelftest(engine, engineName))
+	}
 
 	var extra map[string]any
 	if *extraBody != "" {
@@ -116,7 +138,8 @@ func main() {
 		model = "local-model"
 	}
 	modelTimeout := parseModelTimeout(os.Getenv("COX_MODEL_TIMEOUT"))
-	log.Printf("runner: goal=%q model=%s workspace=%s modelTimeout=%s", goal, model, workspace, modelTimeout)
+	log.Printf("runner: goal=%q model=%s workspace=%s modelTimeout=%s engine=%s",
+		goal, model, workspace, modelTimeout, engineName)
 
 	// The one-shot phase driver: wait for the desired phase, do the phase's
 	// work, write the claim, and exit (0 = the phase completed the operator's
@@ -146,6 +169,7 @@ func main() {
 		MaxSteps:     *maxSteps,
 		ExtraBody:    extra,
 		ModelTimeout: modelTimeout,
+		Engine:       engine,
 	}, stop)
 	code := 0
 	if res.Status == "blocked" {
@@ -156,4 +180,56 @@ func main() {
 		log.Printf("runner: verification: %s", res.VerificationNotes)
 	}
 	os.Exit(code)
+}
+
+// loadEngine returns the CLI engine when the image carries an engine spec, or
+// nil (the built-in model + shell loop) when it does not. A spec that exists
+// but cannot be read or does not validate is an error: an adapter image must
+// not silently become the reference runner.
+func loadEngine(path string) (runner.Engine, string, error) {
+	if path == "" {
+		return nil, "builtin", nil
+	}
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		return nil, "builtin", nil
+	}
+	spec, err := runner.LoadEngineSpec(path)
+	if err != nil {
+		return nil, "", fmt.Errorf("engine spec %s: %w", path, err)
+	}
+	return runner.CLIEngine{Spec: spec}, spec.Name, nil
+}
+
+// runSelftest checks what an agent image needs at run time, prints one JSON
+// line, and returns the exit code. It runs no model call and needs no COX_*
+// environment.
+func runSelftest(engine runner.Engine, name string) int {
+	out := map[string]any{"engine": name, "uid": os.Getuid(), "ok": true}
+	fail := func(k, v string) { out[k] = v; out["ok"] = false }
+	if cli, ok := engine.(runner.CLIEngine); ok {
+		if p, err := exec.LookPath(cli.Spec.Command[0]); err != nil {
+			fail("command", err.Error())
+		} else {
+			out["command"] = p
+		}
+	}
+	for _, dir := range []string{os.Getenv("HOME"), os.TempDir()} {
+		if dir == "" {
+			fail("home", "HOME is not set")
+			continue
+		}
+		f, err := os.CreateTemp(dir, ".cox-selftest-*")
+		if err != nil {
+			fail("writable:"+dir, err.Error())
+			continue
+		}
+		_ = f.Close()
+		_ = os.Remove(f.Name())
+	}
+	b, _ := json.Marshal(out)
+	fmt.Println(string(b))
+	if out["ok"] != true {
+		return 1
+	}
+	return 0
 }

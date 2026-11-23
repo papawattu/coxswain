@@ -9,6 +9,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/papawattu/coxswain/runner"
 )
 
 func TestParseModelTimeout(t *testing.T) {
@@ -85,4 +87,41 @@ func TestEntrypointHonoursModelTimeout(t *testing.T) {
 		time.Sleep(100 * time.Millisecond)
 	}
 	t.Fatal("no second model request within 10s: COX_MODEL_TIMEOUT=1s was not applied (default is 120s)")
+}
+
+// Agent adapters: an image without an engine spec is the reference runner
+// (the built-in engine); a spec that exists but does not load is fatal, never
+// a silent fallback to the built-in engine.
+func TestLoadEngine(t *testing.T) {
+	dir := t.TempDir()
+	if e, name, err := loadEngine(filepath.Join(dir, "absent.json")); err != nil || e != nil || name != "builtin" {
+		t.Fatalf("absent spec = (%v, %q, %v); want the built-in engine", e, name, err)
+	}
+	bad := filepath.Join(dir, "bad.json")
+	if err := os.WriteFile(bad, []byte(`{"name":"pi"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := loadEngine(bad); err == nil {
+		t.Fatal("a spec with no command must be an error, not the built-in engine")
+	}
+	good := filepath.Join(dir, "good.json")
+	if err := os.WriteFile(good, []byte(`{"name":"pi","command":["sh","-c","true"]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	e, name, err := loadEngine(good)
+	if _, ok := e.(runner.CLIEngine); err != nil || !ok || name != "pi" {
+		t.Fatalf("good spec = (%T, %q, %v); want the CLI engine named pi", e, name, err)
+	}
+}
+
+func TestSelftestFailsWhenTheCLIIsMissing(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	missing := runner.CLIEngine{Spec: runner.EngineSpec{Name: "x", Command: []string{"no-such-agent-cli"}}}
+	if code := runSelftest(missing, "x"); code != 1 {
+		t.Fatalf("selftest with a missing CLI = %d, want 1", code)
+	}
+	present := runner.CLIEngine{Spec: runner.EngineSpec{Name: "x", Command: []string{"sh"}}}
+	if code := runSelftest(present, "x"); code != 0 {
+		t.Fatalf("selftest with sh on PATH and a writable HOME = %d, want 0", code)
+	}
 }

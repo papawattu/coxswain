@@ -111,33 +111,98 @@ type ProbeRunnable struct {
 	// It covers BOTH probe passes (the no-policy control pod and the policy
 	// pod — D103), not a single pod.
 	Timeout time.Duration
+	// RetryInitial is the initial delay after a ProbeUnavailable result before
+	// the next probe attempt (I281). It doubles on each consecutive
+	// unavailable result, capped at Interval. Any non-unavailable result
+	// resets the backoff to Interval. Defaults to 15s when <=0.
+	RetryInitial time.Duration
 	// Ch is the source channel the Loop controller watches; a nil channel
 	// (tests) skips the re-gate send.
 	Ch chan<- event.TypedGenericEvent[client.Object]
 }
 
+// nextProbeDelay computes the delay until the next probe attempt given the
+// previous delay, the probe interval, the retry base, and whether the last
+// result was ProbeUnavailable. If unavailable, the delay is the previous
+// delay doubled (starting at base), capped at interval. Otherwise the delay
+// is the full interval.
+func nextProbeDelay(prev, interval, base time.Duration, unavailable bool) time.Duration {
+	if !unavailable {
+		return interval
+	}
+	if prev <= 0 {
+		return base
+	}
+	next := prev * 2
+	next = min(next, interval)
+	next = max(next, base)
+	return next
+}
+
 // Start implements manager.Runnable. It returns when ctx is done.
+//
+// I281: after a ProbeUnavailable result the next probe is scheduled on a
+// short backoff (RetryInitial, doubling, capped at Interval) instead of
+// waiting for the next full tick. Any other result resets the delay to
+// Interval.
 func (p *ProbeRunnable) Start(ctx context.Context) error {
+	interval := p.Interval
+	if interval <= 0 {
+		interval = 10 * time.Minute
+	}
+	base := p.RetryInitial
+	if base <= 0 {
+		base = 15 * time.Second
+	}
 	run := func() {
 		if err := p.probeOnce(ctx); err != nil {
 			ctrl.Log.WithName("cni-prober").Error(err, "CNI probe failed")
 		}
 	}
-	go run() // first probe: never on the manager start path
-	interval := p.Interval
-	if interval <= 0 {
-		interval = 10 * time.Minute
-	}
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-ticker.C:
-			run()
+	go func() {
+		// I281: the backoff state (0 = not in backoff) is tracked separately
+		// from the interval. A non-unavailable result resets it to 0 (the next
+		// probe is at the full interval); an unavailable result grows it via
+		// nextProbeDelay (starting at base, doubling, capped at interval).
+		backoff := time.Duration(0)
+		// First probe: never on the manager start path.
+		run()
+		if ctx.Err() != nil {
+			return
 		}
+		if Holder().Result().Reason == ReasonProbeUnavailable {
+			backoff = nextProbeDelay(backoff, interval, base, true)
+		}
+		timer := time.NewTimer(waitForProbe(backoff, interval))
+		defer timer.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-timer.C:
+				run()
+				if Holder().Result().Reason == ReasonProbeUnavailable {
+					backoff = nextProbeDelay(backoff, interval, base, true)
+				} else {
+					backoff = 0
+				}
+				timer.Reset(waitForProbe(backoff, interval))
+			}
+		}
+	}()
+	// Block until ctx is done (the Runnable must not return before the
+	// manager shuts down; the probe loop runs in the goroutine above).
+	<-ctx.Done()
+	return nil
+}
+
+// waitForProbe returns the delay to wait before the next probe: the backoff
+// if non-zero, otherwise the full interval.
+func waitForProbe(backoff, interval time.Duration) time.Duration {
+	if backoff > 0 {
+		return backoff
 	}
+	return interval
 }
 
 // probeOnce runs one probe with the per-run timeout and re-gates on change.

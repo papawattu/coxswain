@@ -30,6 +30,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	rschema "k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -1122,5 +1123,124 @@ func TestProbeEitherPassInvalidMessageIsUnavailable(t *testing.T) {
 				t.Fatalf("want ProbeUnavailable naming %s, got %v %q", tc.pass, res.Reason, res.Detail)
 			}
 		})
+	}
+}
+
+// I281 (S1): the control pod exists with a finalizer and a deletionTimestamp
+// when Probe starts. A goroutine removes the finalizer after ~300ms, so the
+// pod eventually disappears. Probe must wait (not fail with "object is
+// being deleted") and complete the probe once the pod is gone.
+func TestProbeWaitsForStalePodWithFinalizer(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = networkingv1.AddToScheme(scheme)
+	// A control pod with a finalizer and a deletionTimestamp: it is "being
+	// deleted" but the API still has it.
+	now := metav1.Now()
+	controlPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              probeControlPod,
+			Namespace:         probePodName,
+			DeletionTimestamp: &now,
+			Finalizers:        []string{"test.finalizer"},
+		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "c", Image: probeTestImage}}},
+	}
+	// Reader: the plain fake holding the finalized pod (simulates the direct
+	// API reader). waitProbePodsGone polls this. The finalizer-removal
+	// goroutine and the stub's Create use this store.
+	reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(controlPod).Build()
+	// Client: a fake with an interceptor that returns NotFound for every Pod
+	// Get (simulates the label-scoped cache, which never has the probe pod).
+	// In the real operator the cache is scoped and a cached Get on the probe
+	// pod reads NotFound at once. The wait must use the Reader, not this.
+	// (I281 P1 fix 2.)
+	cl := fake.NewClientBuilder().WithScheme(scheme).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if _, ok := obj.(*corev1.Pod); ok {
+					return apierrors.NewNotFound(rschema.GroupResource{Resource: "pods"}, key.Name)
+				}
+				return c.Get(ctx, key, obj, opts...)
+			},
+		}).Build()
+
+	// A goroutine removes the finalizer after ~300ms so the pod goes away.
+	// Uses the plain reader (the direct API), not the cache-scoped client.
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		fresh := &corev1.Pod{}
+		if err := reader.Get(context.Background(), client.ObjectKey{Namespace: probePodName, Name: probeControlPod}, fresh); err == nil {
+			fresh.Finalizers = nil
+			_ = reader.Update(context.Background(), fresh)
+		}
+	}()
+
+	p := NewPodProber(PodProberConfig{
+		Namespace: probePodName, ProbeImage: probeTestImage,
+		ProbeTimeout: 10 * time.Second, Client: cl, Reader: reader,
+	})
+	// Stub the run seam so the two passes succeed immediately. The stub
+	// creates the pod first (like runPod does) so the stale control pod is
+	// actually hit if the wait is broken (I281 P2: the stub must exercise
+	// the Create path).
+	calls := 0
+	p.run = func(ctx context.Context, pod *corev1.Pod) (string, string, error) {
+		if err := reader.Create(ctx, pod.DeepCopy()); err != nil {
+			return "", "", err
+		}
+		calls++
+		if calls == 1 {
+			return controlOK, "n1", nil
+		}
+		return policyOK, "n1", nil
+	}
+	res, err := p.Probe(context.Background())
+	if err != nil {
+		t.Fatalf("Probe: %v", err)
+	}
+	if res.Reason == ReasonProbeUnavailable {
+		for _, bad := range []string{"stale cleanup failed", "being deleted", "already exists"} {
+			if strings.Contains(res.Detail, bad) {
+				t.Fatalf("Probe returned ProbeUnavailable with %q detail; want a successful probe after waiting for the stale pod: %v %q", bad, res.Reason, res.Detail)
+			}
+		}
+	}
+	if res.Reason != ReasonCNIEnforced {
+		t.Fatalf("want CNIEnforced after the stale pod disappears, got %v %q", res.Reason, res.Detail)
+	}
+}
+
+// I281 (S2): the control pod's finalizer is never removed and the probe
+// timeout is short. Probe must return unavailable naming the pod.
+func TestProbeUnavailableWhenPodStaysPresent(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = networkingv1.AddToScheme(scheme)
+	now := metav1.Now()
+	controlPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              probeControlPod,
+			Namespace:         probePodName,
+			DeletionTimestamp: &now,
+			Finalizers:        []string{"test.finalizer"},
+		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "c", Image: probeTestImage}}},
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(controlPod).Build()
+
+	p := NewPodProber(PodProberConfig{
+		Namespace: probePodName, ProbeImage: probeTestImage,
+		ProbeTimeout: 2 * time.Second, Client: cl, Reader: cl,
+	})
+	res, _ := p.Probe(context.Background())
+	if res.Reason != ReasonProbeUnavailable {
+		t.Fatalf("want ProbeUnavailable when the pod never disappears, got %v %q", res.Reason, res.Detail)
+	}
+	if !strings.Contains(res.Detail, probeControlPod) {
+		t.Fatalf("the unavailable detail must name the pod %q, got %q", probeControlPod, res.Detail)
+	}
+	if !strings.Contains(res.Detail, "stale cleanup failed") {
+		t.Fatalf("the unavailable detail must say stale cleanup failed, got %q", res.Detail)
 	}
 }

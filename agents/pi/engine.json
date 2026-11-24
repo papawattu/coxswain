@@ -1,0 +1,24 @@
+{
+  "name": "pi",
+  "command": [
+    "pi",
+    "-p",
+    "--no-session",
+    "--no-mcp",
+    "--model",
+    "coxswain/${COX_MODEL}",
+    "${COX_PROMPT}"
+  ],
+  "env": {
+    "PI_OFFLINE": "1",
+    "PI_SKIP_VERSION_CHECK": "1",
+    "PI_TELEMETRY": "0",
+    "PI_CODING_AGENT_DIR": "${HOME}/.pi/agent"
+  },
+  "files": [
+    {
+      "path": "${HOME}/.pi/agent/models.json",
+      "content": "{\"providers\": {\"coxswain\": {\"baseUrl\": \"${COX_MODEL_BASE_URL}/v1\", \"api\": \"openai-completions\", \"apiKey\": \"unused\", \"models\": [{\"id\": \"${COX_MODEL}\"}]}}}"
+    }
+  ]
+}

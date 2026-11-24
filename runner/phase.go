@@ -63,7 +63,6 @@ import (
 	"io"
 	"log"
 	"log/slog"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -232,6 +231,10 @@ type PhaseConfig struct {
 	// forever. The S3 production pod never hits it (SIGTERM arrives when the
 	// operator recreates the sandbox). Zero uses defaultIdleTimeout.
 	IdleTimeout time.Duration
+	// Engine does the phase's agent work (agent adapters, S1). Nil is the
+	// reference runner's built-in model + shell-tool loop, built from the
+	// fields above; a CLIEngine runs an external coding-agent CLI instead.
+	Engine Engine
 }
 
 // PhaseRun is the one-shot phase driver (S4). It waits for the operator's
@@ -553,17 +556,12 @@ func awaitDesiredPhase(workspace string, poll time.Duration, stop <-chan any) (s
 // it (no claim, no PLAN.md write, no commit, no lesson file).
 func drivePhaseOnce(cfg PhaseConfig, prompt, phase string, conversation []chatMessage,
 	stop <-chan any, onAnswer ...func(string)) (Result, bool) {
-	modelTimeout := cfg.ModelTimeout
-	if modelTimeout <= 0 {
-		modelTimeout = defaultModelTimeout
-	}
-	shellTimeout := cfg.ShellTimeout
-	if shellTimeout <= 0 {
-		shellTimeout = defaultShellTimeout
-	}
-	maxSteps := cfg.MaxSteps
-	if maxSteps <= 0 {
-		maxSteps = defaultMaxSteps
+	// Agent adapters (S1): the phase's agent work is the Engine's. A nil
+	// Engine is the reference runner's built-in model + shell loop, with the
+	// same defaults as before the split (newModelEngine).
+	engine := cfg.Engine
+	if engine == nil {
+		engine = newModelEngine(cfg)
 	}
 
 	// A4: the conversation (the previous phase's messages) is the starting
@@ -574,11 +572,11 @@ func drivePhaseOnce(cfg PhaseConfig, prompt, phase string, conversation []chatMe
 	messages = append(messages, conversation...)
 	messages = append(messages, chatMessage{Role: jsonRoleUser, Content: prompt})
 
-	client := &http.Client{}
-	// R58 I273 (D142): a ctx cancelled when stop closes (SIGTERM). driveModel
-	// honours it for every model request, the retry backoff, and the shell
-	// tool command (execShell derives its timeout from this ctx), so the
-	// phase ends promptly on a pod deletion even mid-command.
+	// R58 I273 (D142): a ctx cancelled when stop closes (SIGTERM). The engine
+	// honours it (the built-in engine's driveModel honours it for every model request, the retry backoff, and the shell
+	// tool command (execShell derives its timeout from this ctx); the CLI
+	// engine kills the CLI's process group), so the phase ends promptly on a
+	// pod deletion even mid-command.
 	// stopCancelled is set by the watcher when it cancels the ctx (a stop that
 	// arrives during the model work); the stopClosed result below is true only
 	// when the watcher cancelled the ctx, not when the phase's model work
@@ -594,14 +592,10 @@ func drivePhaseOnce(cfg PhaseConfig, prompt, phase string, conversation []chatMe
 		case <-ctx.Done():
 		}
 	}()
-	// F79: the phase drive (the runner binary's path, runner/cmd/main.go) runs
-	// the PRODUCTION ladder. The injectable seam is runConfig's
-	// ModelRetries/ModelRetryBackoff, which the F79 specs use against the same
-	// shared driveModel; PhaseConfig has no operator knob for it.
-	answer, trace, modelErr := driveModel(
-		ctx, client, cfg.BaseURL, cfg.APIKey, cfg.Model, cfg.Workspace,
-		messages, maxSteps, shellTimeout, modelTimeout, modelRetryLadderFor(0, 0), cfg.ExtraBody,
-	)
+	// F79: the built-in engine runs the PRODUCTION retry ladder
+	// (newModelEngine); PhaseConfig has no operator knob for it.
+	er := engine.Run(ctx, EngineRequest{Phase: phase, Prompt: prompt, Workspace: cfg.Workspace, Messages: messages})
+	answer, trace, modelErr := er.Answer, er.Trace, er.Err
 
 	res := Result{
 		Status:        statusSuccess,

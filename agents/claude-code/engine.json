@@ -1,0 +1,25 @@
+{
+  "name": "claude-code",
+  "command": [
+    "claude",
+    "-p",
+    "--dangerously-skip-permissions",
+    "--disallowedTools",
+    "WebFetch,WebSearch",
+    "--model",
+    "${COX_MODEL}",
+    "${COX_PROMPT}"
+  ],
+  "env": {
+    "ANTHROPIC_BASE_URL": "${COX_MODEL_BASE_URL}",
+    "ANTHROPIC_API_KEY": "unused",
+    "CLAUDE_CONFIG_DIR": "${HOME}/.claude",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+    "DISABLE_AUTOUPDATER": "1",
+    "DISABLE_TELEMETRY": "1",
+    "DISABLE_ERROR_REPORTING": "1",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "${COX_MODEL}",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "${COX_MODEL}",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "${COX_MODEL}"
+  }
+}

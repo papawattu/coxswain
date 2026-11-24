@@ -1,0 +1,51 @@
+{
+  "name": "codex",
+  "command": [
+    "codex",
+    "exec",
+    "--disable",
+    "plugins",
+    "--disable",
+    "remote_plugin",
+    "--disable",
+    "plugin_sharing",
+    "--disable",
+    "apps",
+    "--disable",
+    "browser_use",
+    "--disable",
+    "browser_use_external",
+    "--disable",
+    "computer_use",
+    "--disable",
+    "image_generation",
+    "--disable",
+    "skill_mcp_dependency_install",
+    "--disable",
+    "workspace_dependencies",
+    "--disable",
+    "in_app_updates",
+    "--disable",
+    "realtime_conversation",
+    "--disable",
+    "in_app_browser",
+    "--skip-git-repo-check",
+    "--dangerously-bypass-approvals-and-sandbox",
+    "--ephemeral",
+    "-o",
+    "${HOME}/codex-last-message.txt",
+    "${COX_PROMPT}"
+  ],
+  "env": {
+    "CODEX_HOME": "${HOME}/.codex",
+    "COX_DUMMY_KEY": "unused"
+  },
+  "files": [
+    {
+      "path": "${HOME}/.codex/config.toml",
+      "content": "model = \"${COX_MODEL}\"\nmodel_provider = \"coxswain\"\ncheck_for_update_on_startup = false\n\n[analytics]\nenabled = false\n\n[model_providers.coxswain]\nname = \"coxswain\"\nbase_url = \"${COX_MODEL_BASE_URL}/v1\"\nwire_api = \"responses\"\nenv_key = \"COX_DUMMY_KEY\"\n"
+    }
+  ],
+  "answer": "file",
+  "answerPath": "${HOME}/codex-last-message.txt"
+}

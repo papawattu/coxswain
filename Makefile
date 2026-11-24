@@ -230,6 +230,24 @@ proxy-build: ## Build the proxy stand-in image (coxswain-proxy:standin).
 egress-proxy-build: ## Build the egress proxy image (coxswain-egress-proxy:standin).
 	$(CONTAINER_TOOL) build -t $(EGRESS_IMG) -f cmd/egress-proxy/Dockerfile .
 
+# Agent adapter images (docs/PLAN-AGENT-ADAPTERS.md, docs/AGENT-HARNESSES.md):
+# one template (agents/Dockerfile), one target per agent.
+AGENTS ?= pi opencode codex claude-code hermes
+AGENT_IMAGE_PREFIX ?= local/coxswain/agent-
+AGENT_TAG ?= dev
+
+.PHONY: agent-images
+agent-images: ## Build the agent adapter images ($(AGENT_IMAGE_PREFIX)<agent>:$(AGENT_TAG)).
+	@for a in $(AGENTS); do \
+	  echo "== $$a"; \
+	  $(CONTAINER_TOOL) build -f agents/Dockerfile --target $$a -t $(AGENT_IMAGE_PREFIX)$$a:$(AGENT_TAG) . || exit 1; \
+	done
+
+.PHONY: agent-images-test
+agent-images-test: ## T2: each agent image works and is self-contained (Docker; needs a model endpoint).
+	$(CONTAINER_TOOL) build -t local/coxswain/main-model-proxy:t2 -f cmd/model-proxy/Dockerfile .
+	AGENT_IMAGE_PREFIX=$(AGENT_IMAGE_PREFIX) AGENT_TAG=$(AGENT_TAG) hack/agent-images-test.sh $(AGENTS)
+
 .PHONY: runner-build
 runner-build: ## S3: build the runner agent image ($(RUNNER_IMG)) from cmd/runner/Dockerfile.
 	$(CONTAINER_TOOL) build -t $(RUNNER_IMG) -f cmd/runner/Dockerfile .

@@ -22,3 +22,7 @@
 !runner/runner.go
 !runner/cmd/*.go
 !runner/testhelper/*.go
+
+# Agent adapter images (agents/Dockerfile): the engine specs
+!agents
+!agents/*/engine.json

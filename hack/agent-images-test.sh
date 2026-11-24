@@ -30,6 +30,15 @@
 #
 # A step that is not run prints SKIP or NOT RUN, never PASS (R25 I84).
 #
+# Pod limits: the agent containers run with the sandbox pod's limits (512 MiB
+# of memory, half a CPU; T2_MEMORY and T2_CPUS override), and /scratch's size
+# is reported against the pod's 350Mi emptyDir limit.
+#
+# The task: T2_GOAL (default: add NOTES.md), and T2_EXPECT, the file the
+# Implementing commit must contain (default NOTES.md). The real gocli task is
+#   T2_GOAL="Fix Round in round.go so it rounds half away from zero. ..." T2_EXPECT=round.go
+# and then the script also runs `go test ./...` on the committed result.
+#
 # Usage: hack/agent-images-test.sh [agent ...]   (default: all five)
 # Env: AGENT_IMAGE_PREFIX (local/coxswain/agent-), AGENT_TAG (dev),
 #      PROXY_IMAGE (local/coxswain/main-model-proxy:t2), MODEL_ENDPOINT
@@ -50,6 +59,9 @@ RUN=t2-$$
 NET=$RUN-int
 CANARY="t2-canary-$(head -c 12 /dev/urandom | od -An -tx1 | tr -d ' \n')"
 CAP_IMAGE=local/coxswain/t2-tcpdump:dev
+T2_MEMORY=${T2_MEMORY:-512m}
+T2_CPUS=${T2_CPUS:-0.5}
+T2_EXPECT=${T2_EXPECT:-NOTES.md}
 mkdir -p "$EVIDENCE"
 EVIDENCE=$(cd "$EVIDENCE" && pwd)
 FAILS=0
@@ -140,11 +152,13 @@ run_phase() {
   local wsmount=(-v "$ws":/workspace)
   [ "$phase" = Planning ] && wsmount=(-v "$ws":/workspace:ro -v "$ws/.coxswain":/workspace/.coxswain)
   docker run --rm --net "container:$RUN-holder" --read-only -u 65532:65532 \
-    --tmpfs /tmp:uid=65532,gid=65532 -v "$scratch":/scratch "${wsmount[@]}" \
+    --memory "$T2_MEMORY" --memory-swap "$T2_MEMORY" --cpus "$T2_CPUS" \
+    --tmpfs /tmp:exec,uid=65532,gid=65532 -v "$scratch":/scratch "${wsmount[@]}" \
     -e HOME=/scratch -e COX_GOAL="$goal" -e COX_MODEL_BASE_URL=http://model-proxy:8080 -e COX_MODEL="$MODEL" \
-    -e COX_WORKSPACE=/workspace "$PREFIX$agent:$TAG" \
+    -e COX_WORKSPACE=/workspace -e GOTMPDIR=/workspace/.coxswain/gotmp "$PREFIX$agent:$TAG" \
     > "$out/$phase.stdout" 2> "$out/$phase.stderr"
-  echo "exit=$? seconds=$(( $(date +%s) - t0 ))" > "$out/$phase.exit"
+  local rc=$?
+  echo "exit=$rc seconds=$(( $(date +%s) - t0 ))$([ "$rc" = 137 ] && echo ' (137: killed, likely out of memory)')" > "$out/$phase.exit"
 }
 
 # result_ok <ws> <phase>: result.json claims success for the phase.
@@ -196,21 +210,32 @@ for agent in "${AGENTS[@]}"; do
   start_capture
   OWN=$(holder_ip)
   before=$(docker logs "$RUN-proxy" 2>/dev/null | grep -c '"source":"model-proxy"' || true)
-  run_phase "$agent" Planning "$WS" "$SCRATCH" "Add a file NOTES.md at the repository root containing exactly the line: hello from $agent"
+  GOAL=${T2_GOAL:-"Add a file NOTES.md at the repository root containing exactly the line: hello from $agent"}
+  run_phase "$agent" Planning "$WS" "$SCRATCH" "$GOAL"
   if r=$(result_ok "$WS" Planning) && [ -s "$WS/.coxswain/PLAN.md" ]; then
     pass "$agent phases: Planning claimed success and wrote PLAN.md ($(wc -c < "$WS/.coxswain/PLAN.md") bytes); $(cat "$OUT/Planning.exit")"
   else
     fail "$agent phases: Planning: $r; PLAN.md $( [ -s "$WS/.coxswain/PLAN.md" ] && echo present || echo missing); $(cat "$OUT/Planning.exit")"
   fi
   mid=$(docker logs "$RUN-proxy" 2>/dev/null | grep -c '"source":"model-proxy"' || true)
-  run_phase "$agent" Implementing "$WS" "$SCRATCH" "Add a file NOTES.md at the repository root containing exactly the line: hello from $agent"
+  run_phase "$agent" Implementing "$WS" "$SCRATCH" "$GOAL"
   committed=$(cd "$WS" && git log -1 --name-only --format= 2>/dev/null | tr '\n' ' ')
-  if r=$(result_ok "$WS" Implementing) && echo " $committed" | grep -q ' NOTES.md '; then
+  if r=$(result_ok "$WS" Implementing) && echo " $committed" | grep -qF " $T2_EXPECT "; then
     pass "$agent phases: Implementing claimed success and committed: $committed; $(cat "$OUT/Implementing.exit")"
   else
     fail "$agent phases: Implementing: $r; HEAD files: '$committed'; $(cat "$OUT/Implementing.exit")"
   fi
   stop_capture "$OUT/network.tcpdump"
+  scratch_kib=$(docker run --rm -u 0 -v "$SCRATCH":/s:ro alpine:3.22 du -sk /s | cut -f1)
+  say "INFO $agent scratch: $((scratch_kib / 1024)) MiB used (the pod's /scratch emptyDir limit is 350Mi)"
+  if [ "$T2_EXPECT" = round.go ]; then
+    # The real task: the committed result must pass the repo's own tests.
+    if docker run --rm -v "$WS":/w -w /w golang:1.26-trixie sh -c 'git config --global --add safe.directory "*"; git clone -q /w /tmp/c && cd /tmp/c && go test ./... 2>&1 | tail -3' > "$OUT/go-test.txt" 2>&1 && grep -q '^ok' "$OUT/go-test.txt" && ! grep -q FAIL "$OUT/go-test.txt"; then
+      pass "$agent task: go test ./... passes on the committed result ($(head -1 "$OUT/go-test.txt"))"
+    else
+      fail "$agent task: go test ./... on the committed result: $(tr '\n' ' ' < "$OUT/go-test.txt")"
+    fi
+  fi
   after=$(docker logs "$RUN-proxy" 2>/dev/null | grep -c '"source":"model-proxy"' || true)
 
   # network

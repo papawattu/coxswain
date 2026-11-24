@@ -57,9 +57,14 @@ Each CLI was run hardened: uid 65532, a read-only root, and tmpfs `/scratch` and
 | claude-code | none beyond the model | `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`, `DISABLE_AUTOUPDATER`, `DISABLE_TELEMETRY`, `DISABLE_ERROR_REPORTING` |
 | codex | `ab.chatgpt.com` (analytics); `github.com` (2,556 packets: plugins and skills) | `[analytics] enabled = false`, `check_for_update_on_startup = false`, and `--disable` for plugins, remote plugins, apps, browser and computer use, image generation, skill and workspace dependency installs, in-app updates |
 | opencode | `models.opencode.ai` (model catalogue); `registry.npmjs.org` (it installs `@opencode-ai/plugin` into its config dir on every tool-using run) | the `OPENCODE_DISABLE_*` switches (models fetch, autoupdate, default plugins, LSP download, external skills, Claude Code compatibility, project config), and the npm and Bun registry pointed at `http://127.0.0.1:9/` so the plugin install fails inside the container |
-| hermes | `hermes-agent.nousresearch.com` and `nousresearch.github.io` (the plugin catalogue: a fresh home installs its default plugins) | `HERMES_DISABLE_LAZY_INSTALLS=1` and `security.allow_lazy_installs: false` |
+| hermes | `hermes-agent.nousresearch.com` and `nousresearch.github.io` (the plugin catalogue: a fresh home installs its default plugins); on longer tasks also `proxy.golang.org` (it runs `go install gopls` for its LSP), the model catalogue (`hermes-agent.nousresearch.com`, with a fallback on `raw.githubusercontent.com`), and `openrouter.ai` (a reasoning-capabilities cache it warms in the background) | `HERMES_DISABLE_LAZY_INSTALLS=1`, `security.allow_lazy_installs: false`, `plugins.auto_update_check_hours: 0`, `lsp.enabled: false`, `model_catalog.enabled: false`, `curator.enabled: false`, `_config_version: 54` (without it Hermes treats the config as old and migrates it), `HERMES_DISABLE_MODEL_METADATA_FETCH`, `HERMES_DISABLE_TELEMETRY`, `HERMES_DISABLE_PLUGINS`. Two caches are pre-seeded: an empty plugin catalogue, and the OpenRouter reasoning-capabilities cache with a timestamp in 2100, because that cache has no switch. The toolsets are limited to `terminal,file,code_execution,todo`, so there are no web, browser, image or skills-hub tools |
 
 `OPENCODE_DISABLE_PROJECT_CONFIG=1` also stops a repo from shipping its own opencode config, such as providers or permissions.
+
+**Web tools are off** where a CLI has them, because the sandbox has no internet and a web tool could only make blocked attempts:
+- Claude Code: `--disallowedTools WebFetch,WebSearch`;
+- opencode: `tools.webfetch: false`;
+- Hermes: the toolset list above.
 
 ## The tests
 
@@ -85,7 +90,27 @@ Each CLI was run hardened: uid 65532, a read-only root, and tmpfs `/scratch` and
   - `getent hosts example.com` from an agent image must be detected;
   - the canary must be found in the proxy's own key file.
 
-### T2 run, 11-23
+### T2 on the real task, under the pod's limits (11-23 and 11-24)
+
+This is the gocli sample's goal: fix `Round` so it rounds half away from zero, without touching the protected tests. Each run used the sandbox pod's limits (512 MiB and half a CPU, or a harness override), a `/tmp` that allows exec, and `GOTMPDIR=/workspace/.coxswain/gotmp`, all as in a pod. After Implementing, T2 runs `go test ./...` on the committed result. That check fails on the unfixed repo, which is its positive control.
+
+| Agent | Memory | Planning | Implementing | Committed | `go test` on the commit | Network | Evidence |
+|---|---|---|---|---|---|---|---|
+| pi | 512 MiB | 57 s | 8 s | `round.go` | ok | all 46 packets to the proxy | `t2-gocli-final-512` |
+| codex | 512 MiB | 55 s | 10 s | `round.go` | ok | all 204 to the proxy | `t2-gocli-final-512` |
+| claude-code | 512 MiB | 90 s | 27 s | `round.go` | ok | all 182 to the proxy | `t2-gocli-final-512` |
+| opencode | 1 GiB | 73 s | 20 s | `round.go` | ok | all 92 to the proxy | `t2-gocli-final-1g` |
+| hermes | 1 GiB | 100 s | 99 s | `round.go` | ok | all 182 to the proxy | `t2-gocli-hermes-cat` |
+
+The canary was found nowhere in any run. Evidence is reviewer-local, under `.samples/agent-images/`.
+
+**What earlier runs found and what fixed it:**
+- **opencode at 512 MiB:** its CLI was killed by SIGKILL in both phases. Its peak memory was 688 MiB, and Hermes's 664 MiB (`docker stats`, every 2 s). Both run with `--agent-harness …,memory=1Gi`. Hermes's "Gateway disconnected" at 512 MiB went away at 1 GiB.
+- **Codex:** it runs its tool in a login shell (`bash -lc`), which resets `PATH` and lost `/usr/local/go/bin`. It then rebuilt the Go environment inside the workspace, and the adapter refused the build cache in the commit. The images now link `go` and `gofmt` into `/usr/local/bin`.
+- **A T2 defect:** its first version mounted `/tmp` `noexec` (Docker's tmpfs default) and set no `GOTMPDIR`. Every agent's `go test` then failed to exec its test binary, and the agents moved Go caches into the workspace to work around it. T2 now mirrors the pod.
+- **Hermes:** it kept reaching four hosts until the Hermes switches in the table above were added. The final run reached nothing but the proxy.
+
+### T2 run, 11-23 (the small task)
 
 Against `qwen3.8-27b` on the lab endpoint. Evidence is reviewer-local in `.samples/agent-images/t2-all-1/`.
 
@@ -109,4 +134,4 @@ Both controls passed, and every agent committed `NOTES.md`.
 
 - **T3:** a kind Loop per agent with the Judge and delivery, after the operator's `spec.agent.harness` (O1).
 - **T4:** the isolation checks on kind.
-- **Qwen's thinking switch:** the reference runner turns Qwen's thinking pass off with `-extra-body`. The CLIs get no equivalent yet. T2's small tasks did not need it, and T3 will show whether real tasks do.
+- **Qwen's thinking switch:** the reference runner turns Qwen's thinking pass off with `-extra-body`. The CLIs get no equivalent. None of the five needed it for the gocli task.

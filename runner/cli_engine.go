@@ -389,7 +389,7 @@ func exitText(err error) string {
 	}
 	if ee, ok := errors.AsType[*exec.ExitError](err); ok {
 		if ws, ok := ee.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
-			return "killed by " + ws.Signal().String()
+			return "killed by signal " + ws.Signal().String()
 		}
 		return "exit " + strconv.Itoa(ee.ExitCode())
 	}

@@ -4,6 +4,8 @@
     "claude",
     "-p",
     "--dangerously-skip-permissions",
+    "--disallowedTools",
+    "WebFetch,WebSearch",
     "--model",
     "${COX_MODEL}",
     "${COX_PROMPT}"

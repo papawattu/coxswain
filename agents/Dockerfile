@@ -42,6 +42,9 @@ COPY --from=node /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/npm
 RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
  && ln -s ../lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx
 COPY --from=adapter /out/runner /usr/local/bin/runner
+# A login shell (bash -l, which Codex uses for its tool) resets PATH from
+# /etc/profile and loses /usr/local/go/bin; the links keep go on every PATH.
+RUN ln -s /usr/local/go/bin/go /usr/local/bin/go && ln -s /usr/local/go/bin/gofmt /usr/local/bin/gofmt
 ENV HOME=/scratch
 WORKDIR /workspace
 ENTRYPOINT ["/usr/local/bin/runner"]
@@ -77,6 +80,7 @@ USER 65532:65532
 FROM ${GO_IMAGE} AS gotoolchain
 FROM ${HERMES_IMAGE} AS hermes
 COPY --from=gotoolchain /usr/local/go /usr/local/go
+RUN ln -s /usr/local/go/bin/go /usr/local/bin/go && ln -s /usr/local/go/bin/gofmt /usr/local/bin/gofmt
 COPY --from=adapter /out/runner /usr/local/bin/runner
 COPY agents/hermes/engine.json /etc/coxswain/engine.json
 ENV PATH=/usr/local/go/bin:/opt/hermes/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \

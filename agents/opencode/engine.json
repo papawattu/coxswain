@@ -25,7 +25,7 @@
   "files": [
     {
       "path": "${HOME}/.config/opencode/opencode.json",
-      "content": "{\"autoupdate\": false, \"share\": \"disabled\", \"model\": \"coxswain/${COX_MODEL}\", \"provider\": {\"coxswain\": {\"npm\": \"@ai-sdk/openai-compatible\", \"name\": \"coxswain\", \"options\": {\"baseURL\": \"${COX_MODEL_BASE_URL}/v1\", \"apiKey\": \"unused\"}, \"models\": {\"${COX_MODEL}\": {}}}}}"
+      "content": "{\"autoupdate\": false, \"share\": \"disabled\", \"model\": \"coxswain/${COX_MODEL}\", \"provider\": {\"coxswain\": {\"npm\": \"@ai-sdk/openai-compatible\", \"name\": \"coxswain\", \"options\": {\"baseURL\": \"${COX_MODEL_BASE_URL}/v1\", \"apiKey\": \"unused\"}, \"models\": {\"${COX_MODEL}\": {}}}}, \"tools\": {\"webfetch\": false}}"
     }
   ]
 }

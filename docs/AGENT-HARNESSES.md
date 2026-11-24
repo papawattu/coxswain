@@ -130,8 +130,40 @@ Both controls passed, and every agent committed `NOTES.md`.
 - Hermes probes `/api/v1/models`, `/api/tags` and `/v1/props` at start (404, harmless; all to the proxy).
 - One Claude Code request got a 500 from the endpoint and was retried.
 
+## T3 on kind (R6, 11-24)
+
+The kind-ref cluster ran an integration candidate, `61ed6ff` (main, plus #529, #530 and #531, merged locally). The operator ran with `--agent-harness` for all five, opencode and Hermes with `memory=1Gi`. Each Loop is the gocli sample with the Judge, PR delivery, and a `LESSON:` line. They ran three at a time, followed by the reference runner as a regression check. Evidence is reviewer-local in `.samples/r6/c6/` (`summary.txt`, `r6-lab.log`, each Loop's agent logs and model-proxy log, `samples-podwatch.json`).
+
+| Loop | Phase | PR | `RunnerAvailable` | Judge | Memory write | Proxy calls (200s, all metered) |
+|---|---|---|---|---|---|---|
+| r6-runner | Succeeded | 25 | `RunnerImageSet` | true | written | 15 of 15 |
+| r6-pi | Succeeded | 26 | `HarnessImageSet` | true | written | 32 of 32 |
+| r6-opencode | Succeeded | 24 | `HarnessImageSet` | **false** | `LessonsWithheld` (D140: a false verdict withholds lessons) | 9 of 9 |
+| r6-codex | Succeeded | 27 | `HarnessImageSet` | true | written | 12 of 12 |
+| r6-claude-code | Succeeded | 28 | `HarnessImageSet` | true | written | 10 of 10 |
+| r6-hermes | Succeeded | 29 | `HarnessImageSet` | true | written | 9 of 9 completions |
+
+**Every Loop:**
+- every sandbox pod ran its harness's pinned image through `/usr/local/bin/runner`, with 1Gi for opencode and Hermes and 512Mi otherwise (`samples-podwatch.json`);
+- `VerifySuspicious=False`, `NetworkEnforced=True/CNIEnforced`;
+- the operator log has 499,454 lines and `forbidden` = 0;
+- the lab was restored to main `7ab11ec` (`restored args == old: yes`, 0 Loops).
+
+**What the proxy logs show:**
+- **Claude Code** got 8 HTTP 500s from vLLM. It retried and the Loop succeeded. The audit line has no path, so which endpoint returned them is not shown.
+- **Hermes** made 8 404s and 4 unmetered 200s. These are its start-up probes of other servers' model-list endpoints. The 4 unmetered 200s are in the same probe set, but the audit line has no path, so that they are model-list GETs is not shown.
+
+**Node CLIs and `blockedCount`.** For pi (5) and opencode (3), `blockedCount` is above 0 although they made no outside attempt. Each block is KubeArmor's default posture refusing an `AF_NETLINK` raw socket: Node opens one at start to list network interfaces (`operator.stream.log`, `"action":"Block","target":"domain=AF_NETLINK …"`). The `PolicyBlocked` count for a Node agent therefore includes these. They are not egress.
+
+**Egress controls (`r6x-*`):** the same Loop, with a goal that first asks the agent to run `curl -sS -m 10 https://example.com`.
+- The runner, pi, Codex and Hermes each ran it and reported `curl: (6) Could not resolve host: example.com`.
+- The Claude Code and opencode logs do not show the command's result. Whether they ran it is not shown.
+- No control reached example.com.
+- The operator log has 5 KubeArmor lines naming example.com: the processes that carried it in their arguments.
+- The DNS lookup itself is not in the audit (R63 I284), so `blockedCount` is not a measure of these attempts.
+
 ## Not covered yet
 
-- **T3:** a kind Loop per agent with the Judge and delivery, after the operator's `spec.agent.harness` (O1).
-- **T4:** the isolation checks on kind.
+- **T4:** the isolation checks on kind, per agent.
 - **Qwen's thinking switch:** the reference runner turns Qwen's thinking pass off with `-extra-body`. The CLIs get no equivalent. None of the five needed it for the gocli task.
+- **Claude Code's bundled skills:** a Claude Code summary mentions an "update-config skill", one of its built-in skills, which it loads on its own. They are part of the pinned CLI, not fetched.

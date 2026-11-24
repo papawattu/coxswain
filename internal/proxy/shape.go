@@ -6,34 +6,67 @@ import (
 	"io"
 )
 
+// apiUsage is a usage object in any of the three model APIs the agents speak
+// (docs/AGENT-HARNESSES.md, D148): OpenAI chat completions
+// (prompt_tokens/completion_tokens), and Anthropic Messages and OpenAI
+// Responses (input_tokens/output_tokens; Messages may add the cache counts,
+// which are input the model processed).
+type apiUsage struct {
+	PromptTokens             json.Number `json:"prompt_tokens"`
+	CompletionTokens         json.Number `json:"completion_tokens"`
+	InputTokens              json.Number `json:"input_tokens"`
+	OutputTokens             json.Number `json:"output_tokens"`
+	CacheCreationInputTokens json.Number `json:"cache_creation_input_tokens"`
+	CacheReadInputTokens     json.Number `json:"cache_read_input_tokens"`
+}
+
+func num(n json.Number) int64 {
+	v, _ := n.Int64()
+	return v
+}
+
+// counts returns (prompt, completion) for whichever naming the object uses.
+func (u *apiUsage) counts() (int64, int64) {
+	if u.PromptTokens != "" || u.CompletionTokens != "" {
+		return num(u.PromptTokens), num(u.CompletionTokens)
+	}
+	in := num(u.InputTokens) + num(u.CacheCreationInputTokens) + num(u.CacheReadInputTokens)
+	return in, num(u.OutputTokens)
+}
+
 // parseUsage extracts the prompt/completion token counts from a non-streaming
-// response body's top-level usage object. It returns (0, 0, false) for a
-// non-JSON body, a non-object, or an object with no usage object — the
-// caller counts those as unmetered.
+// response body's top-level usage object, in any of the three APIs (chat
+// completions, Messages, Responses all put it at the top level). It returns
+// (0, 0, false) for a non-JSON body, a non-object, or an object with no usage
+// object — the caller counts those as unmetered.
 func parseUsage(body []byte) (prompt, completion int64, ok bool) {
 	var top struct {
-		Usage *struct {
-			PromptTokens     json.Number `json:"prompt_tokens"`
-			CompletionTokens json.Number `json:"completion_tokens"`
-		} `json:"usage"`
+		Usage *apiUsage `json:"usage"`
 	}
 	if err := json.Unmarshal(body, &top); err != nil || top.Usage == nil {
 		return 0, 0, false
 	}
-	p, _ := top.Usage.PromptTokens.Int64()
-	c, _ := top.Usage.CompletionTokens.Int64()
+	p, c := top.Usage.counts()
 	return p, c, true
 }
 
-// parseStreamUsage accumulates the usage object across an SSE stream. It scans
-// every "data: ..." line, decodes the JSON payload, and returns the sum of any
-// usage objects plus whether at least one usage chunk was present. A stream
-// that ends without a usage chunk returns (0, 0, false) — unmetered. The
-// standard OpenAI stream carries the final usage in its last data chunk
-// (forced on by shapeRequest's include_usage); the "[DONE]" sentinel is not
-// JSON and is skipped.
+// parseStreamUsage reads the usage from an SSE stream in any of the three APIs.
+// It returns (0, 0, false) for a stream with no usage at all (unmetered). The
+// "[DONE]" sentinel and non-JSON payloads are skipped.
+//
+//   - Chat completions: a top-level usage object, in the final chunk only
+//     (forced on by shapeRequest's include_usage). Usage chunks are summed, as
+//     before.
+//   - Anthropic Messages: message_start carries message.usage (the input, and
+//     a starting output count); each message_delta carries a CUMULATIVE usage.
+//     The last value of each count is the total, so they are not summed (a sum
+//     would count the output twice).
+//   - OpenAI Responses: response.completed (or response.incomplete or
+//     response.failed) carries the final response.usage.
 func parseStreamUsage(raw []byte) (prompt, completion int64, ok bool) {
-	seen := false
+	var chatP, chatC int64
+	var msgP, msgC, respP, respC int64
+	chatSeen, msgSeen, respSeen := false, false, false
 	for line := range bytes.SplitSeq(raw, []byte("\n")) {
 		line = bytes.TrimSpace(line)
 		if !bytes.HasPrefix(line, []byte("data:")) {
@@ -44,24 +77,42 @@ func parseStreamUsage(raw []byte) (prompt, completion int64, ok bool) {
 			continue
 		}
 		var chunk struct {
-			Usage *struct {
-				PromptTokens     json.Number `json:"prompt_tokens"`
-				CompletionTokens json.Number `json:"completion_tokens"`
-			} `json:"usage"`
+			Type    string    `json:"type"`
+			Usage   *apiUsage `json:"usage"`
+			Message *struct {
+				Usage *apiUsage `json:"usage"`
+			} `json:"message"`
+			Response *struct {
+				Usage *apiUsage `json:"usage"`
+			} `json:"response"`
 		}
 		if err := json.Unmarshal(payload, &chunk); err != nil {
 			continue
 		}
-		if chunk.Usage == nil {
-			continue
+		switch chunk.Type {
+		case "message_start":
+			if chunk.Message != nil && chunk.Message.Usage != nil {
+				p, c := chunk.Message.Usage.counts()
+				msgP, msgC, msgSeen = max(msgP, p), max(msgC, c), true
+			}
+		case "message_delta":
+			if chunk.Usage != nil {
+				p, c := chunk.Usage.counts()
+				msgP, msgC, msgSeen = max(msgP, p), max(msgC, c), true
+			}
+		case "response.completed", "response.incomplete", "response.failed":
+			if chunk.Response != nil && chunk.Response.Usage != nil {
+				respP, respC = chunk.Response.Usage.counts()
+				respSeen = true
+			}
+		default:
+			if chunk.Usage != nil {
+				p, c := chunk.Usage.counts()
+				chatP, chatC, chatSeen = chatP+p, chatC+c, true
+			}
 		}
-		seen = true
-		p, _ := chunk.Usage.PromptTokens.Int64()
-		c, _ := chunk.Usage.CompletionTokens.Int64()
-		prompt += p
-		completion += c
 	}
-	return prompt, completion, seen
+	return chatP + msgP + respP, chatC + msgC + respC, chatSeen || msgSeen || respSeen
 }
 
 // streamRequested reports whether a raw top-level "stream" value asks for a

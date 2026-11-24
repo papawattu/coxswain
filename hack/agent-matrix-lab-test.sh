@@ -75,7 +75,7 @@ want "$T/o" "T4-PROBE model-key N/A no needle" "no needle is N/A"
 grep -Fq 'NEEDLE="$N1$N2"' "$PROBE" || fail "the probe must join the needle from two arguments"
 
 # ---- the lab script's functions ----------------------------------------
-# shellcheck source=hack/agent-matrix-lab.sh
+# shellcheck source=/dev/null  # the real script, sourced for its functions (AGENT_MATRIX_LIB)
 AGENT_MATRIX_LIB=1 source "$ROOT/hack/agent-matrix-lab.sh"
 cd "$ROOT"
 S=config/samples/loop-fix-failing-test.yaml

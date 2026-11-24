@@ -119,6 +119,22 @@ spec:
                     x-kubernetes-list-map-keys:
                     - name
                     x-kubernetes-list-type: map
+                  harness:
+                    description: |-
+                      harness selects an agent adapter by name (D147, docs/PLAN-AGENT-ADAPTERS.md),
+                      for example "pi", "opencode", "codex", "claude-code" or "hermes". The
+                      operator maps the name to an image it pins (--agent-harness name=image)
+                      and runs the adapter in that image, so a Loop can run only images the
+                      operator lists. Empty runs the reference runner (--runner-image). A name
+                      the operator does not list holds the Loop with no sandbox
+                      (RunnerAvailable=False, reason UnknownHarness). Set at most one of harness
+                      and image. Immutable: the sandbox's image is fixed for the Loop's life.
+                    maxLength: 40
+                    pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                    type: string
+                    x-kubernetes-validations:
+                    - message: harness is immutable
+                      rule: self == oldSelf
                   image:
                     description: |-
                       image is the agent container image (e.g. the reference conformance runner
@@ -169,6 +185,8 @@ spec:
                 - message: endpointSecretRef and modelEndpoint must be set together
                     (a Loop with a model Secret must also name the model endpoint)
                   rule: has(self.endpointSecretRef) == has(self.modelEndpoint)
+                - message: set at most one of harness and image
+                  rule: '!(has(self.harness) && has(self.image))'
               approval:
                 description: |-
                   approval is the user's plan-approval settings (PLAN-BETA B3; PLAN.md

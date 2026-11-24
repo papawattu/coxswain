@@ -756,11 +756,26 @@ type BudgetConfig struct {
 // caps, seccomp, read-only rootfs) and talks to the model over localhost.
 //
 // +kubebuilder:validation:XValidation:rule="has(self.endpointSecretRef) == has(self.modelEndpoint)",message="endpointSecretRef and modelEndpoint must be set together (a Loop with a model Secret must also name the model endpoint)"
+// +kubebuilder:validation:XValidation:rule="!(has(self.harness) && has(self.image))",message="set at most one of harness and image"
 type AgentConfig struct {
 	// image is the agent container image (e.g. the reference conformance runner
 	// or an adapter for an external agent). Required when agent is set.
 	// +optional
 	Image string `json:"image,omitempty"`
+
+	// harness selects an agent adapter by name (D147, docs/PLAN-AGENT-ADAPTERS.md),
+	// for example "pi", "opencode", "codex", "claude-code" or "hermes". The
+	// operator maps the name to an image it pins (--agent-harness name=image)
+	// and runs the adapter in that image, so a Loop can run only images the
+	// operator lists. Empty runs the reference runner (--runner-image). A name
+	// the operator does not list holds the Loop with no sandbox
+	// (RunnerAvailable=False, reason UnknownHarness). Set at most one of harness
+	// and image. Immutable: the sandbox's image is fixed for the Loop's life.
+	// +optional
+	// +kubebuilder:validation:MaxLength=40
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="harness is immutable"
+	Harness string `json:"harness,omitempty"`
 
 	// model is the model name/identifier the proxy uses when calling the endpoint.
 	// +optional

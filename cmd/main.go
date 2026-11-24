@@ -241,6 +241,13 @@ func main() {
 		"The image the operator runs as the runner (its entrypoint). When spec.agent.image is empty or equals this, "+
 			"the agent container runs the runner; any other image keeps the 'sleep infinity' stand-in. "+
 			"Default: empty (no Loop is run as the runner).")
+	// D147 (docs/PLAN-AGENT-ADAPTERS.md): the agent adapters a Loop may pick
+	// with spec.agent.harness, each pinned to an image.
+	agentHarnesses := newAgentHarnessFlag()
+	flag.Var(agentHarnesses, "agent-harness",
+		"An agent adapter a Loop may select with spec.agent.harness, as name=image[,memory=Q][,cpu=Q] (repeatable), "+
+			"e.g. --agent-harness pi=registry/agent-pi@sha256:…. Only listed images run the agent contract; "+
+			"a Loop naming an unlisted harness is held (RunnerAvailable=False, UnknownHarness).")
 	// S5a (B3): the DEFAULT image the verify Job's check-* containers run when
 	// a Loop declares acceptance checks without spec.verify.image. A Go image
 	// by default so `go build` / `go test` checks work out of the box.
@@ -524,6 +531,8 @@ func main() {
 			ClusterDomain:          clusterDomain,
 			WorkspaceGitImage:      workspaceGitImage,
 			RunnerImage:            runnerImage,
+			AgentHarnesses:         agentHarnesses.images,
+			AgentHarnessLimits:     agentHarnesses.limits,
 			VerifyImage:            verifyImage,
 			ToolProxyImage:         toolProxyImage,
 			EgressProxyImage:       egressProxyImage,

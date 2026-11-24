@@ -553,6 +553,17 @@ type LoopReconciler struct {
 	// Empty (most envtests) means no Loop is run as the runner: every agent
 	// keeps 'sleep infinity'.
 	RunnerImage string
+	// AgentHarnesses maps an agent-adapter name to the image the operator
+	// pins for it (D147, --agent-harness name=image). A Loop with
+	// spec.agent.harness set runs the adapter (/usr/local/bin/runner) in the
+	// mapped image; a name not in the map holds the Loop (UnknownHarness).
+	// Only images listed here run the contract: a Loop cannot name an
+	// arbitrary image to run as an agent.
+	AgentHarnesses map[string]string
+	// AgentHarnessLimits overrides the agent container's memory and CPU limits
+	// for a harness (--agent-harness name=image,memory=Q,cpu=Q). A harness
+	// not in it keeps the reference runner's limits.
+	AgentHarnessLimits map[string]corev1.ResourceList
 
 	// VerifyImage is the DEFAULT image the verify Job's check-* containers
 	// run when a Loop declares acceptance checks WITHOUT spec.verify.image
@@ -825,6 +836,10 @@ func (r *LoopReconciler) validateStep(ctx context.Context, loop *coxv1alpha1.Loo
 	// misconfiguration that would crash-loop the proxy; reject it early.
 	if r.modelConfigInvalid(ctx, loop) {
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, true
+	}
+	// D147: a harness the operator does not list holds the Loop (no sandbox).
+	if r.harnessUnknown(ctx, loop) {
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, true
 	}
 	// D76/D102: the Secret opt-in gate. Every Secret the Loop names must
 	// exist and carry coxswain.io/usable: "true" BEFORE any object that
@@ -2057,7 +2072,62 @@ func dedupToolsBySpec(tools []coxv1alpha1.ToolSpec) []coxv1alpha1.ToolSpec {
 // reports it on the Loop), so the condition cannot drift from what the pod
 // actually runs (F56).
 func runnerRuns(r *LoopReconciler, loop *coxv1alpha1.Loop) bool {
+	if h := loop.Spec.Agent.Harness; h != "" {
+		// D147: an agent adapter runs only in an image the operator pins.
+		return r.AgentHarnesses[h] != ""
+	}
 	return r.RunnerImage != "" && (loop.Spec.Agent.Image == "" || loop.Spec.Agent.Image == r.RunnerImage)
+}
+
+// harnessImage is the image the operator pins for the Loop's harness, or ""
+// when the Loop names no harness or one the operator does not list.
+func harnessImage(r *LoopReconciler, loop *coxv1alpha1.Loop) string {
+	if h := loop.Spec.Agent.Harness; h != "" {
+		return r.AgentHarnesses[h]
+	}
+	return ""
+}
+
+// HarnessUnknownEventReason is the Warning Event reason for a Loop held
+// because spec.agent.harness names no harness the operator lists (D147).
+const HarnessUnknownEventReason = "UnknownHarness"
+
+// harnessNames lists the operator's harness names, sorted, for messages.
+func harnessNames(m map[string]string) string {
+	names := make([]string, 0, len(m))
+	for k := range m {
+		names = append(names, k)
+	}
+	slices.Sort(names)
+	if len(names) == 0 {
+		return "none"
+	}
+	return strings.Join(names, ", ")
+}
+
+// harnessUnknown (D147) holds a Loop whose spec.agent.harness the operator
+// does not list: no sandbox (it would otherwise run the 'sleep infinity'
+// stand-in and look Running), RunnerAvailable=False/UnknownHarness, and one
+// Warning Event on the transition (R26 I90: a fallback surfaces before it
+// degrades — here there is no fallback, the Loop waits). It returns true
+// while held; the caller requeues, so an operator restarted with the harness
+// listed releases the Loop.
+func (r *LoopReconciler) harnessUnknown(ctx context.Context, loop *coxv1alpha1.Loop) bool {
+	h := loop.Spec.Agent.Harness
+	if h == "" || r.AgentHarnesses[h] != "" {
+		return false
+	}
+	was := conditionFalse(loop, coxv1alpha1.RunnerAvailableCondition, HarnessUnknownEventReason)
+	msg := fmt.Sprintf("spec.agent.harness %q is not one of the operator's harnesses (%s): the Loop is held with no sandbox; "+
+		"list it with --agent-harness %s=<image>, or recreate the Loop with a listed harness", h, harnessNames(r.AgentHarnesses), h)
+	setCondition(loop, coxv1alpha1.RunnerAvailableCondition, metav1.ConditionFalse, HarnessUnknownEventReason, msg)
+	if err := r.Status().Update(ctx, loop); err != nil {
+		return true // still held; the requeue retries the write
+	}
+	if !was && r.Recorder != nil {
+		r.Recorder.Eventf(loop, corev1.EventTypeWarning, HarnessUnknownEventReason, "%s", msg)
+	}
+	return true
 }
 
 // RunnerUnavailableEventReason is the Warning Event reason for a sandbox that
@@ -2080,6 +2150,13 @@ func (r *LoopReconciler) surfaceRunnerAvailable(loop *coxv1alpha1.Loop) {
 		return
 	}
 	switch {
+	case loop.Spec.Agent.Harness != "" && harnessImage(r, loop) == "":
+		// Held by harnessUnknown (validateStep), which owns the condition and
+		// its Event; nothing to add here.
+		return
+	case loop.Spec.Agent.Harness != "":
+		setCondition(loop, coxv1alpha1.RunnerAvailableCondition, metav1.ConditionTrue, "HarnessImageSet",
+			"the sandbox runs the "+loop.Spec.Agent.Harness+" agent adapter in the operator's image ("+harnessImage(r, loop)+")")
 	case runnerRuns(r, loop):
 		setCondition(loop, coxv1alpha1.RunnerAvailableCondition, metav1.ConditionTrue, "RunnerImageSet",
 			"the sandbox runs the operator's runner image ("+r.RunnerImage+"), so the agent executes the runner")
@@ -2143,8 +2220,13 @@ func agentPodSpec(ctx context.Context, r *LoopReconciler, loop *coxv1alpha1.Loop
 	isRunner := runnerRuns(r, loop)
 	// When spec.agent.image is empty and isRunner, the agent image is the
 	// runner (not the generic sandbox default) so /usr/local/bin/runner exists.
+	// D147: a harness Loop runs the image the operator pins for the harness
+	// (an adapter image carries /usr/local/bin/runner too).
 	if isRunner && loop.Spec.Agent.Image == "" {
 		agentImage = r.RunnerImage
+		if hi := harnessImage(r, loop); hi != "" {
+			agentImage = hi
+		}
 	}
 	agentCommand := []string{"sh", "-c", "sleep infinity"}
 	if isRunner {
@@ -2267,6 +2349,16 @@ func agentPodSpec(ctx context.Context, r *LoopReconciler, loop *coxv1alpha1.Loop
 		corev1.ResourceCPU:              resource.MustParse("500m"),
 		corev1.ResourceMemory:           resource.MustParse("512Mi"),
 		corev1.ResourceEphemeralStorage: *agentEphemeral,
+	}
+	// D147: a harness may need more than the reference runner (a Node or
+	// Python CLI plus the repo's own build); the operator sets that per
+	// harness. Only memory and CPU are overridable.
+	if h := loop.Spec.Agent.Harness; h != "" && isRunner {
+		for _, res := range []corev1.ResourceName{corev1.ResourceMemory, corev1.ResourceCPU} {
+			if q, ok := r.AgentHarnessLimits[h][res]; ok {
+				agentLimits[res] = q
+			}
+		}
 	}
 	// R59 I274 / D143(a): in the Planning phase the agent mounts the
 	// workspace READ-ONLY (the kubelet enforces it; a `git commit` or an

@@ -19,6 +19,7 @@ import (
 
 	"github.com/papawattu/coxswain/internal/controller"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -92,12 +93,15 @@ func TestNewLoopReconcilerWiresFlagDerivedOptions(t *testing.T) {
 		ClusterDomain:          "cluster.local",
 		WorkspaceGitImage:      "git:pin",
 		RunnerImage:            "runner:tag",
-		VerifyImage:            "go:pin",
-		ToolProxyImage:         "tp:tag",
-		EgressProxyImage:       "ep:tag",
-		ProxyImage:             "proxy:tag",
-		OperatorNamespace:      "coxswain-system",
-		LoopNodeSelector:       map[string]string{"pool": "loops", "zone": "a"},
+		AgentHarnesses:         map[string]string{"pi": "pi:pin"},
+		AgentHarnessLimits: map[string]corev1.ResourceList{"pi": {
+			corev1.ResourceMemory: resource.MustParse("2Gi")}},
+		VerifyImage:       "go:pin",
+		ToolProxyImage:    "tp:tag",
+		EgressProxyImage:  "ep:tag",
+		ProxyImage:        "proxy:tag",
+		OperatorNamespace: "coxswain-system",
+		LoopNodeSelector:  map[string]string{"pool": "loops", "zone": "a"},
 		LoopTolerations: []corev1.Toleration{{
 			Key: "pool", Operator: corev1.TolerationOpEqual,
 			Value: "loops", Effect: corev1.TaintEffectNoSchedule,
@@ -129,6 +133,10 @@ func TestNewLoopReconcilerWiresFlagDerivedOptions(t *testing.T) {
 		t.Errorf("WorkspaceGitImage not wired: %q", r.WorkspaceGitImage)
 	case r.RunnerImage != "runner:tag":
 		t.Errorf("RunnerImage not wired: %q", r.RunnerImage)
+	case r.AgentHarnesses["pi"] != "pi:pin":
+		t.Errorf("AgentHarnesses not wired: %v", r.AgentHarnesses)
+	case func() string { q := r.AgentHarnessLimits["pi"][corev1.ResourceMemory]; return q.String() }() != "2Gi":
+		t.Errorf("AgentHarnessLimits not wired: %v", r.AgentHarnessLimits)
 	case r.VerifyImage != "go:pin":
 		t.Errorf("VerifyImage not wired: %q", r.VerifyImage)
 	case r.ToolProxyImage != "tp:tag":

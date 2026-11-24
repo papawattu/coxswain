@@ -1,0 +1,226 @@
+{
+    "apiVersion": "coxswain.wattu.com/v1alpha1",
+    "kind": "Loop",
+    "metadata": {
+        "annotations": {
+            "kubectl.kubernetes.io/last-applied-configuration": "{\"apiVersion\":\"coxswain.wattu.com/v1alpha1\",\"kind\":\"Loop\",\"metadata\":{\"annotations\":{},\"name\":\"r6-opencode\",\"namespace\":\"samples\"},\"spec\":{\"agent\":{\"endpointSecretRef\":\"r6-model\",\"harness\":\"opencode\",\"model\":\"qwen3.8-27b\",\"modelEndpoint\":\"192.168.1.20:8000\"},\"delivery\":{\"draft\":false,\"mode\":\"PullRequest\"},\"goal\":\"When you finish implementing, end your final answer with one line that starts with LESSON: and states one short lesson about this repository. Then: Fix Round in round.go so it rounds half away from zero. The test suite (round_test.go) is currently red and is a protected path: do not change or weaken any test file. Make `go test ./...` pass on the tests as written.\",\"loop\":{\"maxIterations\":3},\"verify\":{\"acceptanceChecks\":[\"go build -o /tmp/gocli ./...\",\"go vet ./...\",\"go test ./...\"],\"image\":\"docker.io/library/golang:1.26\",\"judge\":{\"enabled\":true,\"maxTokens\":1024},\"preset\":\"go\",\"protectedPaths\":[\"round_test.go\",\"main_test.go\"]},\"workspace\":{\"gitCredentialSecret\":\"samples-git-cred\",\"ref\":\"initial\",\"repo\":\"http://gitea.samples.svc:3000/samples/gocli.git\"}}}\n"
+        },
+        "creationTimestamp": "2026-11-24T00:20:47Z",
+        "finalizers": [
+            "coxswain.wattu.com/checkpoints"
+        ],
+        "generation": 1,
+        "name": "r6-opencode",
+        "namespace": "samples",
+        "resourceVersion": "5599084",
+        "uid": "5cec95d4-2b9c-4b99-94db-4dca7071ef82"
+    },
+    "spec": {
+        "agent": {
+            "endpointSecretRef": "r6-model",
+            "harness": "opencode",
+            "model": "qwen3.8-27b",
+            "modelEndpoint": "192.168.1.20:8000"
+        },
+        "checkpoints": "BestEffort",
+        "delivery": {
+            "branchPrefix": "coxswain/",
+            "draft": false,
+            "mode": "PullRequest"
+        },
+        "goal": "When you finish implementing, end your final answer with one line that starts with LESSON: and states one short lesson about this repository. Then: Fix Round in round.go so it rounds half away from zero. The test suite (round_test.go) is currently red and is a protected path: do not change or weaken any test file. Make `go test ./...` pass on the tests as written.",
+        "loop": {
+            "maxIterations": 3,
+            "stallAction": "Fail"
+        },
+        "verify": {
+            "acceptanceChecks": [
+                "go build -o /tmp/gocli ./...",
+                "go vet ./...",
+                "go test ./..."
+            ],
+            "image": "docker.io/library/golang:1.26",
+            "judge": {
+                "enabled": true,
+                "maxTokens": 1024
+            },
+            "onVerifyFail": "Implement",
+            "preset": "go",
+            "protectedPaths": [
+                "round_test.go",
+                "main_test.go"
+            ]
+        },
+        "workspace": {
+            "gitCredentialSecret": "samples-git-cred",
+            "ref": "initial",
+            "repo": "http://gitea.samples.svc:3000/samples/gocli.git"
+        }
+    },
+    "status": {
+        "baseCommit": "da9a0d3481d888d2bda0118445d030febcf5e836",
+        "budget": {
+            "activeSeconds": 246,
+            "completionTokens": 516,
+            "lastActiveStamp": "2026-11-24T00:24:55Z",
+            "lastBootID": "05a0a60d020f7d7e4670fdf319f23eeb",
+            "lastCompletionTokens": 757,
+            "lastPromptTokens": 82766,
+            "lastRequests": 9,
+            "lastUsageReadAt": "2026-11-24T00:24:55Z",
+            "promptTokens": 54616,
+            "requests": 6
+        },
+        "conditions": [
+            {
+                "lastTransitionTime": "2026-11-24T00:20:48Z",
+                "message": "the sandbox runs the opencode agent adapter in the operator's image (local/coxswain/agent-opencode:c6-61ed6ff)",
+                "reason": "HarnessImageSet",
+                "status": "True",
+                "type": "RunnerAvailable"
+            },
+            {
+                "lastTransitionTime": "2026-11-24T00:20:48Z",
+                "message": "all 2 Secret(s) the Loop names are opted in (label coxswain.io/usable=true)",
+                "reason": "OptedIn",
+                "status": "True",
+                "type": "SecretsUsable"
+            },
+            {
+                "lastTransitionTime": "2026-11-24T00:20:48Z",
+                "message": "every host:PORT allow's port is carried by the egress proxy or the model proxy's NetworkPolicy; the KubeArmor translation matches the host",
+                "reason": "NoPortLoss",
+                "status": "False",
+                "type": "PolicyTranslationLossy"
+            },
+            {
+                "lastTransitionTime": "2026-11-24T00:20:49Z",
+                "message": "the eBPF engine is enforcing the Loop's effective policy",
+                "reason": "Enforcing",
+                "status": "True",
+                "type": "PolicyEnforced"
+            },
+            {
+                "lastTransitionTime": "2026-11-24T00:20:48Z",
+                "message": "every target was BLOCKED by the NetworkPolicy (pod -\u003e host-network egress is policed)",
+                "reason": "CNIEnforced",
+                "status": "True",
+                "type": "NetworkEnforced"
+            },
+            {
+                "lastTransitionTime": "2026-11-24T00:21:00Z",
+                "message": "the model proxy pod is Ready; the sandbox is not held for it",
+                "reason": "Ready",
+                "status": "False",
+                "type": "ModelProxyNotReady"
+            },
+            {
+                "lastTransitionTime": "2026-11-24T00:20:48Z",
+                "message": "no VolumeSnapshotClass exists for the workspace PVC's CSI driver rancher.io/local-path (spec.checkpoints=BestEffort: the Loop carries on with the A2 PVC-resume)",
+                "reason": "NoSnapshotClassForDriver",
+                "status": "False",
+                "type": "CheckpointsAvailable"
+            },
+            {
+                "lastTransitionTime": "2026-11-24T00:20:48Z",
+                "message": "no foreign proxy pod detected",
+                "reason": "NoConflict",
+                "status": "False",
+                "type": "ProxyConflict"
+            },
+            {
+                "lastTransitionTime": "2026-11-24T00:24:52Z",
+                "message": "3 action(s) blocked; latest target HOPOPT at 2026-11-24T00:21:47Z; 4928 audit alert(s) in this operator could not be attributed to any Loop",
+                "reason": "BlocksObserved",
+                "status": "True",
+                "type": "PolicyBlocked"
+            },
+            {
+                "lastTransitionTime": "2026-11-24T00:21:36Z",
+                "message": "model backend reachable",
+                "reason": "Recovered",
+                "status": "True",
+                "type": "ModelAvailable"
+            },
+            {
+                "lastTransitionTime": "2026-11-24T00:23:27Z",
+                "message": "no subversion pattern in the diff",
+                "reason": "NoSubversionPattern",
+                "status": "False",
+                "type": "VerifySuspicious"
+            },
+            {
+                "lastTransitionTime": "2026-11-24T00:24:52Z",
+                "message": "verify passed and the Loop is Succeeded (delivery: Delivered)",
+                "reason": "Delivered",
+                "status": "False",
+                "type": "Verifying"
+            },
+            {
+                "lastTransitionTime": "2026-11-24T00:24:34Z",
+                "message": "judge verdict recorded (advisory, ADR-0011): verdict false, score 0",
+                "reason": "Judged",
+                "status": "False",
+                "type": "JudgeVerdict"
+            },
+            {
+                "lastTransitionTime": "2026-11-24T00:24:52Z",
+                "message": "delivered a29592c6f7ed7c5064bce35c22eed9f50222b167 to branch coxswain/r6-opencode-5cec95d4; PR 24 open",
+                "reason": "Delivered",
+                "status": "True",
+                "type": "Delivered"
+            },
+            {
+                "lastTransitionTime": "2026-11-24T00:24:53Z",
+                "message": "lessons withheld: the Judge's verdict is false (D140)",
+                "reason": "LessonsWithheld",
+                "status": "True",
+                "type": "MemoryWriteDone"
+            }
+        ],
+        "currentVerify": {
+            "verifiedCommit": "a29592c6f7ed7c5064bce35c22eed9f50222b167"
+        },
+        "delivery": {
+            "branch": "coxswain/r6-opencode-5cec95d4",
+            "commit": "a29592c6f7ed7c5064bce35c22eed9f50222b167",
+            "prNumber": 24,
+            "prURL": "http://gitea.samples.svc:3000/samples/gocli/pulls/24"
+        },
+        "desiredPhase": "Succeeded",
+        "iteration": 0,
+        "judge": {
+            "at": "2026-11-24T00:24:34Z",
+            "reason": "The agent failed to include the required 'LESSON:' line in its final answer as explicitly mandated by the goal.",
+            "verdict": false
+        },
+        "judgeSummary": "False",
+        "observedGeneration": 1,
+        "observedPhase": "Implementing",
+        "phase": "Succeeded",
+        "planAttempt": 0,
+        "policy": {
+            "blockedCount": 3,
+            "kaptSpecHash": "9b79742abecbf8193fd27095ade0861fa7bfd5ac88d9195880670d8057476ebd"
+        },
+        "progress": {
+            "baseCommit": "da9a0d3481d888d2bda0118445d030febcf5e836",
+            "lastActivityTime": "2026-11-24T00:23:09Z",
+            "lastResultStatus": "success",
+            "lessonsAvailable": true,
+            "observedGeneration": 1,
+            "phase": "Implementing"
+        },
+        "verify": {
+            "iteration": 0,
+            "lastCheckResults": [
+                0,
+                0,
+                0
+            ],
+            "tamperExitCode": 0,
+            "tamperJobUID": "e2f7d028-952b-4587-9b88-85b0da27cbab",
+            "verifiedCommit": "a29592c6f7ed7c5064bce35c22eed9f50222b167"
+        }
+    }
+}

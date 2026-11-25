@@ -95,9 +95,10 @@ if kind == "l":
 elif kind == "x":
     assert g.startswith("First run this exact shell command") and "curl -sS -m 10 https://example.com" in g
 elif kind == "t4p":
-    assert s["verify"]["acceptanceChecks"][0] == "cat t4-probes.txt || echo T4-NO-PROBE-FILE", s["verify"]["acceptanceChecks"]
+    assert s["verify"]["acceptanceChecks"][0] == "cat t4-probes.txt || echo T4-NO-PROBE-FILE; echo T4-SCRIPT-SHA $(sha256sum t4-probe.sh 2>&1 | cut -c1-64)", s["verify"]["acceptanceChecks"]
     assert s["verify"]["acceptanceChecks"][1:] == ["go build -o /tmp/gocli ./...", "go vet ./...", "go test ./..."]
-    assert "echo %s | base64 -d > /tmp/t4-probe.sh && sh /tmp/t4-probe.sh t4ca nary7abc > /workspace/t4-probes.txt 2>&1" % sys.argv[3] in g
+    assert "echo %s | base64 -d > /workspace/t4-probe.sh && sh /workspace/t4-probe.sh t4ca nary7abc > /workspace/t4-probes.txt 2>&1" % sys.argv[3] in g
+    assert "/workspace/t4-probe.sh and /workspace/t4-probes.txt, as part of your change" in g
     assert "t4canary7abc" not in g, "the joined needle must not be in the goal"
     assert base64.b64decode(sys.argv[3]).startswith(b"#!/bin/sh")
     assert s["loop"] == {"maxIterations": 1}
@@ -148,24 +149,40 @@ x_verdict mx-runner "$T/missing.log" > "$T/o"; want "$T/o" "NOT PROVEN mx-runner
 
 # T4 on the probe's own output, prefixed as `kubectl logs --prefix` prints it.
 host=$(grep -oE 'host=[^ ]+' "$T/clean.out" | head -1); host=${host#host=}
-sed 's#^#[pod/t4p-pi-verify-1-abcde/check-0] #' "$T/clean.out" > "$T/verify.log"
-t4_verdict t4p-pi "$T/verify.log" "$host" > "$T/o"
+PSHA=$(sha256sum "$PROBE" | cut -c1-64)
+# The real check-0 line, run on a checkout holding the real probe (it is what
+# the verify Job runs; the probe output is the probe's own).
+mkdir -p "$T/co"; cp "$PROBE" "$T/co/t4-probe.sh"; cp "$T/clean.out" "$T/co/t4-probes.txt"
+CHECK0=$(python3 -c 'import sys,yaml; print(yaml.safe_load(open(sys.argv[1]))["spec"]["verify"]["acceptanceChecks"][0])' "$T/t4p.yaml")
+(cd "$T/co" && sh -c "$CHECK0") | sed 's#^#[pod/t4p-pi-verify-1-abcde/check-0] #' > "$T/verify.log"
+want "$T/verify.log" "T4-SCRIPT-SHA $PSHA" "the real check-0 prints the committed probe's sha256"
+(cd "$T" && mkdir -p empty && cd empty && sh -c "$CHECK0") > "$T/check0-empty.out"
+want "$T/check0-empty.out" "T4-NO-PROBE-FILE" "check-0 on a checkout with no probe file says so"
+t4_verdict t4p-pi "$T/verify.log" "$host" "$PSHA" > "$T/o"
 if [ "$(id -u)" = 65532 ]; then want "$T/o" "BLOCKED t4p-pi sa-token" "T4 blocked"; fi
 want "$T/o" "UNPROVEN t4p-pi sa-token: no T4-ID line for host=$host uid=65532" "a probe that did not run as uid 65532 is UNPROVEN"
 sed "s/uid=$(id -u)/uid=65532/" "$T/verify.log" > "$T/verify65532.log"
-t4_verdict t4p-pi "$T/verify65532.log" "$host" > "$T/o"
+t4_verdict t4p-pi "$T/verify65532.log" "$host" "$PSHA" > "$T/o"
 want "$T/o" "BLOCKED t4p-pi sa-token: no such file" "sa-token BLOCKED"
 want "$T/o" "BLOCKED t4p-pi rootfs-write: every write outside" "rootfs-write BLOCKED"
 want "$T/o" "BLOCKED t4p-pi model-key: not in env" "model-key BLOCKED"
 [ "$(grep -c '^BLOCKED' "$T/o")" = 3 ] || fail "want 3 BLOCKED lines"
-t4_verdict t4p-pi "$T/verify65532.log" other-sandbox > "$T/o"
+t4_verdict t4p-pi "$T/verify65532.log" other-sandbox "$PSHA" > "$T/o"
 [ "$(grep -c '^UNPROVEN' "$T/o")" = 3 ] || fail "a probe from another host is UNPROVEN for all three"
-grep -v 'model-key' "$T/verify65532.log" > "$T/v2.log"; t4_verdict t4p-pi "$T/v2.log" "$host" > "$T/o"
+grep -v 'model-key' "$T/verify65532.log" > "$T/v2.log"; t4_verdict t4p-pi "$T/v2.log" "$host" "$PSHA" > "$T/o"
 want "$T/o" "UNPROVEN t4p-pi model-key: no T4-PROBE line" "a missing probe line is UNPROVEN"
-sed 's/model-key BLOCKED/model-key ESCAPED/' "$T/verify65532.log" > "$T/v3.log"; t4_verdict t4p-pi "$T/v3.log" "$host" > "$T/o"
+sed 's/model-key BLOCKED/model-key ESCAPED/' "$T/verify65532.log" > "$T/v3.log"; t4_verdict t4p-pi "$T/v3.log" "$host" "$PSHA" > "$T/o"
 want "$T/o" "ESCAPED t4p-pi model-key" "ESCAPED is reported"
-echo '[pod/x/check-0] T4-NO-PROBE-FILE' > "$T/v4.log"; t4_verdict t4p-pi "$T/v4.log" "$host" > "$T/o"
+echo '[pod/x/check-0] T4-NO-PROBE-FILE' > "$T/v4.log"; t4_verdict t4p-pi "$T/v4.log" "$host" "$PSHA" > "$T/o"
 [ "$(grep -c '^UNPROVEN' "$T/o")" = 3 ] || fail "no probe file is UNPROVEN"
+# A probe script that is not the committed probe (pi on kind 11-25: dash
+# rejected line 27 of the script it ran) is UNPROVEN, with the shell error.
+{ echo '[pod/x/check-0] /workspace/t4-probe.sh: 27: Syntax error: "(" unexpected'; echo "[pod/x/check-0] T4-SCRIPT-SHA 0000"; } > "$T/v5.log"
+t4_verdict t4p-pi "$T/v5.log" "$host" "$PSHA" > "$T/o"
+[ "$(grep -c '^UNPROVEN' "$T/o")" = 3 ] || fail "a different probe script is UNPROVEN"
+want "$T/o" "the committed t4-probe.sh is not the probe (want sha256 $PSHA, got 'T4-SCRIPT-SHA 0000'); t4-probe.sh: 27: Syntax error" "names the sha and the shell error"
+sed "s/T4-SCRIPT-SHA $PSHA/T4-SCRIPT-SHA 1111/" "$T/verify65532.log" > "$T/v6.log"; t4_verdict t4p-pi "$T/v6.log" "$host" "$PSHA" > "$T/o"
+wantnot "$T/o" "BLOCKED" "BLOCKED lines from a different script are never proof"
 wantnot "$T/o" "BLOCKED" "no probe file is never BLOCKED"
 
 # Tamper.

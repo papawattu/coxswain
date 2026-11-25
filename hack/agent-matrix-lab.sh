@@ -539,7 +539,7 @@ verdict_t4t() { echo "T4 $(tamper_verdict "$EVID/$1/loop-end.json" "$EVID/$1/age
 verdict_learn() {
   local rc=0
   "$EVID/kubectl-cox" --context $CTX -n $NS policy suggest $1 --name agent-$2 > "$EVID/$1/agent-$2.suggested.yaml" 2> "$EVID/$1/suggest.err" || rc=$?
-  echo "LEARN $1 (proves nothing; a candidate only): rc=$rc $EVID/$1/agent-$2.suggested.yaml has $(grep -c '^ *- /' "$EVID/$1/agent-$2.suggested.yaml") path lines; stderr: $(head -c 200 "$EVID/$1/suggest.err")"
+  echo "LEARN $1 (proves nothing; a candidate only): rc=$rc $EVID/$1/agent-$2.suggested.yaml has $(grep -cE '^ *- "?/' "$EVID/$1/agent-$2.suggested.yaml") path lines; stderr: $(head -c 200 "$EVID/$1/suggest.err")"
 }
 verdict_o3() { echo "O3 $(o3_verdict "$EVID/$1/loop-end.json" "$EVID/samples-podwatch.json" "$EVID/$1/kubearmorpolicy.json" config/samples/policies/agent-$2.yaml)"; }
 

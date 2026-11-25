@@ -4419,15 +4419,20 @@ func (r *LoopReconciler) verifyProxyHost(loop *coxv1alpha1.Loop) string {
 	return host
 }
 
-func (r *LoopReconciler) ensureEgressProxy(ctx context.Context, loop *coxv1alpha1.Loop) error {
-	log := logf.FromContext(ctx)
-	// One read of the referenced AgentPolicies for the whole path (P3: no
-	// second union that swallows Get errors). Fails closed: a transient error
-	// propagates and the reconcile requeues; it must not be treated as
-	// "no allows".
+// egressProxyAllows is the egress proxy's SNI allowlist and whether the proxy
+// exists at all: the AgentPolicy network allows plus the external-repo hosts
+// of the workspace-init clone, the verify clone-base and the deliver push.
+// ensureEgressProxy creates the proxy from it and ensureNetworkPolicy fences
+// that proxy from it, so the two can never disagree (homelab run 2026-11-25:
+// the netpol used to follow the AgentPolicy allows only, so an external-repo
+// Loop with no allows got an egress proxy with NO NetworkPolicy). One read of the referenced
+// AgentPolicies for the whole path (P3: no second union that swallows Get
+// errors). Fails closed: a transient error propagates and the reconcile
+// requeues; it must not be treated as "no allows".
+func (r *LoopReconciler) egressProxyAllows(ctx context.Context, loop *coxv1alpha1.Loop) ([]string, bool, error) {
 	networkAllows, hasAllows, err := r.effectivePolicyNetwork(ctx, loop)
 	if err != nil {
-		return fmt.Errorf("resolve egress proxy network allows for %s/%s: %w", loop.Namespace, loop.Name, err)
+		return nil, false, fmt.Errorf("resolve egress proxy network allows for %s/%s: %w", loop.Namespace, loop.Name, err)
 	}
 	// S6: the workspace init container's first clone of an EXTERNAL repo
 	// (github.com, ...) also traverses the proxy, so the repo host joins the
@@ -4477,6 +4482,23 @@ func (r *LoopReconciler) ensureEgressProxy(ctx context.Context, loop *coxv1alpha
 		uniqueAllows = append(uniqueAllows, h)
 	}
 	networkAllows = uniqueAllows
+	return networkAllows, hasAllows, nil
+}
+
+// egressProxyExpected reports whether the Loop has (or is about to have) an
+// egress proxy, so ensureNetworkPolicy fences it. A read error counts as
+// expected: fail closed, keep the proxy's NetworkPolicy.
+func (r *LoopReconciler) egressProxyExpected(ctx context.Context, loop *coxv1alpha1.Loop) bool {
+	_, created, err := r.egressProxyAllows(ctx, loop)
+	return err != nil || created
+}
+
+func (r *LoopReconciler) ensureEgressProxy(ctx context.Context, loop *coxv1alpha1.Loop) error {
+	log := logf.FromContext(ctx)
+	networkAllows, hasAllows, err := r.egressProxyAllows(ctx, loop)
+	if err != nil {
+		return err
+	}
 	if !hasAllows {
 		// No network allows: no egress proxy needed. Clean up if one exists.
 		// P3: clear a stale EgressProxyConflict here too — if a foreign pod once
@@ -5509,12 +5531,16 @@ func (r *LoopReconciler) ensureNetworkPolicy(ctx context.Context, loop *coxv1alp
 		}
 	}
 
-	// I42c: the egress proxy NetworkPolicy is created only when the egress
-	// proxy is expected (network allows present). Ingress: only from this
-	// Loop's agent on 3128. Egress: the external world with carve-outs (the
-	// proxy dials any port the allow specifies; the application layer enforces
-	// the port) + DNS to kube-dns.
-	if egressExpected {
+	// I42c: the egress proxy NetworkPolicy exists whenever the egress
+	// proxy does (egressProxyAllows, the same union ensureEgressProxy creates
+	// the proxy from: AgentPolicy allows OR an external-repo clone/verify/
+	// deliver host). A read error fails closed: the netpol is kept (a policy
+	// for a pod that is not there is harmless; a proxy with no policy is
+	// unfenced). Ingress: only from this Loop's agent and Job pods on 3128.
+	// Egress: the external world with carve-outs (the proxy dials any port the
+	// allow specifies; the application layer enforces the port) + DNS.
+	egressProxyFenced := r.egressProxyExpected(ctx, loop)
+	if egressProxyFenced {
 		egressProxyNP := &networkingv1.NetworkPolicy{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      loopName + "-egress-proxy-netpol",
@@ -5579,11 +5605,10 @@ func (r *LoopReconciler) ensureNetworkPolicy(ctx context.Context, loop *coxv1alp
 	}
 
 	// I42c: clean up the egress proxy NetworkPolicy when the egress proxy is
-	// no longer expected (the network allows went away). (The egress proxy
-	// netpol is created only when egressExpected, above; cleanup runs in the
-	// ELSE branch — a call inside the if-block would delete the netpol just
-	// created.)
-	if !egressExpected {
+	// no longer expected. (The egress proxy netpol is created only when
+	// egressProxyFenced, above; cleanup runs in the ELSE branch — a call
+	// inside the if-block would delete the netpol just created.)
+	if !egressProxyFenced {
 		if merr := r.cleanupEgressProxyNetpol(ctx, loop); merr != nil {
 			return merr
 		}

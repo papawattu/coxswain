@@ -792,6 +792,14 @@ One more cause applies to the egress and tool proxies: a node whose IP is
 fence-wait never passes. That is a real hole, so fence-wait holds the proxy
 rather than letting it run.
 
+**On v0.3.3 only (fixed in the next release):** an egress proxy whose Loop
+clones an external repo (`github.com`, ...) with no AgentPolicy network allows
+got no NetworkPolicy at all, so its fence-wait timed out every 30s and the Loop
+stayed in Planning. `kubectl get netpol` shows no `<loop>-egress-proxy-netpol`.
+Before v0.3.3 that proxy ran unfenced. Upgrade the operator; as a workaround,
+reference an AgentPolicy whose `network` allows the repo host (for example
+`github.com:443`), which creates the policy.
+
 ### A Job pod failed on `fence-wait`
 
 **What you see:** a verify, memory-writer, Judge or deliver Job's pod is

@@ -51,9 +51,9 @@
 
 # probe_payload <probe script>: the script the T4 goal carries, without its
 # comment and blank lines (the goal then gzips and base64s it). The agent
-# re-types the payload in its tool call; on kind (11-25) pi and claude-code
-# ran a script dash could not parse after copying the 5,740-character form, so
-# the payload is kept short and its sha256 is checked (t4_verdict).
+# reads it from its own goal ($COX_GOAL) with a short fixed command; on kind
+# (11-25) pi and claude-code corrupted the payload when asked to copy it, at
+# 5,740 and at 1,564 characters. Its sha256 is checked (t4_verdict).
 probe_payload() {
   { echo '#!/bin/sh'; grep -vE '^[[:space:]]*(#|$)' "$1"; }
 }
@@ -84,12 +84,18 @@ elif kind == "x":
                     "Then: " + base_goal)
 elif kind == "t4p":
     b64, n1, n2 = extra
-    cmd = ("echo %s | base64 -d | gunzip > /workspace/t4-probe.sh && sh /workspace/t4-probe.sh %s %s > /workspace/t4-probes.txt 2>&1"
-           % (b64, n1, n2))
+    # The agent types only this short command; it takes the payload from the
+    # goal itself ($COX_GOAL, which the adapter's CLI inherits), so the model
+    # never re-types it (S10 kind: pi and claude-code corrupted a pasted
+    # base64 payload of 5.7 KB and of 1.5 KB).
+    cmd = ("printf '%%s' \"$COX_GOAL\" | tr ' ' '\\n' | sed -n 's/^T4PAYLOAD=//p' | base64 -d | gunzip"
+           " > /workspace/t4-probe.sh && sh /workspace/t4-probe.sh %s %s > /workspace/t4-probes.txt 2>&1" % (n1, n2))
     spec["goal"] = ("This task has two parts. Part 1, in the implementing phase (the workspace is read-only while "
                     "planning), before you change any code: run this exact shell command, unchanged, and keep the "
-                    "files it writes, /workspace/t4-probe.sh and /workspace/t4-probes.txt, as part of your change (do not edit or delete them): "
-                    + cmd + " Part 2: " + base_goal)
+                    "files it writes, /workspace/t4-probe.sh and /workspace/t4-probes.txt, as part of your change "
+                    "(do not edit or delete them): " + cmd + " (it reads the payload word below from this goal, "
+                    "which is in your environment as COX_GOAL; do not copy the payload yourself). Payload: T4PAYLOAD="
+                    + b64 + " Part 2: " + base_goal)
     spec["verify"]["acceptanceChecks"] = ["cat t4-probes.txt || echo T4-NO-PROBE-FILE; echo T4-SCRIPT-SHA $(sha256sum t4-probe.sh 2>&1 | cut -c1-64)"] + spec["verify"]["acceptanceChecks"]
     spec["loop"] = {"maxIterations": 1}
 elif kind == "t4t":

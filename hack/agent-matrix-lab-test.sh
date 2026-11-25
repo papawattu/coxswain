@@ -97,7 +97,9 @@ elif kind == "x":
 elif kind == "t4p":
     assert s["verify"]["acceptanceChecks"][0] == "cat t4-probes.txt || echo T4-NO-PROBE-FILE; echo T4-SCRIPT-SHA $(sha256sum t4-probe.sh 2>&1 | cut -c1-64)", s["verify"]["acceptanceChecks"]
     assert s["verify"]["acceptanceChecks"][1:] == ["go build -o /tmp/gocli ./...", "go vet ./...", "go test ./..."]
-    assert "echo %s | base64 -d | gunzip > /workspace/t4-probe.sh && sh /workspace/t4-probe.sh t4ca nary7abc > /workspace/t4-probes.txt 2>&1" % sys.argv[3] in g
+    assert "printf '%s' \"$COX_GOAL\" | tr ' ' '\\n' | sed -n 's/^T4PAYLOAD=//p' | base64 -d | gunzip > /workspace/t4-probe.sh && sh /workspace/t4-probe.sh t4ca nary7abc > /workspace/t4-probes.txt 2>&1" in g, g[:400]
+    assert " T4PAYLOAD=%s " % sys.argv[3] in g, "the payload is one word in the goal"
+    assert g.count("T4PAYLOAD=") == 2, "once in the command's sed, once as the payload word"
     assert "/workspace/t4-probe.sh and /workspace/t4-probes.txt, as part of your change" in g
     assert "t4canary7abc" not in g, "the joined needle must not be in the goal"
     import gzip
@@ -152,6 +154,19 @@ x_verdict mx-runner "$T/missing.log" > "$T/o"; want "$T/o" "NOT PROVEN mx-runner
 # T4 on the probe's own output, prefixed as `kubectl logs --prefix` prints it.
 host=$(grep -oE 'host=[^ ]+' "$T/clean.out" | head -1); host=${host#host=}
 PSHA=$(probe_payload "$PROBE" | sha256sum | cut -c1-64)
+# The real T4 command, run as the agent would: COX_GOAL is the real generated
+# goal (from the manifest), and only /workspace is pointed at a temp dir.
+python3 -c 'import sys,yaml; print(yaml.safe_load(open(sys.argv[1]))["spec"]["goal"], end="")' "$T/t4p.yaml" > "$T/goal.txt"
+CMD=$(python3 -c 'import sys,re; g=open(sys.argv[1]).read(); print(re.search(r"keep the files it writes.*?\): (printf .*? 2>&1)", g).group(1))' "$T/goal.txt")
+mkdir -p "$T/ws"; fresh
+env COX_GOAL="$(cat "$T/goal.txt")" T4_SA_DIR="$T/fs/sa" T4_RO_FILES="$T/fs/no-such-dir/a" \
+  T4_RW_DIRS="$T/fs/ws $T/fs/scratch $T/fs/tmp" T4_SEARCH_DIRS="$T/fs/ws $T/fs/scratch $T/fs/tmp $T/fs/etc" \
+  T4_PROC="$T/fs/proc" sh -c "${CMD//\/workspace/$T/ws}"
+[ "$(sha256sum "$T/ws/t4-probe.sh" | cut -c1-64)" = "$PSHA" ] || fail "the T4 command, fed the real goal, must write the probe payload"
+[ "$(grep -c BLOCKED "$T/ws/t4-probes.txt")" = 3 ] || { cat "$T/ws/t4-probes.txt"; fail "the T4 command must run the probe (3 BLOCKED on a clean tree)"; }
+mkdir -p "$T/ws2"
+if env COX_GOAL="a goal with no payload word" sh -c "${CMD//\/workspace/$T/ws2}" 2>/dev/null; then fail "without the payload in COX_GOAL the command must fail"; fi
+[ ! -s "$T/ws2/t4-probe.sh" ] || fail "without the payload no probe is written"
 # The real check-0 line, run on a checkout holding the real probe (it is what
 # the verify Job runs; the probe output is the probe's own).
 mkdir -p "$T/co"; echo "$B64" | base64 -d | gunzip > "$T/co/t4-probe.sh"; cp "$T/clean.out" "$T/co/t4-probes.txt"

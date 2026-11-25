@@ -1,0 +1,2087 @@
+{
+    "apiVersion": "v1",
+    "items": [
+        {
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "annotations": {
+                    "container.apparmor.security.beta.kubernetes.io/kubearmor": "unconfined",
+                    "kubearmor-policy": "enabled",
+                    "kubearmor-visibility": "process,file,network,capabilities",
+                    "kubectl.kubernetes.io/restartedAt": "2026-11-07T16:44:33Z"
+                },
+                "creationTimestamp": "2026-11-07T16:51:28Z",
+                "generateName": "kubearmor-bpf-containerd-98c2c-",
+                "generation": 1,
+                "labels": {
+                    "controller-revision-hash": "5d9b4cc5d7",
+                    "kubearmor-app": "kubearmor",
+                    "kubearmor.io/btf": "yes",
+                    "kubearmor.io/enforcer": "bpf",
+                    "kubearmor.io/nri-socket": "run_nri_nri.sock",
+                    "kubearmor.io/runtime": "containerd",
+                    "kubearmor.io/seccomp": "yes",
+                    "kubearmor.io/socket": "run_containerd_containerd.sock",
+                    "kubernetes.io/os": "linux",
+                    "pod-template-generation": "3"
+                },
+                "name": "kubearmor-bpf-containerd-98c2c-7xgff",
+                "namespace": "kubearmor",
+                "ownerReferences": [
+                    {
+                        "apiVersion": "apps/v1",
+                        "blockOwnerDeletion": true,
+                        "controller": true,
+                        "kind": "DaemonSet",
+                        "name": "kubearmor-bpf-containerd-98c2c",
+                        "uid": "e9e3fde6-d2ce-4bae-8442-7cb37ec0c3fa"
+                    }
+                ],
+                "resourceVersion": "5770171",
+                "uid": "3b246b0f-48ae-448a-bdd4-bf165e2e0909"
+            },
+            "spec": {
+                "affinity": {
+                    "nodeAffinity": {
+                        "requiredDuringSchedulingIgnoredDuringExecution": {
+                            "nodeSelectorTerms": [
+                                {
+                                    "matchFields": [
+                                        {
+                                            "key": "metadata.name",
+                                            "operator": "In",
+                                            "values": [
+                                                "ref-worker2"
+                                            ]
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    }
+                },
+                "containers": [
+                    {
+                        "args": [
+                            "-gRPC=32767",
+                            "-procfsMount=/host/procfs",
+                            "-tlsEnabled=false"
+                        ],
+                        "env": [
+                            {
+                                "name": "KUBEARMOR_NODENAME",
+                                "valueFrom": {
+                                    "fieldRef": {
+                                        "apiVersion": "v1",
+                                        "fieldPath": "spec.nodeName"
+                                    }
+                                }
+                            },
+                            {
+                                "name": "KUBEARMOR_NAMESPACE",
+                                "valueFrom": {
+                                    "fieldRef": {
+                                        "apiVersion": "v1",
+                                        "fieldPath": "metadata.namespace"
+                                    }
+                                }
+                            },
+                            {
+                                "name": "LOGPATH",
+                                "value": "stdout"
+                            }
+                        ],
+                        "image": "kubearmor/kubearmor:v1.7.5",
+                        "imagePullPolicy": "Always",
+                        "livenessProbe": {
+                            "failureThreshold": 5,
+                            "grpc": {
+                                "port": 32766,
+                                "service": ""
+                            },
+                            "initialDelaySeconds": 60,
+                            "periodSeconds": 20,
+                            "successThreshold": 1,
+                            "timeoutSeconds": 5
+                        },
+                        "name": "kubearmor",
+                        "ports": [
+                            {
+                                "containerPort": 32767,
+                                "hostPort": 32767,
+                                "name": "grpc",
+                                "protocol": "TCP"
+                            },
+                            {
+                                "containerPort": 32766,
+                                "hostPort": 32766,
+                                "name": "grpc-health",
+                                "protocol": "TCP"
+                            }
+                        ],
+                        "resources": {
+                            "limits": {
+                                "cpu": "400m",
+                                "memory": "600Mi"
+                            },
+                            "requests": {
+                                "cpu": "50m",
+                                "memory": "50Mi"
+                            }
+                        },
+                        "securityContext": {
+                            "appArmorProfile": {
+                                "type": "Unconfined"
+                            },
+                            "capabilities": {
+                                "add": [
+                                    "SETUID",
+                                    "SETGID",
+                                    "SETPCAP",
+                                    "SYS_ADMIN",
+                                    "SYS_PTRACE",
+                                    "MAC_ADMIN",
+                                    "NET_ADMIN",
+                                    "SYS_RESOURCE",
+                                    "IPC_LOCK",
+                                    "CAP_DAC_OVERRIDE",
+                                    "CAP_DAC_READ_SEARCH"
+                                ],
+                                "drop": [
+                                    "ALL"
+                                ]
+                            },
+                            "privileged": false
+                        },
+                        "terminationMessagePath": "/dev/termination-log",
+                        "terminationMessagePolicy": "File",
+                        "volumeMounts": [
+                            {
+                                "mountPath": "/run/containerd",
+                                "name": "containerd-socket",
+                                "readOnly": true
+                            },
+                            {
+                                "mountPath": "/sys/kernel/debug",
+                                "name": "sys-kernel-debug-path"
+                            },
+                            {
+                                "mountPath": "/host/procfs",
+                                "name": "proc-fs-mount",
+                                "readOnly": true
+                            },
+                            {
+                                "mountPath": "/opt/kubearmor/karmor.yaml",
+                                "name": "kubearmor-config",
+                                "subPath": "karmor.yaml"
+                            },
+                            {
+                                "mountPath": "/opt/kubearmor/BPF",
+                                "name": "bpf"
+                            },
+                            {
+                                "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount",
+                                "name": "kube-api-access-fmxlx",
+                                "readOnly": true
+                            }
+                        ]
+                    }
+                ],
+                "dnsPolicy": "ClusterFirstWithHostNet",
+                "enableServiceLinks": true,
+                "hostNetwork": true,
+                "initContainers": [
+                    {
+                        "env": [
+                            {
+                                "name": "LOGPATH",
+                                "value": "stdout"
+                            }
+                        ],
+                        "image": "kubearmor/kubearmor-init:v1.7.5",
+                        "imagePullPolicy": "Always",
+                        "name": "init",
+                        "resources": {
+                            "limits": {
+                                "cpu": "400m",
+                                "memory": "600Mi"
+                            },
+                            "requests": {
+                                "cpu": "50m",
+                                "memory": "50Mi"
+                            }
+                        },
+                        "securityContext": {
+                            "capabilities": {
+                                "add": [
+                                    "SETUID",
+                                    "SETGID",
+                                    "SETPCAP",
+                                    "SYS_ADMIN",
+                                    "SYS_PTRACE",
+                                    "MAC_ADMIN",
+                                    "SYS_RESOURCE",
+                                    "IPC_LOCK",
+                                    "CAP_DAC_OVERRIDE",
+                                    "CAP_DAC_READ_SEARCH"
+                                ],
+                                "drop": [
+                                    "ALL"
+                                ]
+                            },
+                            "privileged": false
+                        },
+                        "terminationMessagePath": "/dev/termination-log",
+                        "terminationMessagePolicy": "File",
+                        "volumeMounts": [
+                            {
+                                "mountPath": "/sys/kernel/debug",
+                                "name": "sys-kernel-debug-path"
+                            },
+                            {
+                                "mountPath": "/host/procfs",
+                                "name": "proc-fs-mount",
+                                "readOnly": true
+                            },
+                            {
+                                "mountPath": "/opt/kubearmor/karmor.yaml",
+                                "name": "kubearmor-config",
+                                "subPath": "karmor.yaml"
+                            },
+                            {
+                                "mountPath": "/opt/kubearmor/BPF",
+                                "name": "bpf"
+                            },
+                            {
+                                "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount",
+                                "name": "kube-api-access-fmxlx",
+                                "readOnly": true
+                            }
+                        ]
+                    }
+                ],
+                "nodeName": "ref-worker2",
+                "nodeSelector": {
+                    "kubearmor.io/btf": "yes",
+                    "kubearmor.io/enforcer": "bpf",
+                    "kubearmor.io/nri-socket": "run_nri_nri.sock",
+                    "kubearmor.io/runtime": "containerd",
+                    "kubearmor.io/seccomp": "yes",
+                    "kubearmor.io/socket": "run_containerd_containerd.sock",
+                    "kubernetes.io/os": "linux"
+                },
+                "preemptionPolicy": "PreemptLowerPriority",
+                "priority": 0,
+                "restartPolicy": "Always",
+                "schedulerName": "default-scheduler",
+                "securityContext": {},
+                "serviceAccount": "kubearmor",
+                "serviceAccountName": "kubearmor",
+                "terminationGracePeriodSeconds": 60,
+                "tolerations": [
+                    {
+                        "effect": "NoExecute",
+                        "key": "node.kubernetes.io/not-ready",
+                        "operator": "Exists"
+                    },
+                    {
+                        "effect": "NoExecute",
+                        "key": "node.kubernetes.io/unreachable",
+                        "operator": "Exists"
+                    },
+                    {
+                        "effect": "NoSchedule",
+                        "key": "node.kubernetes.io/disk-pressure",
+                        "operator": "Exists"
+                    },
+                    {
+                        "effect": "NoSchedule",
+                        "key": "node.kubernetes.io/memory-pressure",
+                        "operator": "Exists"
+                    },
+                    {
+                        "effect": "NoSchedule",
+                        "key": "node.kubernetes.io/pid-pressure",
+                        "operator": "Exists"
+                    },
+                    {
+                        "effect": "NoSchedule",
+                        "key": "node.kubernetes.io/unschedulable",
+                        "operator": "Exists"
+                    },
+                    {
+                        "effect": "NoSchedule",
+                        "key": "node.kubernetes.io/network-unavailable",
+                        "operator": "Exists"
+                    }
+                ],
+                "volumes": [
+                    {
+                        "hostPath": {
+                            "path": "/run/containerd",
+                            "type": "Directory"
+                        },
+                        "name": "containerd-socket"
+                    },
+                    {
+                        "hostPath": {
+                            "path": "/sys/kernel/debug",
+                            "type": "Directory"
+                        },
+                        "name": "sys-kernel-debug-path"
+                    },
+                    {
+                        "hostPath": {
+                            "path": "/proc",
+                            "type": "Directory"
+                        },
+                        "name": "proc-fs-mount"
+                    },
+                    {
+                        "configMap": {
+                            "defaultMode": 420,
+                            "items": [
+                                {
+                                    "key": "karmor.yaml",
+                                    "path": "karmor.yaml"
+                                }
+                            ],
+                            "name": "kubearmor-config"
+                        },
+                        "name": "kubearmor-config"
+                    },
+                    {
+                        "emptyDir": {},
+                        "name": "bpf"
+                    },
+                    {
+                        "name": "kube-api-access-fmxlx",
+                        "projected": {
+                            "defaultMode": 420,
+                            "sources": [
+                                {
+                                    "serviceAccountToken": {
+                                        "expirationSeconds": 3607,
+                                        "path": "token"
+                                    }
+                                },
+                                {
+                                    "configMap": {
+                                        "items": [
+                                            {
+                                                "key": "ca.crt",
+                                                "path": "ca.crt"
+                                            }
+                                        ],
+                                        "name": "kube-root-ca.crt"
+                                    }
+                                },
+                                {
+                                    "downwardAPI": {
+                                        "items": [
+                                            {
+                                                "fieldRef": {
+                                                    "apiVersion": "v1",
+                                                    "fieldPath": "metadata.namespace"
+                                                },
+                                                "path": "namespace"
+                                            }
+                                        ]
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                ]
+            },
+            "status": {
+                "conditions": [
+                    {
+                        "lastProbeTime": null,
+                        "lastTransitionTime": "2026-11-25T19:37:07Z",
+                        "observedGeneration": 1,
+                        "status": "True",
+                        "type": "PodReadyToStartContainers"
+                    },
+                    {
+                        "lastProbeTime": null,
+                        "lastTransitionTime": "2026-11-07T16:52:16Z",
+                        "observedGeneration": 1,
+                        "status": "True",
+                        "type": "Initialized"
+                    },
+                    {
+                        "lastProbeTime": null,
+                        "lastTransitionTime": "2026-11-25T19:37:40Z",
+                        "observedGeneration": 1,
+                        "status": "True",
+                        "type": "Ready"
+                    },
+                    {
+                        "lastProbeTime": null,
+                        "lastTransitionTime": "2026-11-25T19:37:40Z",
+                        "observedGeneration": 1,
+                        "status": "True",
+                        "type": "ContainersReady"
+                    },
+                    {
+                        "lastProbeTime": null,
+                        "lastTransitionTime": "2026-11-07T16:51:28Z",
+                        "observedGeneration": 1,
+                        "status": "True",
+                        "type": "PodScheduled"
+                    }
+                ],
+                "containerStatuses": [
+                    {
+                        "allocatedResources": {
+                            "cpu": "50m",
+                            "memory": "50Mi"
+                        },
+                        "containerID": "containerd://06018426ee16f686a8acd70d17ac1a9b73607516e473fa675f4ab466d28af918",
+                        "image": "docker.io/kubearmor/kubearmor:v1.7.5",
+                        "imageID": "docker.io/kubearmor/kubearmor@sha256:336fe04a4f768d477a27846e3f853b5844137e41b5194bd5365e0ff120498c60",
+                        "lastState": {
+                            "terminated": {
+                                "containerID": "containerd://e7eb31372a09ece993baaf037e76390ea3c86789e42ef61a0c4aef3fbf36b0a5",
+                                "exitCode": 255,
+                                "finishedAt": "2026-11-25T19:36:44Z",
+                                "reason": "Unknown",
+                                "startedAt": "2026-11-14T21:50:12Z"
+                            }
+                        },
+                        "name": "kubearmor",
+                        "ready": true,
+                        "resources": {
+                            "limits": {
+                                "cpu": "400m",
+                                "memory": "600Mi"
+                            },
+                            "requests": {
+                                "cpu": "50m",
+                                "memory": "50Mi"
+                            }
+                        },
+                        "restartCount": 2,
+                        "started": true,
+                        "state": {
+                            "running": {
+                                "startedAt": "2026-11-25T19:37:40Z"
+                            }
+                        },
+                        "user": {
+                            "linux": {
+                                "gid": 0,
+                                "supplementalGroups": [
+                                    0,
+                                    1,
+                                    2,
+                                    3,
+                                    4,
+                                    6,
+                                    10,
+                                    11,
+                                    20,
+                                    26,
+                                    27
+                                ],
+                                "uid": 0
+                            }
+                        },
+                        "volumeMounts": [
+                            {
+                                "mountPath": "/run/containerd",
+                                "name": "containerd-socket",
+                                "readOnly": true,
+                                "recursiveReadOnly": "Disabled"
+                            },
+                            {
+                                "mountPath": "/sys/kernel/debug",
+                                "name": "sys-kernel-debug-path"
+                            },
+                            {
+                                "mountPath": "/host/procfs",
+                                "name": "proc-fs-mount",
+                                "readOnly": true,
+                                "recursiveReadOnly": "Disabled"
+                            },
+                            {
+                                "mountPath": "/opt/kubearmor/karmor.yaml",
+                                "name": "kubearmor-config"
+                            },
+                            {
+                                "mountPath": "/opt/kubearmor/BPF",
+                                "name": "bpf"
+                            },
+                            {
+                                "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount",
+                                "name": "kube-api-access-fmxlx",
+                                "readOnly": true,
+                                "recursiveReadOnly": "Disabled"
+                            }
+                        ]
+                    }
+                ],
+                "hostIP": "172.19.0.5",
+                "hostIPs": [
+                    {
+                        "ip": "172.19.0.5"
+                    }
+                ],
+                "initContainerStatuses": [
+                    {
+                        "allocatedResources": {
+                            "cpu": "50m",
+                            "memory": "50Mi"
+                        },
+                        "containerID": "containerd://33e190a78a4d42380e88b605399386e8aa3edfc16f6d8f060bf163adadc8a9a1",
+                        "image": "docker.io/kubearmor/kubearmor-init:v1.7.5",
+                        "imageID": "docker.io/kubearmor/kubearmor-init@sha256:2f8d3bcc03321398cd2feb0a6815418fc6b3a379e6c874e9c7e11be54267ef5b",
+                        "lastState": {},
+                        "name": "init",
+                        "ready": true,
+                        "resources": {
+                            "limits": {
+                                "cpu": "400m",
+                                "memory": "600Mi"
+                            },
+                            "requests": {
+                                "cpu": "50m",
+                                "memory": "50Mi"
+                            }
+                        },
+                        "restartCount": 2,
+                        "started": false,
+                        "state": {
+                            "terminated": {
+                                "containerID": "containerd://33e190a78a4d42380e88b605399386e8aa3edfc16f6d8f060bf163adadc8a9a1",
+                                "exitCode": 0,
+                                "finishedAt": "2026-11-25T19:37:38Z",
+                                "reason": "Completed",
+                                "startedAt": "2026-11-25T19:37:07Z"
+                            }
+                        },
+                        "user": {
+                            "linux": {
+                                "gid": 0,
+                                "supplementalGroups": [
+                                    0,
+                                    1,
+                                    2,
+                                    3,
+                                    4,
+                                    6,
+                                    10,
+                                    11,
+                                    20,
+                                    26,
+                                    27
+                                ],
+                                "uid": 0
+                            }
+                        },
+                        "volumeMounts": [
+                            {
+                                "mountPath": "/sys/kernel/debug",
+                                "name": "sys-kernel-debug-path"
+                            },
+                            {
+                                "mountPath": "/host/procfs",
+                                "name": "proc-fs-mount",
+                                "readOnly": true,
+                                "recursiveReadOnly": "Disabled"
+                            },
+                            {
+                                "mountPath": "/opt/kubearmor/karmor.yaml",
+                                "name": "kubearmor-config"
+                            },
+                            {
+                                "mountPath": "/opt/kubearmor/BPF",
+                                "name": "bpf"
+                            },
+                            {
+                                "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount",
+                                "name": "kube-api-access-fmxlx",
+                                "readOnly": true,
+                                "recursiveReadOnly": "Disabled"
+                            }
+                        ]
+                    }
+                ],
+                "observedGeneration": 1,
+                "phase": "Running",
+                "podIP": "172.19.0.5",
+                "podIPs": [
+                    {
+                        "ip": "172.19.0.5"
+                    }
+                ],
+                "qosClass": "Burstable",
+                "startTime": "2026-11-07T16:51:29Z"
+            }
+        },
+        {
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "annotations": {
+                    "container.apparmor.security.beta.kubernetes.io/kubearmor": "unconfined",
+                    "kubearmor-policy": "enabled",
+                    "kubearmor-visibility": "process,file,network,capabilities",
+                    "kubectl.kubernetes.io/restartedAt": "2026-11-07T16:44:33Z"
+                },
+                "creationTimestamp": "2026-11-07T16:52:26Z",
+                "generateName": "kubearmor-bpf-containerd-98c2c-",
+                "generation": 1,
+                "labels": {
+                    "controller-revision-hash": "5d9b4cc5d7",
+                    "kubearmor-app": "kubearmor",
+                    "kubearmor.io/btf": "yes",
+                    "kubearmor.io/enforcer": "bpf",
+                    "kubearmor.io/nri-socket": "run_nri_nri.sock",
+                    "kubearmor.io/runtime": "containerd",
+                    "kubearmor.io/seccomp": "yes",
+                    "kubearmor.io/socket": "run_containerd_containerd.sock",
+                    "kubernetes.io/os": "linux",
+                    "pod-template-generation": "3"
+                },
+                "name": "kubearmor-bpf-containerd-98c2c-x827n",
+                "namespace": "kubearmor",
+                "ownerReferences": [
+                    {
+                        "apiVersion": "apps/v1",
+                        "blockOwnerDeletion": true,
+                        "controller": true,
+                        "kind": "DaemonSet",
+                        "name": "kubearmor-bpf-containerd-98c2c",
+                        "uid": "e9e3fde6-d2ce-4bae-8442-7cb37ec0c3fa"
+                    }
+                ],
+                "resourceVersion": "5770153",
+                "uid": "3b2a6a4a-65d7-4fe7-ab87-6f46c9f999fc"
+            },
+            "spec": {
+                "affinity": {
+                    "nodeAffinity": {
+                        "requiredDuringSchedulingIgnoredDuringExecution": {
+                            "nodeSelectorTerms": [
+                                {
+                                    "matchFields": [
+                                        {
+                                            "key": "metadata.name",
+                                            "operator": "In",
+                                            "values": [
+                                                "ref-worker"
+                                            ]
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    }
+                },
+                "containers": [
+                    {
+                        "args": [
+                            "-gRPC=32767",
+                            "-procfsMount=/host/procfs",
+                            "-tlsEnabled=false"
+                        ],
+                        "env": [
+                            {
+                                "name": "KUBEARMOR_NODENAME",
+                                "valueFrom": {
+                                    "fieldRef": {
+                                        "apiVersion": "v1",
+                                        "fieldPath": "spec.nodeName"
+                                    }
+                                }
+                            },
+                            {
+                                "name": "KUBEARMOR_NAMESPACE",
+                                "valueFrom": {
+                                    "fieldRef": {
+                                        "apiVersion": "v1",
+                                        "fieldPath": "metadata.namespace"
+                                    }
+                                }
+                            },
+                            {
+                                "name": "LOGPATH",
+                                "value": "stdout"
+                            }
+                        ],
+                        "image": "kubearmor/kubearmor:v1.7.5",
+                        "imagePullPolicy": "Always",
+                        "livenessProbe": {
+                            "failureThreshold": 5,
+                            "grpc": {
+                                "port": 32766,
+                                "service": ""
+                            },
+                            "initialDelaySeconds": 60,
+                            "periodSeconds": 20,
+                            "successThreshold": 1,
+                            "timeoutSeconds": 5
+                        },
+                        "name": "kubearmor",
+                        "ports": [
+                            {
+                                "containerPort": 32767,
+                                "hostPort": 32767,
+                                "name": "grpc",
+                                "protocol": "TCP"
+                            },
+                            {
+                                "containerPort": 32766,
+                                "hostPort": 32766,
+                                "name": "grpc-health",
+                                "protocol": "TCP"
+                            }
+                        ],
+                        "resources": {
+                            "limits": {
+                                "cpu": "400m",
+                                "memory": "600Mi"
+                            },
+                            "requests": {
+                                "cpu": "50m",
+                                "memory": "50Mi"
+                            }
+                        },
+                        "securityContext": {
+                            "appArmorProfile": {
+                                "type": "Unconfined"
+                            },
+                            "capabilities": {
+                                "add": [
+                                    "SETUID",
+                                    "SETGID",
+                                    "SETPCAP",
+                                    "SYS_ADMIN",
+                                    "SYS_PTRACE",
+                                    "MAC_ADMIN",
+                                    "NET_ADMIN",
+                                    "SYS_RESOURCE",
+                                    "IPC_LOCK",
+                                    "CAP_DAC_OVERRIDE",
+                                    "CAP_DAC_READ_SEARCH"
+                                ],
+                                "drop": [
+                                    "ALL"
+                                ]
+                            },
+                            "privileged": false
+                        },
+                        "terminationMessagePath": "/dev/termination-log",
+                        "terminationMessagePolicy": "File",
+                        "volumeMounts": [
+                            {
+                                "mountPath": "/run/containerd",
+                                "name": "containerd-socket",
+                                "readOnly": true
+                            },
+                            {
+                                "mountPath": "/sys/kernel/debug",
+                                "name": "sys-kernel-debug-path"
+                            },
+                            {
+                                "mountPath": "/host/procfs",
+                                "name": "proc-fs-mount",
+                                "readOnly": true
+                            },
+                            {
+                                "mountPath": "/opt/kubearmor/karmor.yaml",
+                                "name": "kubearmor-config",
+                                "subPath": "karmor.yaml"
+                            },
+                            {
+                                "mountPath": "/opt/kubearmor/BPF",
+                                "name": "bpf"
+                            },
+                            {
+                                "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount",
+                                "name": "kube-api-access-hrmkk",
+                                "readOnly": true
+                            }
+                        ]
+                    }
+                ],
+                "dnsPolicy": "ClusterFirstWithHostNet",
+                "enableServiceLinks": true,
+                "hostNetwork": true,
+                "initContainers": [
+                    {
+                        "env": [
+                            {
+                                "name": "LOGPATH",
+                                "value": "stdout"
+                            }
+                        ],
+                        "image": "kubearmor/kubearmor-init:v1.7.5",
+                        "imagePullPolicy": "Always",
+                        "name": "init",
+                        "resources": {
+                            "limits": {
+                                "cpu": "400m",
+                                "memory": "600Mi"
+                            },
+                            "requests": {
+                                "cpu": "50m",
+                                "memory": "50Mi"
+                            }
+                        },
+                        "securityContext": {
+                            "capabilities": {
+                                "add": [
+                                    "SETUID",
+                                    "SETGID",
+                                    "SETPCAP",
+                                    "SYS_ADMIN",
+                                    "SYS_PTRACE",
+                                    "MAC_ADMIN",
+                                    "SYS_RESOURCE",
+                                    "IPC_LOCK",
+                                    "CAP_DAC_OVERRIDE",
+                                    "CAP_DAC_READ_SEARCH"
+                                ],
+                                "drop": [
+                                    "ALL"
+                                ]
+                            },
+                            "privileged": false
+                        },
+                        "terminationMessagePath": "/dev/termination-log",
+                        "terminationMessagePolicy": "File",
+                        "volumeMounts": [
+                            {
+                                "mountPath": "/sys/kernel/debug",
+                                "name": "sys-kernel-debug-path"
+                            },
+                            {
+                                "mountPath": "/host/procfs",
+                                "name": "proc-fs-mount",
+                                "readOnly": true
+                            },
+                            {
+                                "mountPath": "/opt/kubearmor/karmor.yaml",
+                                "name": "kubearmor-config",
+                                "subPath": "karmor.yaml"
+                            },
+                            {
+                                "mountPath": "/opt/kubearmor/BPF",
+                                "name": "bpf"
+                            },
+                            {
+                                "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount",
+                                "name": "kube-api-access-hrmkk",
+                                "readOnly": true
+                            }
+                        ]
+                    }
+                ],
+                "nodeName": "ref-worker",
+                "nodeSelector": {
+                    "kubearmor.io/btf": "yes",
+                    "kubearmor.io/enforcer": "bpf",
+                    "kubearmor.io/nri-socket": "run_nri_nri.sock",
+                    "kubearmor.io/runtime": "containerd",
+                    "kubearmor.io/seccomp": "yes",
+                    "kubearmor.io/socket": "run_containerd_containerd.sock",
+                    "kubernetes.io/os": "linux"
+                },
+                "preemptionPolicy": "PreemptLowerPriority",
+                "priority": 0,
+                "restartPolicy": "Always",
+                "schedulerName": "default-scheduler",
+                "securityContext": {},
+                "serviceAccount": "kubearmor",
+                "serviceAccountName": "kubearmor",
+                "terminationGracePeriodSeconds": 60,
+                "tolerations": [
+                    {
+                        "effect": "NoExecute",
+                        "key": "node.kubernetes.io/not-ready",
+                        "operator": "Exists"
+                    },
+                    {
+                        "effect": "NoExecute",
+                        "key": "node.kubernetes.io/unreachable",
+                        "operator": "Exists"
+                    },
+                    {
+                        "effect": "NoSchedule",
+                        "key": "node.kubernetes.io/disk-pressure",
+                        "operator": "Exists"
+                    },
+                    {
+                        "effect": "NoSchedule",
+                        "key": "node.kubernetes.io/memory-pressure",
+                        "operator": "Exists"
+                    },
+                    {
+                        "effect": "NoSchedule",
+                        "key": "node.kubernetes.io/pid-pressure",
+                        "operator": "Exists"
+                    },
+                    {
+                        "effect": "NoSchedule",
+                        "key": "node.kubernetes.io/unschedulable",
+                        "operator": "Exists"
+                    },
+                    {
+                        "effect": "NoSchedule",
+                        "key": "node.kubernetes.io/network-unavailable",
+                        "operator": "Exists"
+                    }
+                ],
+                "volumes": [
+                    {
+                        "hostPath": {
+                            "path": "/run/containerd",
+                            "type": "Directory"
+                        },
+                        "name": "containerd-socket"
+                    },
+                    {
+                        "hostPath": {
+                            "path": "/sys/kernel/debug",
+                            "type": "Directory"
+                        },
+                        "name": "sys-kernel-debug-path"
+                    },
+                    {
+                        "hostPath": {
+                            "path": "/proc",
+                            "type": "Directory"
+                        },
+                        "name": "proc-fs-mount"
+                    },
+                    {
+                        "configMap": {
+                            "defaultMode": 420,
+                            "items": [
+                                {
+                                    "key": "karmor.yaml",
+                                    "path": "karmor.yaml"
+                                }
+                            ],
+                            "name": "kubearmor-config"
+                        },
+                        "name": "kubearmor-config"
+                    },
+                    {
+                        "emptyDir": {},
+                        "name": "bpf"
+                    },
+                    {
+                        "name": "kube-api-access-hrmkk",
+                        "projected": {
+                            "defaultMode": 420,
+                            "sources": [
+                                {
+                                    "serviceAccountToken": {
+                                        "expirationSeconds": 3607,
+                                        "path": "token"
+                                    }
+                                },
+                                {
+                                    "configMap": {
+                                        "items": [
+                                            {
+                                                "key": "ca.crt",
+                                                "path": "ca.crt"
+                                            }
+                                        ],
+                                        "name": "kube-root-ca.crt"
+                                    }
+                                },
+                                {
+                                    "downwardAPI": {
+                                        "items": [
+                                            {
+                                                "fieldRef": {
+                                                    "apiVersion": "v1",
+                                                    "fieldPath": "metadata.namespace"
+                                                },
+                                                "path": "namespace"
+                                            }
+                                        ]
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                ]
+            },
+            "status": {
+                "conditions": [
+                    {
+                        "lastProbeTime": null,
+                        "lastTransitionTime": "2026-11-25T19:37:05Z",
+                        "observedGeneration": 1,
+                        "status": "True",
+                        "type": "PodReadyToStartContainers"
+                    },
+                    {
+                        "lastProbeTime": null,
+                        "lastTransitionTime": "2026-11-07T16:53:02Z",
+                        "observedGeneration": 1,
+                        "status": "True",
+                        "type": "Initialized"
+                    },
+                    {
+                        "lastProbeTime": null,
+                        "lastTransitionTime": "2026-11-25T19:37:39Z",
+                        "observedGeneration": 1,
+                        "status": "True",
+                        "type": "Ready"
+                    },
+                    {
+                        "lastProbeTime": null,
+                        "lastTransitionTime": "2026-11-25T19:37:39Z",
+                        "observedGeneration": 1,
+                        "status": "True",
+                        "type": "ContainersReady"
+                    },
+                    {
+                        "lastProbeTime": null,
+                        "lastTransitionTime": "2026-11-07T16:52:26Z",
+                        "observedGeneration": 1,
+                        "status": "True",
+                        "type": "PodScheduled"
+                    }
+                ],
+                "containerStatuses": [
+                    {
+                        "allocatedResources": {
+                            "cpu": "50m",
+                            "memory": "50Mi"
+                        },
+                        "containerID": "containerd://dd36b13bf7e20486553a50eccd7e4e5dea93c22e7cb81d840d06f3ee0d9c9962",
+                        "image": "docker.io/kubearmor/kubearmor:v1.7.5",
+                        "imageID": "docker.io/kubearmor/kubearmor@sha256:336fe04a4f768d477a27846e3f853b5844137e41b5194bd5365e0ff120498c60",
+                        "lastState": {
+                            "terminated": {
+                                "containerID": "containerd://d54a0ebafb1c12eab2cce8f4d4b027d7bb4b3355cf1abe2fbbbb2faebeae5403",
+                                "exitCode": 255,
+                                "finishedAt": "2026-11-25T19:36:44Z",
+                                "reason": "Unknown",
+                                "startedAt": "2026-11-14T21:50:09Z"
+                            }
+                        },
+                        "name": "kubearmor",
+                        "ready": true,
+                        "resources": {
+                            "limits": {
+                                "cpu": "400m",
+                                "memory": "600Mi"
+                            },
+                            "requests": {
+                                "cpu": "50m",
+                                "memory": "50Mi"
+                            }
+                        },
+                        "restartCount": 2,
+                        "started": true,
+                        "state": {
+                            "running": {
+                                "startedAt": "2026-11-25T19:37:38Z"
+                            }
+                        },
+                        "user": {
+                            "linux": {
+                                "gid": 0,
+                                "supplementalGroups": [
+                                    0,
+                                    1,
+                                    2,
+                                    3,
+                                    4,
+                                    6,
+                                    10,
+                                    11,
+                                    20,
+                                    26,
+                                    27
+                                ],
+                                "uid": 0
+                            }
+                        },
+                        "volumeMounts": [
+                            {
+                                "mountPath": "/run/containerd",
+                                "name": "containerd-socket",
+                                "readOnly": true,
+                                "recursiveReadOnly": "Disabled"
+                            },
+                            {
+                                "mountPath": "/sys/kernel/debug",
+                                "name": "sys-kernel-debug-path"
+                            },
+                            {
+                                "mountPath": "/host/procfs",
+                                "name": "proc-fs-mount",
+                                "readOnly": true,
+                                "recursiveReadOnly": "Disabled"
+                            },
+                            {
+                                "mountPath": "/opt/kubearmor/karmor.yaml",
+                                "name": "kubearmor-config"
+                            },
+                            {
+                                "mountPath": "/opt/kubearmor/BPF",
+                                "name": "bpf"
+                            },
+                            {
+                                "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount",
+                                "name": "kube-api-access-hrmkk",
+                                "readOnly": true,
+                                "recursiveReadOnly": "Disabled"
+                            }
+                        ]
+                    }
+                ],
+                "hostIP": "172.19.0.2",
+                "hostIPs": [
+                    {
+                        "ip": "172.19.0.2"
+                    }
+                ],
+                "initContainerStatuses": [
+                    {
+                        "allocatedResources": {
+                            "cpu": "50m",
+                            "memory": "50Mi"
+                        },
+                        "containerID": "containerd://2f91e99d6653042193d2466bce3aa798ee839da8e036140712024e4118de80ea",
+                        "image": "docker.io/kubearmor/kubearmor-init:v1.7.5",
+                        "imageID": "docker.io/kubearmor/kubearmor-init@sha256:2f8d3bcc03321398cd2feb0a6815418fc6b3a379e6c874e9c7e11be54267ef5b",
+                        "lastState": {},
+                        "name": "init",
+                        "ready": true,
+                        "resources": {
+                            "limits": {
+                                "cpu": "400m",
+                                "memory": "600Mi"
+                            },
+                            "requests": {
+                                "cpu": "50m",
+                                "memory": "50Mi"
+                            }
+                        },
+                        "restartCount": 2,
+                        "started": false,
+                        "state": {
+                            "terminated": {
+                                "containerID": "containerd://2f91e99d6653042193d2466bce3aa798ee839da8e036140712024e4118de80ea",
+                                "exitCode": 0,
+                                "finishedAt": "2026-11-25T19:37:35Z",
+                                "reason": "Completed",
+                                "startedAt": "2026-11-25T19:37:04Z"
+                            }
+                        },
+                        "user": {
+                            "linux": {
+                                "gid": 0,
+                                "supplementalGroups": [
+                                    0,
+                                    1,
+                                    2,
+                                    3,
+                                    4,
+                                    6,
+                                    10,
+                                    11,
+                                    20,
+                                    26,
+                                    27
+                                ],
+                                "uid": 0
+                            }
+                        },
+                        "volumeMounts": [
+                            {
+                                "mountPath": "/sys/kernel/debug",
+                                "name": "sys-kernel-debug-path"
+                            },
+                            {
+                                "mountPath": "/host/procfs",
+                                "name": "proc-fs-mount",
+                                "readOnly": true,
+                                "recursiveReadOnly": "Disabled"
+                            },
+                            {
+                                "mountPath": "/opt/kubearmor/karmor.yaml",
+                                "name": "kubearmor-config"
+                            },
+                            {
+                                "mountPath": "/opt/kubearmor/BPF",
+                                "name": "bpf"
+                            },
+                            {
+                                "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount",
+                                "name": "kube-api-access-hrmkk",
+                                "readOnly": true,
+                                "recursiveReadOnly": "Disabled"
+                            }
+                        ]
+                    }
+                ],
+                "observedGeneration": 1,
+                "phase": "Running",
+                "podIP": "172.19.0.2",
+                "podIPs": [
+                    {
+                        "ip": "172.19.0.2"
+                    }
+                ],
+                "qosClass": "Burstable",
+                "startTime": "2026-11-07T16:52:26Z"
+            }
+        },
+        {
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "annotations": {
+                    "cni.projectcalico.org/containerID": "9d92330683571aebb8c0f510ab7ff6e3e4fd3d29535b0ddbea902f4cdc604205",
+                    "cni.projectcalico.org/podIP": "10.244.1.109/32",
+                    "cni.projectcalico.org/podIPs": "10.244.1.109/32",
+                    "container.apparmor.security.beta.kubernetes.io/manager": "unconfined",
+                    "kubearmor-policy": "enabled",
+                    "kubearmor-visibility": "process,file,network,capabilities"
+                },
+                "creationTimestamp": "2026-11-07T16:51:23Z",
+                "generateName": "kubearmor-controller-678855dd5-",
+                "generation": 1,
+                "labels": {
+                    "kubearmor-app": "kubearmor-controller",
+                    "pod-template-hash": "678855dd5"
+                },
+                "name": "kubearmor-controller-678855dd5-8k44l",
+                "namespace": "kubearmor",
+                "ownerReferences": [
+                    {
+                        "apiVersion": "apps/v1",
+                        "blockOwnerDeletion": true,
+                        "controller": true,
+                        "kind": "ReplicaSet",
+                        "name": "kubearmor-controller-678855dd5",
+                        "uid": "f0113c23-47d0-406f-88fd-1b805b83df83"
+                    }
+                ],
+                "resourceVersion": "5771080",
+                "uid": "55fd9472-afb9-4753-83d9-d7e2fb38396f"
+            },
+            "spec": {
+                "containers": [
+                    {
+                        "args": [
+                            "-annotateExisting=false",
+                            "-health-probe-bind-address=:8081",
+                            "-webhook-port=9443"
+                        ],
+                        "command": [
+                            "/manager"
+                        ],
+                        "env": [
+                            {
+                                "name": "LOGPATH",
+                                "value": "stdout"
+                            }
+                        ],
+                        "image": "kubearmor/kubearmor-controller:stable",
+                        "imagePullPolicy": "Always",
+                        "livenessProbe": {
+                            "failureThreshold": 3,
+                            "httpGet": {
+                                "path": "/healthz",
+                                "port": 8081,
+                                "scheme": "HTTP"
+                            },
+                            "initialDelaySeconds": 15,
+                            "periodSeconds": 20,
+                            "successThreshold": 1,
+                            "timeoutSeconds": 1
+                        },
+                        "name": "manager",
+                        "ports": [
+                            {
+                                "containerPort": 9443,
+                                "name": "webhook-server",
+                                "protocol": "TCP"
+                            }
+                        ],
+                        "readinessProbe": {
+                            "failureThreshold": 3,
+                            "httpGet": {
+                                "path": "/readyz",
+                                "port": 8081,
+                                "scheme": "HTTP"
+                            },
+                            "initialDelaySeconds": 5,
+                            "periodSeconds": 10,
+                            "successThreshold": 1,
+                            "timeoutSeconds": 1
+                        },
+                        "resources": {
+                            "limits": {
+                                "cpu": "200m",
+                                "memory": "200Mi"
+                            },
+                            "requests": {
+                                "cpu": "50m",
+                                "memory": "50Mi"
+                            }
+                        },
+                        "securityContext": {
+                            "allowPrivilegeEscalation": false,
+                            "appArmorProfile": {
+                                "type": "Unconfined"
+                            }
+                        },
+                        "terminationMessagePath": "/dev/termination-log",
+                        "terminationMessagePolicy": "File",
+                        "volumeMounts": [
+                            {
+                                "mountPath": "/tmp/k8s-webhook-server/serving-certs",
+                                "name": "cert",
+                                "readOnly": true
+                            },
+                            {
+                                "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount",
+                                "name": "kube-api-access-f6cnj",
+                                "readOnly": true
+                            }
+                        ]
+                    }
+                ],
+                "dnsPolicy": "ClusterFirst",
+                "enableServiceLinks": true,
+                "nodeName": "ref-worker2",
+                "nodeSelector": {
+                    "kubearmor.io/securityfs": "yes"
+                },
+                "preemptionPolicy": "PreemptLowerPriority",
+                "priority": 0,
+                "restartPolicy": "Always",
+                "schedulerName": "default-scheduler",
+                "securityContext": {},
+                "serviceAccount": "kubearmor-controller",
+                "serviceAccountName": "kubearmor-controller",
+                "terminationGracePeriodSeconds": 10,
+                "tolerations": [
+                    {
+                        "effect": "NoExecute",
+                        "key": "node.kubernetes.io/not-ready",
+                        "operator": "Exists",
+                        "tolerationSeconds": 300
+                    },
+                    {
+                        "effect": "NoExecute",
+                        "key": "node.kubernetes.io/unreachable",
+                        "operator": "Exists",
+                        "tolerationSeconds": 300
+                    }
+                ],
+                "volumes": [
+                    {
+                        "name": "cert",
+                        "secret": {
+                            "defaultMode": 420,
+                            "secretName": "kubearmor-controller-webhook-server-cert"
+                        }
+                    },
+                    {
+                        "name": "kube-api-access-f6cnj",
+                        "projected": {
+                            "defaultMode": 420,
+                            "sources": [
+                                {
+                                    "serviceAccountToken": {
+                                        "expirationSeconds": 3607,
+                                        "path": "token"
+                                    }
+                                },
+                                {
+                                    "configMap": {
+                                        "items": [
+                                            {
+                                                "key": "ca.crt",
+                                                "path": "ca.crt"
+                                            }
+                                        ],
+                                        "name": "kube-root-ca.crt"
+                                    }
+                                },
+                                {
+                                    "downwardAPI": {
+                                        "items": [
+                                            {
+                                                "fieldRef": {
+                                                    "apiVersion": "v1",
+                                                    "fieldPath": "metadata.namespace"
+                                                },
+                                                "path": "namespace"
+                                            }
+                                        ]
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                ]
+            },
+            "status": {
+                "conditions": [
+                    {
+                        "lastProbeTime": null,
+                        "lastTransitionTime": "2026-11-25T19:38:23Z",
+                        "observedGeneration": 1,
+                        "status": "True",
+                        "type": "PodReadyToStartContainers"
+                    },
+                    {
+                        "lastProbeTime": null,
+                        "lastTransitionTime": "2026-11-07T16:51:24Z",
+                        "observedGeneration": 1,
+                        "status": "True",
+                        "type": "Initialized"
+                    },
+                    {
+                        "lastProbeTime": null,
+                        "lastTransitionTime": "2026-11-25T19:38:35Z",
+                        "observedGeneration": 1,
+                        "status": "True",
+                        "type": "Ready"
+                    },
+                    {
+                        "lastProbeTime": null,
+                        "lastTransitionTime": "2026-11-25T19:38:35Z",
+                        "observedGeneration": 1,
+                        "status": "True",
+                        "type": "ContainersReady"
+                    },
+                    {
+                        "lastProbeTime": null,
+                        "lastTransitionTime": "2026-11-07T16:51:23Z",
+                        "observedGeneration": 1,
+                        "status": "True",
+                        "type": "PodScheduled"
+                    }
+                ],
+                "containerStatuses": [
+                    {
+                        "allocatedResources": {
+                            "cpu": "50m",
+                            "memory": "50Mi"
+                        },
+                        "containerID": "containerd://46c5153e5493148a5e1f2f0c85be332f0ddf41d52dad70596322794124a782a7",
+                        "image": "docker.io/kubearmor/kubearmor-controller:stable",
+                        "imageID": "docker.io/kubearmor/kubearmor-controller@sha256:c6f2dc0de1a87d471e79b35ea831f0940dde00e39d8470d71f83f8efd7a906cc",
+                        "lastState": {
+                            "terminated": {
+                                "containerID": "containerd://13511c2581b177f4d78627b77e24e613ada5de5b0b117f26f1f1521a975f0233",
+                                "exitCode": 255,
+                                "finishedAt": "2026-11-25T19:36:44Z",
+                                "reason": "Unknown",
+                                "startedAt": "2026-11-14T21:50:07Z"
+                            }
+                        },
+                        "name": "manager",
+                        "ready": true,
+                        "resources": {
+                            "limits": {
+                                "cpu": "200m",
+                                "memory": "200Mi"
+                            },
+                            "requests": {
+                                "cpu": "50m",
+                                "memory": "50Mi"
+                            }
+                        },
+                        "restartCount": 2,
+                        "started": true,
+                        "state": {
+                            "running": {
+                                "startedAt": "2026-11-25T19:38:22Z"
+                            }
+                        },
+                        "user": {
+                            "linux": {
+                                "gid": 0,
+                                "supplementalGroups": [
+                                    0
+                                ],
+                                "uid": 0
+                            }
+                        },
+                        "volumeMounts": [
+                            {
+                                "mountPath": "/tmp/k8s-webhook-server/serving-certs",
+                                "name": "cert",
+                                "readOnly": true,
+                                "recursiveReadOnly": "Disabled"
+                            },
+                            {
+                                "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount",
+                                "name": "kube-api-access-f6cnj",
+                                "readOnly": true,
+                                "recursiveReadOnly": "Disabled"
+                            }
+                        ]
+                    }
+                ],
+                "hostIP": "172.19.0.5",
+                "hostIPs": [
+                    {
+                        "ip": "172.19.0.5"
+                    }
+                ],
+                "observedGeneration": 1,
+                "phase": "Running",
+                "podIP": "10.244.1.109",
+                "podIPs": [
+                    {
+                        "ip": "10.244.1.109"
+                    }
+                ],
+                "qosClass": "Burstable",
+                "startTime": "2026-11-07T16:51:24Z"
+            }
+        },
+        {
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "annotations": {
+                    "cni.projectcalico.org/containerID": "c88da1cdb2f25eecaebca430ef13cac46e90cb7710a358057ab7a20eca2dbcbe",
+                    "cni.projectcalico.org/podIP": "10.244.1.105/32",
+                    "cni.projectcalico.org/podIPs": "10.244.1.105/32"
+                },
+                "creationTimestamp": "2026-10-23T20:57:19Z",
+                "generateName": "kubearmor-operator-9845bbf95-",
+                "generation": 1,
+                "labels": {
+                    "kubearmor-app": "kubearmor-operator",
+                    "pod-template-hash": "9845bbf95"
+                },
+                "name": "kubearmor-operator-9845bbf95-k827v",
+                "namespace": "kubearmor",
+                "ownerReferences": [
+                    {
+                        "apiVersion": "apps/v1",
+                        "blockOwnerDeletion": true,
+                        "controller": true,
+                        "kind": "ReplicaSet",
+                        "name": "kubearmor-operator-9845bbf95",
+                        "uid": "78174498-139c-4cb4-9163-7a7d02fad7fd"
+                    }
+                ],
+                "resourceVersion": "5770617",
+                "uid": "158f50dc-e398-46ae-bb21-a6eb09eab35c"
+            },
+            "spec": {
+                "containers": [
+                    {
+                        "args": [
+                            "--annotateExisting=false",
+                            "--annotateResource=false"
+                        ],
+                        "env": [
+                            {
+                                "name": "KUBEARMOR_OPERATOR_NS",
+                                "valueFrom": {
+                                    "fieldRef": {
+                                        "apiVersion": "v1",
+                                        "fieldPath": "metadata.namespace"
+                                    }
+                                }
+                            }
+                        ],
+                        "image": "kubearmor/kubearmor-operator:stable",
+                        "imagePullPolicy": "Always",
+                        "name": "kubearmor-operator",
+                        "resources": {},
+                        "terminationMessagePath": "/dev/termination-log",
+                        "terminationMessagePolicy": "File",
+                        "volumeMounts": [
+                            {
+                                "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount",
+                                "name": "kube-api-access-lcgzt",
+                                "readOnly": true
+                            }
+                        ]
+                    }
+                ],
+                "dnsPolicy": "ClusterFirst",
+                "enableServiceLinks": true,
+                "nodeName": "ref-worker2",
+                "preemptionPolicy": "PreemptLowerPriority",
+                "priority": 0,
+                "restartPolicy": "Always",
+                "schedulerName": "default-scheduler",
+                "securityContext": {},
+                "serviceAccount": "kubearmor-operator",
+                "serviceAccountName": "kubearmor-operator",
+                "terminationGracePeriodSeconds": 30,
+                "tolerations": [
+                    {
+                        "effect": "NoExecute",
+                        "key": "node.kubernetes.io/not-ready",
+                        "operator": "Exists",
+                        "tolerationSeconds": 300
+                    },
+                    {
+                        "effect": "NoExecute",
+                        "key": "node.kubernetes.io/unreachable",
+                        "operator": "Exists",
+                        "tolerationSeconds": 300
+                    }
+                ],
+                "volumes": [
+                    {
+                        "name": "kube-api-access-lcgzt",
+                        "projected": {
+                            "defaultMode": 420,
+                            "sources": [
+                                {
+                                    "serviceAccountToken": {
+                                        "expirationSeconds": 3607,
+                                        "path": "token"
+                                    }
+                                },
+                                {
+                                    "configMap": {
+                                        "items": [
+                                            {
+                                                "key": "ca.crt",
+                                                "path": "ca.crt"
+                                            }
+                                        ],
+                                        "name": "kube-root-ca.crt"
+                                    }
+                                },
+                                {
+                                    "downwardAPI": {
+                                        "items": [
+                                            {
+                                                "fieldRef": {
+                                                    "apiVersion": "v1",
+                                                    "fieldPath": "metadata.namespace"
+                                                },
+                                                "path": "namespace"
+                                            }
+                                        ]
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                ]
+            },
+            "status": {
+                "conditions": [
+                    {
+                        "lastProbeTime": null,
+                        "lastTransitionTime": "2026-11-25T19:38:11Z",
+                        "observedGeneration": 1,
+                        "status": "True",
+                        "type": "PodReadyToStartContainers"
+                    },
+                    {
+                        "lastProbeTime": null,
+                        "lastTransitionTime": "2026-10-23T20:57:19Z",
+                        "observedGeneration": 1,
+                        "status": "True",
+                        "type": "Initialized"
+                    },
+                    {
+                        "lastProbeTime": null,
+                        "lastTransitionTime": "2026-11-25T19:38:11Z",
+                        "observedGeneration": 1,
+                        "status": "True",
+                        "type": "Ready"
+                    },
+                    {
+                        "lastProbeTime": null,
+                        "lastTransitionTime": "2026-11-25T19:38:11Z",
+                        "observedGeneration": 1,
+                        "status": "True",
+                        "type": "ContainersReady"
+                    },
+                    {
+                        "lastProbeTime": null,
+                        "lastTransitionTime": "2026-10-23T20:57:19Z",
+                        "observedGeneration": 1,
+                        "status": "True",
+                        "type": "PodScheduled"
+                    }
+                ],
+                "containerStatuses": [
+                    {
+                        "containerID": "containerd://72b2163eaa7c82ecc80472d48a3206372f7fb4dfe4828519f7c8f4c8860fc9d8",
+                        "image": "docker.io/kubearmor/kubearmor-operator:stable",
+                        "imageID": "docker.io/kubearmor/kubearmor-operator@sha256:6d018ff5d2c01ea58aeca9f3b204b8d3006acad4b09a5c0744d2f48ca1fea48d",
+                        "lastState": {
+                            "terminated": {
+                                "containerID": "containerd://f7205d43238b6ee0da06b477bd310fc13b92d632db7e28e13c16124429839aaf",
+                                "exitCode": 255,
+                                "finishedAt": "2026-11-25T19:36:44Z",
+                                "reason": "Unknown",
+                                "startedAt": "2026-11-14T21:50:18Z"
+                            }
+                        },
+                        "name": "kubearmor-operator",
+                        "ready": true,
+                        "resources": {},
+                        "restartCount": 2,
+                        "started": true,
+                        "state": {
+                            "running": {
+                                "startedAt": "2026-11-25T19:38:11Z"
+                            }
+                        },
+                        "user": {
+                            "linux": {
+                                "gid": 0,
+                                "supplementalGroups": [
+                                    0
+                                ],
+                                "uid": 0
+                            }
+                        },
+                        "volumeMounts": [
+                            {
+                                "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount",
+                                "name": "kube-api-access-lcgzt",
+                                "readOnly": true,
+                                "recursiveReadOnly": "Disabled"
+                            }
+                        ]
+                    }
+                ],
+                "hostIP": "172.19.0.5",
+                "hostIPs": [
+                    {
+                        "ip": "172.19.0.5"
+                    }
+                ],
+                "observedGeneration": 1,
+                "phase": "Running",
+                "podIP": "10.244.1.105",
+                "podIPs": [
+                    {
+                        "ip": "10.244.1.105"
+                    }
+                ],
+                "qosClass": "BestEffort",
+                "startTime": "2026-10-23T20:57:19Z"
+            }
+        },
+        {
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "annotations": {
+                    "cni.projectcalico.org/containerID": "87948cff7f6001e5834a2c142c9c85e43c8992e8943000594640a746f0009158",
+                    "cni.projectcalico.org/podIP": "10.244.1.125/32",
+                    "cni.projectcalico.org/podIPs": "10.244.1.125/32",
+                    "kubearmor-policy": "enabled",
+                    "kubearmor-visibility": "process,file,network,capabilities"
+                },
+                "creationTimestamp": "2026-11-07T16:51:23Z",
+                "generateName": "kubearmor-relay-78cc8fbfb9-",
+                "generation": 1,
+                "labels": {
+                    "kubearmor-app": "kubearmor-relay",
+                    "pod-template-hash": "78cc8fbfb9"
+                },
+                "name": "kubearmor-relay-78cc8fbfb9-msw9t",
+                "namespace": "kubearmor",
+                "ownerReferences": [
+                    {
+                        "apiVersion": "apps/v1",
+                        "blockOwnerDeletion": true,
+                        "controller": true,
+                        "kind": "ReplicaSet",
+                        "name": "kubearmor-relay-78cc8fbfb9",
+                        "uid": "f47ea71a-e010-45f3-8ae5-a4abccdc58e5"
+                    }
+                ],
+                "resourceVersion": "5770709",
+                "uid": "8b379fba-ab08-440f-a987-df92c122f586"
+            },
+            "spec": {
+                "containers": [
+                    {
+                        "args": [
+                            "-tlsEnabled=false"
+                        ],
+                        "env": [
+                            {
+                                "name": "ENABLE_STDOUT_LOGS",
+                                "value": "false"
+                            },
+                            {
+                                "name": "ENABLE_STDOUT_ALERTS",
+                                "value": "false"
+                            },
+                            {
+                                "name": "ENABLE_STDOUT_MSGS",
+                                "value": "false"
+                            },
+                            {
+                                "name": "ENABLE_DASHBOARDS",
+                                "value": "false"
+                            },
+                            {
+                                "name": "ES_URL"
+                            },
+                            {
+                                "name": "ES_ALERTS_INDEX"
+                            },
+                            {
+                                "name": "ES_USERNAME",
+                                "valueFrom": {
+                                    "secretKeyRef": {
+                                        "key": "username",
+                                        "name": "elastic-secret",
+                                        "optional": true
+                                    }
+                                }
+                            },
+                            {
+                                "name": "ES_PASSWORD",
+                                "valueFrom": {
+                                    "secretKeyRef": {
+                                        "key": "password",
+                                        "name": "elastic-secret",
+                                        "optional": true
+                                    }
+                                }
+                            },
+                            {
+                                "name": "LOGPATH",
+                                "value": "stdout"
+                            }
+                        ],
+                        "image": "kubearmor/kubearmor-relay-server:stable",
+                        "imagePullPolicy": "Always",
+                        "name": "kubearmor-relay-server",
+                        "ports": [
+                            {
+                                "containerPort": 32767,
+                                "protocol": "TCP"
+                            }
+                        ],
+                        "resources": {
+                            "limits": {
+                                "cpu": "200m",
+                                "memory": "200Mi"
+                            },
+                            "requests": {
+                                "cpu": "50m",
+                                "memory": "50Mi"
+                            }
+                        },
+                        "terminationMessagePath": "/dev/termination-log",
+                        "terminationMessagePolicy": "File",
+                        "volumeMounts": [
+                            {
+                                "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount",
+                                "name": "kube-api-access-pfn4f",
+                                "readOnly": true
+                            }
+                        ]
+                    }
+                ],
+                "dnsPolicy": "ClusterFirst",
+                "enableServiceLinks": true,
+                "nodeName": "ref-worker2",
+                "nodeSelector": {
+                    "kubernetes.io/os": "linux"
+                },
+                "preemptionPolicy": "PreemptLowerPriority",
+                "priority": 0,
+                "restartPolicy": "Always",
+                "schedulerName": "default-scheduler",
+                "securityContext": {},
+                "serviceAccount": "kubearmor-relay",
+                "serviceAccountName": "kubearmor-relay",
+                "terminationGracePeriodSeconds": 30,
+                "tolerations": [
+                    {
+                        "effect": "NoExecute",
+                        "key": "node.kubernetes.io/not-ready",
+                        "operator": "Exists",
+                        "tolerationSeconds": 300
+                    },
+                    {
+                        "effect": "NoExecute",
+                        "key": "node.kubernetes.io/unreachable",
+                        "operator": "Exists",
+                        "tolerationSeconds": 300
+                    }
+                ],
+                "volumes": [
+                    {
+                        "name": "kube-api-access-pfn4f",
+                        "projected": {
+                            "defaultMode": 420,
+                            "sources": [
+                                {
+                                    "serviceAccountToken": {
+                                        "expirationSeconds": 3607,
+                                        "path": "token"
+                                    }
+                                },
+                                {
+                                    "configMap": {
+                                        "items": [
+                                            {
+                                                "key": "ca.crt",
+                                                "path": "ca.crt"
+                                            }
+                                        ],
+                                        "name": "kube-root-ca.crt"
+                                    }
+                                },
+                                {
+                                    "downwardAPI": {
+                                        "items": [
+                                            {
+                                                "fieldRef": {
+                                                    "apiVersion": "v1",
+                                                    "fieldPath": "metadata.namespace"
+                                                },
+                                                "path": "namespace"
+                                            }
+                                        ]
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                ]
+            },
+            "status": {
+                "conditions": [
+                    {
+                        "lastProbeTime": null,
+                        "lastTransitionTime": "2026-11-25T19:38:13Z",
+                        "observedGeneration": 1,
+                        "status": "True",
+                        "type": "PodReadyToStartContainers"
+                    },
+                    {
+                        "lastProbeTime": null,
+                        "lastTransitionTime": "2026-11-07T16:51:24Z",
+                        "observedGeneration": 1,
+                        "status": "True",
+                        "type": "Initialized"
+                    },
+                    {
+                        "lastProbeTime": null,
+                        "lastTransitionTime": "2026-11-25T19:38:13Z",
+                        "observedGeneration": 1,
+                        "status": "True",
+                        "type": "Ready"
+                    },
+                    {
+                        "lastProbeTime": null,
+                        "lastTransitionTime": "2026-11-25T19:38:13Z",
+                        "observedGeneration": 1,
+                        "status": "True",
+                        "type": "ContainersReady"
+                    },
+                    {
+                        "lastProbeTime": null,
+                        "lastTransitionTime": "2026-11-07T16:51:23Z",
+                        "observedGeneration": 1,
+                        "status": "True",
+                        "type": "PodScheduled"
+                    }
+                ],
+                "containerStatuses": [
+                    {
+                        "allocatedResources": {
+                            "cpu": "50m",
+                            "memory": "50Mi"
+                        },
+                        "containerID": "containerd://0b8e561763c5d072f708939393b468332f869cfdb1a427f032f7f6c0a26adffc",
+                        "image": "docker.io/kubearmor/kubearmor-relay-server:stable",
+                        "imageID": "docker.io/kubearmor/kubearmor-relay-server@sha256:73ec881d511c2d25276c0b467cbbe10aa7fd726efaa14ca3d3ac61ca90bce185",
+                        "lastState": {
+                            "terminated": {
+                                "containerID": "containerd://49ddf93fb8e9c5828e3c3487ee9bda1e7c509544a9507ed4a7a1aaea248e03c0",
+                                "exitCode": 255,
+                                "finishedAt": "2026-11-25T19:36:44Z",
+                                "reason": "Unknown",
+                                "startedAt": "2026-11-14T21:50:20Z"
+                            }
+                        },
+                        "name": "kubearmor-relay-server",
+                        "ready": true,
+                        "resources": {
+                            "limits": {
+                                "cpu": "200m",
+                                "memory": "200Mi"
+                            },
+                            "requests": {
+                                "cpu": "50m",
+                                "memory": "50Mi"
+                            }
+                        },
+                        "restartCount": 2,
+                        "started": true,
+                        "state": {
+                            "running": {
+                                "startedAt": "2026-11-25T19:38:12Z"
+                            }
+                        },
+                        "user": {
+                            "linux": {
+                                "gid": 1000,
+                                "supplementalGroups": [
+                                    1000
+                                ],
+                                "uid": 1000
+                            }
+                        },
+                        "volumeMounts": [
+                            {
+                                "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount",
+                                "name": "kube-api-access-pfn4f",
+                                "readOnly": true,
+                                "recursiveReadOnly": "Disabled"
+                            }
+                        ]
+                    }
+                ],
+                "hostIP": "172.19.0.5",
+                "hostIPs": [
+                    {
+                        "ip": "172.19.0.5"
+                    }
+                ],
+                "observedGeneration": 1,
+                "phase": "Running",
+                "podIP": "10.244.1.125",
+                "podIPs": [
+                    {
+                        "ip": "10.244.1.125"
+                    }
+                ],
+                "qosClass": "Burstable",
+                "startTime": "2026-11-07T16:51:24Z"
+            }
+        }
+    ],
+    "kind": "List",
+    "metadata": {
+        "resourceVersion": ""
+    }
+}

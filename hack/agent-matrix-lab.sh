@@ -273,6 +273,31 @@ print("%s %s phase=%s PolicyEnforced=%s exec-allow=%d paths blocked=%s sandbox-w
 PY
 }
 
+# unserved_bpf_nodes <nodes.json> <kubearmor pods.json>: the operator's D30
+# fact 1 (internal/engine/kubearmor_enforcer.go Enforcing): every node labelled
+# kubearmor.io/enforcer=bpf needs a Ready KubeArmor agent pod owned by a
+# DaemonSet, or the operator holds every Loop with NodeNotEnforcing. Prints
+# each node that lacks one; prints "ERROR ..." if the input is unreadable.
+unserved_bpf_nodes() {
+  python3 - "$@" <<'PY'
+import sys, json
+try:
+    nodes = json.load(open(sys.argv[1]))["items"]
+    pods = json.load(open(sys.argv[2]))["items"]
+except (OSError, ValueError, KeyError) as e:
+    print("ERROR cannot read nodes or pods (%s)" % e); sys.exit()
+served = set()
+for p in pods:
+    if (p["metadata"].get("labels") or {}).get("kubearmor-app") != "kubearmor": continue
+    if not any(o.get("kind") == "DaemonSet" for o in p["metadata"].get("ownerReferences") or []): continue
+    if any(c["type"] == "Ready" and c["status"] == "True" for c in p.get("status", {}).get("conditions") or []):
+        served.add(p["spec"].get("nodeName"))
+for n in nodes:
+    if (n["metadata"].get("labels") or {}).get("kubearmor.io/enforcer") == "bpf" and n["metadata"]["name"] not in served:
+        print(n["metadata"]["name"])
+PY
+}
+
 [ -n "${AGENT_MATRIX_LIB:-}" ] && return 0
 
 # ----- the run -------------------------------------------------------------
@@ -319,6 +344,14 @@ cat <<EOF
 EOF
 for i in $IMGS; do docker image inspect local/coxswain/$i:$TAG >/dev/null 2>&1 || fatal "image local/coxswain/$i:$TAG missing"; done
 git cat-file -e "$SHA" 2>/dev/null || fatal "$SHA not in $CHECKOUT"
+# The operator's D30 gate: a BPF-labelled node with no Ready KubeArmor agent
+# holds every Loop Suspended (NodeNotEnforcing). After a lab reboot KubeArmor's
+# snitch labelled the tainted control plane, where its DaemonSet does not run
+# (S10, 11-25). Stop here rather than watch Loops sit in Planning.
+$K get nodes -o json > "$EVID/nodes.json" 2>&1
+$K -n kubearmor get pods -o json > "$EVID/kubearmor-pods.json" 2>&1
+UNSERVED=$(unserved_bpf_nodes "$EVID/nodes.json" "$EVID/kubearmor-pods.json")
+[ -z "$UNSERVED" ] || fatal "the operator would hold every Loop (NodeNotEnforcing): no Ready KubeArmor agent on BPF-labelled node(s): ${UNSERVED//$'\n'/ }"
 $K -n $D get $DEP -o yaml > "$EVID/deploy-before.yaml"
 RETURN=$(git rev-parse HEAD)
 git checkout -q --detach "$SHA" && git log --oneline -1

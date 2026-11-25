@@ -228,6 +228,30 @@ wantnot "$T/o" "PASS" "an unsaved KubeArmorPolicy is never PASS"
 o3_verdict "$TD/r6-pi.loop-end.json" "$T/watch-ok.json" "$T/kapt-ok.json" "$T/policy.yaml" > "$T/o"
 want "$T/o" "NOT PROVEN r6-pi: the sandbox pod was never seen" "pods are matched by the Loop's own name"
 
+# KubeArmor coverage (the operator's D30 fact 1), on kind-ref's real nodes and
+# KubeArmor pods (11-25, after the control plane's enforcer label was removed).
+unserved_bpf_nodes "$TD/kind-ref.nodes.json" "$TD/kind-ref.kubearmor-pods.json" > "$T/o"
+[ ! -s "$T/o" ] || { cat "$T/o"; fail "kind-ref after the fix: every BPF node has an agent"; }
+python3 - "$TD/kind-ref.nodes.json" "$TD/kind-ref.kubearmor-pods.json" "$T" <<'PY'
+import json, sys
+n = json.load(open(sys.argv[1])); p = json.load(open(sys.argv[2])); d = sys.argv[3]
+for x in n["items"]:
+    if x["metadata"]["name"] == "ref-control-plane":
+        x["metadata"]["labels"]["kubearmor.io/enforcer"] = "bpf"   # the post-reboot snitch label
+json.dump(n, open(d + "/nodes-cp-labelled.json", "w"))
+for x in p["items"]:
+    if x["spec"].get("nodeName") == "ref-worker":
+        for c in x["status"]["conditions"]:
+            if c["type"] == "Ready": c["status"] = "False"
+json.dump(p, open(d + "/pods-worker-notready.json", "w"))
+PY
+unserved_bpf_nodes "$T/nodes-cp-labelled.json" "$TD/kind-ref.kubearmor-pods.json" > "$T/o"
+[ "$(cat "$T/o")" = ref-control-plane ] || { cat "$T/o"; fail "the labelled, tainted control plane with no agent is unserved"; }
+unserved_bpf_nodes "$TD/kind-ref.nodes.json" "$T/pods-worker-notready.json" > "$T/o"
+[ "$(cat "$T/o")" = ref-worker ] || { cat "$T/o"; fail "a node whose agent is not Ready is unserved"; }
+unserved_bpf_nodes "$T/missing.json" "$TD/kind-ref.kubearmor-pods.json" > "$T/o"
+want "$T/o" "ERROR cannot read nodes or pods" "unreadable input is an error, not an empty (all-served) answer"
+
 # ---- the real preflight, stubbed --------------------------------------
 mkdir -p "$T/bin" "$T/home/projects/coxswain"
 cat > "$T/bin/kubectl" <<'STUB'

@@ -1,0 +1,1432 @@
+{
+    "apiVersion": "v1",
+    "items": [
+        {
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": {
+                "annotations": {
+                    "node.alpha.kubernetes.io/ttl": "0",
+                    "projectcalico.org/IPv4Address": "172.19.0.4/16",
+                    "projectcalico.org/IPv4IPIPTunnelAddr": "10.244.100.64",
+                    "volumes.kubernetes.io/controller-managed-attach-detach": "true"
+                },
+                "creationTimestamp": "2026-10-23T20:56:39Z",
+                "labels": {
+                    "beta.kubernetes.io/arch": "amd64",
+                    "beta.kubernetes.io/os": "linux",
+                    "kubearmor.io/apparmorfs": "no",
+                    "kubearmor.io/btf": "yes",
+                    "kubearmor.io/nri-socket": "run_nri_nri.sock",
+                    "kubearmor.io/oci-hooks": "no",
+                    "kubearmor.io/rand": "nhw8",
+                    "kubearmor.io/runtime": "containerd",
+                    "kubearmor.io/seccomp": "yes",
+                    "kubearmor.io/securityfs": "yes",
+                    "kubearmor.io/socket": "run_containerd_containerd.sock",
+                    "kubernetes.io/arch": "amd64",
+                    "kubernetes.io/hostname": "ref-control-plane",
+                    "kubernetes.io/os": "linux",
+                    "node-role.kubernetes.io/control-plane": "",
+                    "node.kubernetes.io/exclude-from-external-load-balancers": ""
+                },
+                "name": "ref-control-plane",
+                "resourceVersion": "5777408",
+                "uid": "2106fc36-5a6e-4e7e-95d4-51b244c140ec"
+            },
+            "spec": {
+                "podCIDR": "10.244.0.0/24",
+                "podCIDRs": [
+                    "10.244.0.0/24"
+                ],
+                "providerID": "kind://docker/ref/ref-control-plane",
+                "taints": [
+                    {
+                        "effect": "NoSchedule",
+                        "key": "node-role.kubernetes.io/control-plane"
+                    }
+                ]
+            },
+            "status": {
+                "addresses": [
+                    {
+                        "address": "172.19.0.4",
+                        "type": "InternalIP"
+                    },
+                    {
+                        "address": "ref-control-plane",
+                        "type": "Hostname"
+                    }
+                ],
+                "allocatable": {
+                    "cpu": "16",
+                    "ephemeral-storage": "307438784Ki",
+                    "hugepages-1Gi": "0",
+                    "hugepages-2Mi": "0",
+                    "memory": "31809428Ki",
+                    "pods": "110"
+                },
+                "capacity": {
+                    "cpu": "16",
+                    "ephemeral-storage": "307438784Ki",
+                    "hugepages-1Gi": "0",
+                    "hugepages-2Mi": "0",
+                    "memory": "31809428Ki",
+                    "pods": "110"
+                },
+                "conditions": [
+                    {
+                        "lastHeartbeatTime": "2026-11-25T19:38:30Z",
+                        "lastTransitionTime": "2026-11-25T19:38:30Z",
+                        "message": "Calico is running on this node",
+                        "reason": "CalicoIsUp",
+                        "status": "False",
+                        "type": "NetworkUnavailable"
+                    },
+                    {
+                        "lastHeartbeatTime": "2026-11-25T20:12:28Z",
+                        "lastTransitionTime": "2026-10-23T20:56:38Z",
+                        "message": "kubelet has sufficient memory available",
+                        "reason": "KubeletHasSufficientMemory",
+                        "status": "False",
+                        "type": "MemoryPressure"
+                    },
+                    {
+                        "lastHeartbeatTime": "2026-11-25T20:12:28Z",
+                        "lastTransitionTime": "2026-10-23T20:56:38Z",
+                        "message": "kubelet has no disk pressure",
+                        "reason": "KubeletHasNoDiskPressure",
+                        "status": "False",
+                        "type": "DiskPressure"
+                    },
+                    {
+                        "lastHeartbeatTime": "2026-11-25T20:12:28Z",
+                        "lastTransitionTime": "2026-10-23T20:56:38Z",
+                        "message": "kubelet has sufficient PID available",
+                        "reason": "KubeletHasSufficientPID",
+                        "status": "False",
+                        "type": "PIDPressure"
+                    },
+                    {
+                        "lastHeartbeatTime": "2026-11-25T20:12:28Z",
+                        "lastTransitionTime": "2026-10-23T20:57:13Z",
+                        "message": "kubelet is posting ready status",
+                        "reason": "KubeletReady",
+                        "status": "True",
+                        "type": "Ready"
+                    }
+                ],
+                "daemonEndpoints": {
+                    "kubeletEndpoint": {
+                        "Port": 10250
+                    }
+                },
+                "features": {
+                    "supplementalGroupsPolicy": true
+                },
+                "images": [
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/agent-hermes:c6-61ed6ff",
+                            "docker.io/local/coxswain/agent-hermes:s10-48aa40b"
+                        ],
+                        "sizeBytes": 3570680259
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/agent-codex:c6-61ed6ff",
+                            "docker.io/local/coxswain/agent-codex:s10-48aa40b"
+                        ],
+                        "sizeBytes": 1503933611
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/agent-opencode:c6-61ed6ff",
+                            "docker.io/local/coxswain/agent-opencode:s10-48aa40b"
+                        ],
+                        "sizeBytes": 1491645110
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/agent-claude-code:c6-61ed6ff",
+                            "docker.io/local/coxswain/agent-claude-code:s10-48aa40b"
+                        ],
+                        "sizeBytes": 1458773714
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/agent-pi:c6-61ed6ff",
+                            "docker.io/local/coxswain/agent-pi:s10-48aa40b"
+                        ],
+                        "sizeBytes": 1196190913
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/runner:c6-61ed6ff",
+                            "docker.io/local/coxswain/runner:s10-48aa40b"
+                        ],
+                        "sizeBytes": 915694978
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/runner:7ab11ec"
+                        ],
+                        "sizeBytes": 915621250
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/runner:c522-fe46e76"
+                        ],
+                        "sizeBytes": 915621250
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/runner:3aff005"
+                        ],
+                        "sizeBytes": 915621250
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/runner:c525-c1ba5c7",
+                            "docker.io/local/coxswain/runner:c525-fa9d121"
+                        ],
+                        "sizeBytes": 915621250
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/runner:r2-2bb5177"
+                        ],
+                        "sizeBytes": 915621250
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/runner:r3-badd801"
+                        ],
+                        "sizeBytes": 915621250
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/runner:bed9ba7"
+                        ],
+                        "sizeBytes": 915621249
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/runner:34daeee"
+                        ],
+                        "sizeBytes": 915431213
+                    },
+                    {
+                        "names": [
+                            "docker.io/library/golang:1.26"
+                        ],
+                        "sizeBytes": 900669257
+                    },
+                    {
+                        "names": [
+                            "docker.io/gitea/gitea:1.24"
+                        ],
+                        "sizeBytes": 181025707
+                    },
+                    {
+                        "names": [
+                            "docker.io/calico/node@sha256:c1880682c5a0aed91104cdbd809fd8681ff836d797200906b174d4544b2bca75",
+                            "docker.io/calico/node:v3.30.1"
+                        ],
+                        "sizeBytes": 156519395
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/main:c6-61ed6ff",
+                            "docker.io/local/coxswain/main:s10-48aa40b"
+                        ],
+                        "sizeBytes": 117458105
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/main:c525-fa9d121"
+                        ],
+                        "sizeBytes": 117440186
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/main:c525-c1ba5c7"
+                        ],
+                        "sizeBytes": 117439670
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/main:7ab11ec"
+                        ],
+                        "sizeBytes": 117438647
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/main:c522-fe46e76"
+                        ],
+                        "sizeBytes": 117438646
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/main:3aff005"
+                        ],
+                        "sizeBytes": 117434554
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/main:r3-badd801"
+                        ],
+                        "sizeBytes": 117408954
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/main:bed9ba7"
+                        ],
+                        "sizeBytes": 117408954
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/main:r2-2bb5177"
+                        ],
+                        "sizeBytes": 117407930
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/main:e1-9dfa68a"
+                        ],
+                        "sizeBytes": 117403322
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/main:r2-dcd3e42"
+                        ],
+                        "sizeBytes": 117403321
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/main:j5b-e8600fc"
+                        ],
+                        "sizeBytes": 113812653
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/main:j5b-3d31704"
+                        ],
+                        "sizeBytes": 113808557
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/main:f54M2"
+                        ],
+                        "sizeBytes": 91241677
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/main:f54M5"
+                        ],
+                        "sizeBytes": 91241165
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/main:f54M3"
+                        ],
+                        "sizeBytes": 91241165
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/main:f54M1"
+                        ],
+                        "sizeBytes": 91241165
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/main:f54main"
+                        ],
+                        "sizeBytes": 91241165
+                    },
+                    {
+                        "names": null,
+                        "sizeBytes": 91241164
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/main:f55"
+                        ],
+                        "sizeBytes": 91240141
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/main:0a048fc"
+                        ],
+                        "sizeBytes": 91220172
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/main:86d1135"
+                        ],
+                        "sizeBytes": 91211981
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/p5c:ed65ad3"
+                        ],
+                        "sizeBytes": 91211981
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/p5c:0963416",
+                            "docker.io/local/coxswain/p5c:20261023",
+                            "docker.io/local/coxswain/p5c:8508c64",
+                            "docker.io/local/coxswain/runner:20261023"
+                        ],
+                        "sizeBytes": 91210957
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/p5c:34daeee"
+                        ],
+                        "sizeBytes": 91210957
+                    },
+                    {
+                        "names": [
+                            "registry.k8s.io/kube-apiserver-amd64:v1.34.0",
+                            "registry.k8s.io/kube-apiserver:v1.34.0"
+                        ],
+                        "sizeBytes": 89044732
+                    },
+                    {
+                        "names": [
+                            "registry.k8s.io/kube-controller-manager-amd64:v1.34.0",
+                            "registry.k8s.io/kube-controller-manager:v1.34.0"
+                        ],
+                        "sizeBytes": 75998818
+                    },
+                    {
+                        "names": [
+                            "registry.k8s.io/etcd:3.6.4-0"
+                        ],
+                        "sizeBytes": 74311308
+                    },
+                    {
+                        "names": [
+                            "registry.k8s.io/kube-proxy-amd64:v1.34.0",
+                            "registry.k8s.io/kube-proxy:v1.34.0"
+                        ],
+                        "sizeBytes": 73135815
+                    },
+                    {
+                        "names": [
+                            "docker.io/calico/cni@sha256:191f0d9b082070be55b6ce0785817f7cb415097d212ca04c0c1d5448b3fdd062",
+                            "docker.io/calico/cni:v3.30.1"
+                        ],
+                        "sizeBytes": 71899200
+                    },
+                    {
+                        "names": [
+                            "docker.io/library/python:3-alpine"
+                        ],
+                        "sizeBytes": 58896357
+                    },
+                    {
+                        "names": [
+                            "registry.k8s.io/kube-scheduler-amd64:v1.34.0",
+                            "registry.k8s.io/kube-scheduler:v1.34.0"
+                        ],
+                        "sizeBytes": 53839458
+                    },
+                    {
+                        "names": [
+                            "docker.io/calico/kube-controllers@sha256:6055d8c7dcef2ac7d454084ac8199012fdeb904110991747655bb7b5c116588e",
+                            "docker.io/calico/kube-controllers:v3.30.1"
+                        ],
+                        "sizeBytes": 52739522
+                    }
+                ],
+                "nodeInfo": {
+                    "architecture": "amd64",
+                    "bootID": "f6eea374-795c-4647-a097-e3bd436fbbce",
+                    "containerRuntimeVersion": "containerd://2.1.3",
+                    "kernelVersion": "7.0.0-43-generic",
+                    "kubeProxyVersion": "",
+                    "kubeletVersion": "v1.34.0",
+                    "machineID": "44203f240a354d589e3f9da1fd2aa083",
+                    "operatingSystem": "linux",
+                    "osImage": "Debian GNU/Linux 12 (bookworm)",
+                    "systemUUID": "ab39ac54-ec8c-4b03-ae87-43c6e3f938ff"
+                },
+                "runtimeHandlers": [
+                    {
+                        "features": {
+                            "recursiveReadOnlyMounts": true,
+                            "userNamespaces": true
+                        },
+                        "name": "runc"
+                    },
+                    {
+                        "features": {
+                            "recursiveReadOnlyMounts": true,
+                            "userNamespaces": true
+                        },
+                        "name": ""
+                    },
+                    {
+                        "features": {
+                            "recursiveReadOnlyMounts": true,
+                            "userNamespaces": true
+                        },
+                        "name": "test-handler"
+                    }
+                ]
+            }
+        },
+        {
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": {
+                "annotations": {
+                    "node.alpha.kubernetes.io/ttl": "0",
+                    "projectcalico.org/IPv4Address": "172.19.0.2/16",
+                    "projectcalico.org/IPv4IPIPTunnelAddr": "10.244.97.64",
+                    "volumes.kubernetes.io/controller-managed-attach-detach": "true"
+                },
+                "creationTimestamp": "2026-10-23T20:56:56Z",
+                "labels": {
+                    "beta.kubernetes.io/arch": "amd64",
+                    "beta.kubernetes.io/os": "linux",
+                    "kubearmor.io/apparmorfs": "no",
+                    "kubearmor.io/btf": "yes",
+                    "kubearmor.io/enforcer": "bpf",
+                    "kubearmor.io/nri-socket": "run_nri_nri.sock",
+                    "kubearmor.io/oci-hooks": "no",
+                    "kubearmor.io/rand": "jmwc",
+                    "kubearmor.io/runtime": "containerd",
+                    "kubearmor.io/seccomp": "yes",
+                    "kubearmor.io/securityfs": "yes",
+                    "kubearmor.io/socket": "run_containerd_containerd.sock",
+                    "kubernetes.io/arch": "amd64",
+                    "kubernetes.io/hostname": "ref-worker",
+                    "kubernetes.io/os": "linux"
+                },
+                "name": "ref-worker",
+                "resourceVersion": "5777291",
+                "uid": "6e9226d9-863c-4e4a-bfbc-052856809f22"
+            },
+            "spec": {
+                "podCIDR": "10.244.1.0/24",
+                "podCIDRs": [
+                    "10.244.1.0/24"
+                ],
+                "providerID": "kind://docker/ref/ref-worker"
+            },
+            "status": {
+                "addresses": [
+                    {
+                        "address": "172.19.0.2",
+                        "type": "InternalIP"
+                    },
+                    {
+                        "address": "ref-worker",
+                        "type": "Hostname"
+                    }
+                ],
+                "allocatable": {
+                    "cpu": "16",
+                    "ephemeral-storage": "307438784Ki",
+                    "hugepages-1Gi": "0",
+                    "hugepages-2Mi": "0",
+                    "memory": "31809428Ki",
+                    "pods": "110"
+                },
+                "capacity": {
+                    "cpu": "16",
+                    "ephemeral-storage": "307438784Ki",
+                    "hugepages-1Gi": "0",
+                    "hugepages-2Mi": "0",
+                    "memory": "31809428Ki",
+                    "pods": "110"
+                },
+                "conditions": [
+                    {
+                        "lastHeartbeatTime": "2026-11-25T19:37:56Z",
+                        "lastTransitionTime": "2026-11-25T19:37:56Z",
+                        "message": "Calico is running on this node",
+                        "reason": "CalicoIsUp",
+                        "status": "False",
+                        "type": "NetworkUnavailable"
+                    },
+                    {
+                        "lastHeartbeatTime": "2026-11-25T20:12:08Z",
+                        "lastTransitionTime": "2026-10-23T20:56:56Z",
+                        "message": "kubelet has sufficient memory available",
+                        "reason": "KubeletHasSufficientMemory",
+                        "status": "False",
+                        "type": "MemoryPressure"
+                    },
+                    {
+                        "lastHeartbeatTime": "2026-11-25T20:12:08Z",
+                        "lastTransitionTime": "2026-10-23T20:56:56Z",
+                        "message": "kubelet has no disk pressure",
+                        "reason": "KubeletHasNoDiskPressure",
+                        "status": "False",
+                        "type": "DiskPressure"
+                    },
+                    {
+                        "lastHeartbeatTime": "2026-11-25T20:12:08Z",
+                        "lastTransitionTime": "2026-10-23T20:56:56Z",
+                        "message": "kubelet has sufficient PID available",
+                        "reason": "KubeletHasSufficientPID",
+                        "status": "False",
+                        "type": "PIDPressure"
+                    },
+                    {
+                        "lastHeartbeatTime": "2026-11-25T20:12:08Z",
+                        "lastTransitionTime": "2026-10-23T20:57:15Z",
+                        "message": "kubelet is posting ready status",
+                        "reason": "KubeletReady",
+                        "status": "True",
+                        "type": "Ready"
+                    }
+                ],
+                "daemonEndpoints": {
+                    "kubeletEndpoint": {
+                        "Port": 10250
+                    }
+                },
+                "features": {
+                    "supplementalGroupsPolicy": true
+                },
+                "images": [
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/agent-hermes:c6-61ed6ff",
+                            "docker.io/local/coxswain/agent-hermes:s10-48aa40b"
+                        ],
+                        "sizeBytes": 3570680259
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/agent-codex:c6-61ed6ff",
+                            "docker.io/local/coxswain/agent-codex:s10-48aa40b"
+                        ],
+                        "sizeBytes": 1503933611
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/agent-opencode:c6-61ed6ff",
+                            "docker.io/local/coxswain/agent-opencode:s10-48aa40b"
+                        ],
+                        "sizeBytes": 1491645110
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/agent-claude-code:c6-61ed6ff",
+                            "docker.io/local/coxswain/agent-claude-code:s10-48aa40b"
+                        ],
+                        "sizeBytes": 1458773714
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/agent-pi:c6-61ed6ff",
+                            "docker.io/local/coxswain/agent-pi:s10-48aa40b"
+                        ],
+                        "sizeBytes": 1196190913
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/runner:c6-61ed6ff",
+                            "docker.io/local/coxswain/runner:s10-48aa40b"
+                        ],
+                        "sizeBytes": 915694978
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/runner:7ab11ec"
+                        ],
+                        "sizeBytes": 915621250
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/runner:c522-fe46e76"
+                        ],
+                        "sizeBytes": 915621250
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/runner:3aff005"
+                        ],
+                        "sizeBytes": 915621250
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/runner:c525-c1ba5c7",
+                            "docker.io/local/coxswain/runner:c525-fa9d121"
+                        ],
+                        "sizeBytes": 915621250
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/runner:r2-2bb5177"
+                        ],
+                        "sizeBytes": 915621250
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/runner:r3-badd801"
+                        ],
+                        "sizeBytes": 915621250
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/runner:bed9ba7"
+                        ],
+                        "sizeBytes": 915621249
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/runner:34daeee"
+                        ],
+                        "sizeBytes": 915431213
+                    },
+                    {
+                        "names": [
+                            "docker.io/library/golang:1.26"
+                        ],
+                        "sizeBytes": 900669257
+                    },
+                    {
+                        "names": [
+                            "docker.io/kubearmor/kubearmor-init@sha256:2f8d3bcc03321398cd2feb0a6815418fc6b3a379e6c874e9c7e11be54267ef5b",
+                            "docker.io/kubearmor/kubearmor-init:v1.7.5"
+                        ],
+                        "sizeBytes": 266387387
+                    },
+                    {
+                        "names": [
+                            "docker.io/gitea/gitea:1.24"
+                        ],
+                        "sizeBytes": 181025707
+                    },
+                    {
+                        "names": [
+                            "docker.io/calico/node@sha256:c1880682c5a0aed91104cdbd809fd8681ff836d797200906b174d4544b2bca75",
+                            "docker.io/calico/node:v3.30.1"
+                        ],
+                        "sizeBytes": 156519395
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/main:c6-61ed6ff",
+                            "docker.io/local/coxswain/main:s10-48aa40b"
+                        ],
+                        "sizeBytes": 117458105
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/main:c525-fa9d121"
+                        ],
+                        "sizeBytes": 117440186
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/main:c525-c1ba5c7"
+                        ],
+                        "sizeBytes": 117439670
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/main:7ab11ec"
+                        ],
+                        "sizeBytes": 117438647
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/main:c522-fe46e76"
+                        ],
+                        "sizeBytes": 117438646
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/main:3aff005"
+                        ],
+                        "sizeBytes": 117434554
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/main:r3-badd801"
+                        ],
+                        "sizeBytes": 117408954
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/main:bed9ba7"
+                        ],
+                        "sizeBytes": 117408954
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/main:r2-2bb5177"
+                        ],
+                        "sizeBytes": 117407930
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/main:e1-9dfa68a"
+                        ],
+                        "sizeBytes": 117403322
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/main:r2-dcd3e42"
+                        ],
+                        "sizeBytes": 117403321
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/main:j5b-e8600fc"
+                        ],
+                        "sizeBytes": 113810247
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/main:j5b-3d31704"
+                        ],
+                        "sizeBytes": 113806151
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/main:f54M2"
+                        ],
+                        "sizeBytes": 91241677
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/main:f54M5"
+                        ],
+                        "sizeBytes": 91241165
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/main:f54M3"
+                        ],
+                        "sizeBytes": 91241165
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/main:f54M1"
+                        ],
+                        "sizeBytes": 91241165
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/main:f54main"
+                        ],
+                        "sizeBytes": 91241165
+                    },
+                    {
+                        "names": null,
+                        "sizeBytes": 91241164
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/main:f55"
+                        ],
+                        "sizeBytes": 91240141
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/main:0a048fc"
+                        ],
+                        "sizeBytes": 91220172
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/main:86d1135"
+                        ],
+                        "sizeBytes": 91211981
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/p5c:ed65ad3"
+                        ],
+                        "sizeBytes": 91211981
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/p5c:0963416",
+                            "docker.io/local/coxswain/p5c:20261023",
+                            "docker.io/local/coxswain/p5c:8508c64",
+                            "docker.io/local/coxswain/runner:20261023"
+                        ],
+                        "sizeBytes": 91210957
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/p5c:34daeee"
+                        ],
+                        "sizeBytes": 91210957
+                    },
+                    {
+                        "names": [
+                            "registry.k8s.io/kube-apiserver-amd64:v1.34.0",
+                            "registry.k8s.io/kube-apiserver:v1.34.0"
+                        ],
+                        "sizeBytes": 89044732
+                    },
+                    {
+                        "names": [
+                            "registry.k8s.io/kube-controller-manager-amd64:v1.34.0",
+                            "registry.k8s.io/kube-controller-manager:v1.34.0"
+                        ],
+                        "sizeBytes": 75998818
+                    },
+                    {
+                        "names": [
+                            "registry.k8s.io/etcd:3.6.4-0"
+                        ],
+                        "sizeBytes": 74311308
+                    },
+                    {
+                        "names": [
+                            "registry.k8s.io/kube-proxy-amd64:v1.34.0",
+                            "registry.k8s.io/kube-proxy:v1.34.0"
+                        ],
+                        "sizeBytes": 73135815
+                    },
+                    {
+                        "names": [
+                            "docker.io/kubearmor/kubearmor@sha256:336fe04a4f768d477a27846e3f853b5844137e41b5194bd5365e0ff120498c60",
+                            "docker.io/kubearmor/kubearmor:v1.7.5"
+                        ],
+                        "sizeBytes": 72963731
+                    },
+                    {
+                        "names": [
+                            "docker.io/calico/cni@sha256:191f0d9b082070be55b6ce0785817f7cb415097d212ca04c0c1d5448b3fdd062",
+                            "docker.io/calico/cni:v3.30.1"
+                        ],
+                        "sizeBytes": 71899200
+                    },
+                    {
+                        "names": [
+                            "docker.io/kubearmor/kubearmor-relay-server@sha256:73ec881d511c2d25276c0b467cbbe10aa7fd726efaa14ca3d3ac61ca90bce185",
+                            "docker.io/kubearmor/kubearmor-relay-server:stable"
+                        ],
+                        "sizeBytes": 71218538
+                    }
+                ],
+                "nodeInfo": {
+                    "architecture": "amd64",
+                    "bootID": "f6eea374-795c-4647-a097-e3bd436fbbce",
+                    "containerRuntimeVersion": "containerd://2.1.3",
+                    "kernelVersion": "7.0.0-43-generic",
+                    "kubeProxyVersion": "",
+                    "kubeletVersion": "v1.34.0",
+                    "machineID": "4b0fdba829414619adba6bbc5a70a5c3",
+                    "operatingSystem": "linux",
+                    "osImage": "Debian GNU/Linux 12 (bookworm)",
+                    "systemUUID": "df30dd48-6fa1-4a51-ab5d-a51802caef71"
+                },
+                "runtimeHandlers": [
+                    {
+                        "features": {
+                            "recursiveReadOnlyMounts": true,
+                            "userNamespaces": true
+                        },
+                        "name": "runc"
+                    },
+                    {
+                        "features": {
+                            "recursiveReadOnlyMounts": true,
+                            "userNamespaces": true
+                        },
+                        "name": ""
+                    },
+                    {
+                        "features": {
+                            "recursiveReadOnlyMounts": true,
+                            "userNamespaces": true
+                        },
+                        "name": "test-handler"
+                    }
+                ]
+            }
+        },
+        {
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": {
+                "annotations": {
+                    "node.alpha.kubernetes.io/ttl": "0",
+                    "projectcalico.org/IPv4Address": "172.19.0.5/16",
+                    "projectcalico.org/IPv4IPIPTunnelAddr": "10.244.1.64",
+                    "volumes.kubernetes.io/controller-managed-attach-detach": "true"
+                },
+                "creationTimestamp": "2026-10-23T20:56:56Z",
+                "labels": {
+                    "beta.kubernetes.io/arch": "amd64",
+                    "beta.kubernetes.io/os": "linux",
+                    "kubearmor.io/apparmorfs": "no",
+                    "kubearmor.io/btf": "yes",
+                    "kubearmor.io/enforcer": "bpf",
+                    "kubearmor.io/nri-socket": "run_nri_nri.sock",
+                    "kubearmor.io/oci-hooks": "no",
+                    "kubearmor.io/rand": "844s",
+                    "kubearmor.io/runtime": "containerd",
+                    "kubearmor.io/seccomp": "yes",
+                    "kubearmor.io/securityfs": "yes",
+                    "kubearmor.io/socket": "run_containerd_containerd.sock",
+                    "kubernetes.io/arch": "amd64",
+                    "kubernetes.io/hostname": "ref-worker2",
+                    "kubernetes.io/os": "linux"
+                },
+                "name": "ref-worker2",
+                "resourceVersion": "5777362",
+                "uid": "15213b2f-533c-4a90-ad07-ab95ba391fbb"
+            },
+            "spec": {
+                "podCIDR": "10.244.2.0/24",
+                "podCIDRs": [
+                    "10.244.2.0/24"
+                ],
+                "providerID": "kind://docker/ref/ref-worker2"
+            },
+            "status": {
+                "addresses": [
+                    {
+                        "address": "172.19.0.5",
+                        "type": "InternalIP"
+                    },
+                    {
+                        "address": "ref-worker2",
+                        "type": "Hostname"
+                    }
+                ],
+                "allocatable": {
+                    "cpu": "16",
+                    "ephemeral-storage": "307438784Ki",
+                    "hugepages-1Gi": "0",
+                    "hugepages-2Mi": "0",
+                    "memory": "31809428Ki",
+                    "pods": "110"
+                },
+                "capacity": {
+                    "cpu": "16",
+                    "ephemeral-storage": "307438784Ki",
+                    "hugepages-1Gi": "0",
+                    "hugepages-2Mi": "0",
+                    "memory": "31809428Ki",
+                    "pods": "110"
+                },
+                "conditions": [
+                    {
+                        "lastHeartbeatTime": "2026-11-25T19:37:59Z",
+                        "lastTransitionTime": "2026-11-25T19:37:59Z",
+                        "message": "Calico is running on this node",
+                        "reason": "CalicoIsUp",
+                        "status": "False",
+                        "type": "NetworkUnavailable"
+                    },
+                    {
+                        "lastHeartbeatTime": "2026-11-25T20:12:16Z",
+                        "lastTransitionTime": "2026-10-23T20:56:56Z",
+                        "message": "kubelet has sufficient memory available",
+                        "reason": "KubeletHasSufficientMemory",
+                        "status": "False",
+                        "type": "MemoryPressure"
+                    },
+                    {
+                        "lastHeartbeatTime": "2026-11-25T20:12:16Z",
+                        "lastTransitionTime": "2026-10-23T20:56:56Z",
+                        "message": "kubelet has no disk pressure",
+                        "reason": "KubeletHasNoDiskPressure",
+                        "status": "False",
+                        "type": "DiskPressure"
+                    },
+                    {
+                        "lastHeartbeatTime": "2026-11-25T20:12:16Z",
+                        "lastTransitionTime": "2026-10-23T20:56:56Z",
+                        "message": "kubelet has sufficient PID available",
+                        "reason": "KubeletHasSufficientPID",
+                        "status": "False",
+                        "type": "PIDPressure"
+                    },
+                    {
+                        "lastHeartbeatTime": "2026-11-25T20:12:16Z",
+                        "lastTransitionTime": "2026-10-23T20:57:15Z",
+                        "message": "kubelet is posting ready status",
+                        "reason": "KubeletReady",
+                        "status": "True",
+                        "type": "Ready"
+                    }
+                ],
+                "daemonEndpoints": {
+                    "kubeletEndpoint": {
+                        "Port": 10250
+                    }
+                },
+                "features": {
+                    "supplementalGroupsPolicy": true
+                },
+                "images": [
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/agent-hermes:c6-61ed6ff",
+                            "docker.io/local/coxswain/agent-hermes:s10-48aa40b"
+                        ],
+                        "sizeBytes": 3570680259
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/agent-codex:c6-61ed6ff",
+                            "docker.io/local/coxswain/agent-codex:s10-48aa40b"
+                        ],
+                        "sizeBytes": 1503933611
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/agent-opencode:c6-61ed6ff",
+                            "docker.io/local/coxswain/agent-opencode:s10-48aa40b"
+                        ],
+                        "sizeBytes": 1491645110
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/agent-claude-code:c6-61ed6ff",
+                            "docker.io/local/coxswain/agent-claude-code:s10-48aa40b"
+                        ],
+                        "sizeBytes": 1458773714
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/agent-pi:c6-61ed6ff",
+                            "docker.io/local/coxswain/agent-pi:s10-48aa40b"
+                        ],
+                        "sizeBytes": 1196190913
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/runner:c6-61ed6ff",
+                            "docker.io/local/coxswain/runner:s10-48aa40b"
+                        ],
+                        "sizeBytes": 915694978
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/runner:7ab11ec"
+                        ],
+                        "sizeBytes": 915621250
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/runner:c522-fe46e76"
+                        ],
+                        "sizeBytes": 915621250
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/runner:3aff005"
+                        ],
+                        "sizeBytes": 915621250
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/runner:c525-c1ba5c7",
+                            "docker.io/local/coxswain/runner:c525-fa9d121"
+                        ],
+                        "sizeBytes": 915621250
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/runner:r2-2bb5177"
+                        ],
+                        "sizeBytes": 915621250
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/runner:r3-badd801"
+                        ],
+                        "sizeBytes": 915621250
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/runner:bed9ba7"
+                        ],
+                        "sizeBytes": 915621249
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/runner:34daeee"
+                        ],
+                        "sizeBytes": 915431213
+                    },
+                    {
+                        "names": [
+                            "docker.io/library/golang:1.26"
+                        ],
+                        "sizeBytes": 900669257
+                    },
+                    {
+                        "names": [
+                            "docker.io/kubearmor/kubearmor-init@sha256:2f8d3bcc03321398cd2feb0a6815418fc6b3a379e6c874e9c7e11be54267ef5b",
+                            "docker.io/kubearmor/kubearmor-init:v1.7.5"
+                        ],
+                        "sizeBytes": 266387387
+                    },
+                    {
+                        "names": [
+                            "docker.io/gitea/gitea@sha256:918955f16b1e91732af6c449bb2db3a34271748dbed1ccfbae48f8a2fb5480b8",
+                            "docker.io/gitea/gitea:1.24"
+                        ],
+                        "sizeBytes": 181025707
+                    },
+                    {
+                        "names": [
+                            "docker.io/calico/node@sha256:c1880682c5a0aed91104cdbd809fd8681ff836d797200906b174d4544b2bca75",
+                            "docker.io/calico/node:v3.30.1"
+                        ],
+                        "sizeBytes": 156519395
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/main:c6-61ed6ff",
+                            "docker.io/local/coxswain/main:s10-48aa40b"
+                        ],
+                        "sizeBytes": 117458105
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/main:c525-fa9d121"
+                        ],
+                        "sizeBytes": 117440186
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/main:c525-c1ba5c7"
+                        ],
+                        "sizeBytes": 117439670
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/main:7ab11ec"
+                        ],
+                        "sizeBytes": 117438647
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/main:c522-fe46e76"
+                        ],
+                        "sizeBytes": 117438646
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/main:3aff005"
+                        ],
+                        "sizeBytes": 117434554
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/main:r3-badd801"
+                        ],
+                        "sizeBytes": 117408954
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/main:bed9ba7"
+                        ],
+                        "sizeBytes": 117408954
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/main:r2-2bb5177"
+                        ],
+                        "sizeBytes": 117407930
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/main:e1-9dfa68a"
+                        ],
+                        "sizeBytes": 117403322
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/main:r2-dcd3e42"
+                        ],
+                        "sizeBytes": 117403321
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/main:j5b-e8600fc"
+                        ],
+                        "sizeBytes": 113817442
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/main:j5b-3d31704"
+                        ],
+                        "sizeBytes": 113813346
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/main:f54M2"
+                        ],
+                        "sizeBytes": 91241677
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/main:f54M5"
+                        ],
+                        "sizeBytes": 91241165
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/main:f54M3"
+                        ],
+                        "sizeBytes": 91241165
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/main:f54M1"
+                        ],
+                        "sizeBytes": 91241165
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/main:f54main"
+                        ],
+                        "sizeBytes": 91241165
+                    },
+                    {
+                        "names": null,
+                        "sizeBytes": 91241164
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/main:f55"
+                        ],
+                        "sizeBytes": 91240141
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/main:0a048fc"
+                        ],
+                        "sizeBytes": 91220172
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/main:86d1135"
+                        ],
+                        "sizeBytes": 91211981
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/p5c:ed65ad3"
+                        ],
+                        "sizeBytes": 91211981
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/p5c:0963416",
+                            "docker.io/local/coxswain/p5c:20261023",
+                            "docker.io/local/coxswain/p5c:8508c64",
+                            "docker.io/local/coxswain/runner:20261023"
+                        ],
+                        "sizeBytes": 91210957
+                    },
+                    {
+                        "names": [
+                            "docker.io/local/coxswain/p5c:34daeee"
+                        ],
+                        "sizeBytes": 91210957
+                    },
+                    {
+                        "names": [
+                            "registry.k8s.io/kube-apiserver-amd64:v1.34.0",
+                            "registry.k8s.io/kube-apiserver:v1.34.0"
+                        ],
+                        "sizeBytes": 89044732
+                    },
+                    {
+                        "names": [
+                            "registry.k8s.io/kube-controller-manager-amd64:v1.34.0",
+                            "registry.k8s.io/kube-controller-manager:v1.34.0"
+                        ],
+                        "sizeBytes": 75998818
+                    },
+                    {
+                        "names": [
+                            "registry.k8s.io/etcd:3.6.4-0"
+                        ],
+                        "sizeBytes": 74311308
+                    },
+                    {
+                        "names": [
+                            "registry.k8s.io/kube-proxy-amd64:v1.34.0",
+                            "registry.k8s.io/kube-proxy:v1.34.0"
+                        ],
+                        "sizeBytes": 73135815
+                    },
+                    {
+                        "names": [
+                            "docker.io/kubearmor/kubearmor@sha256:336fe04a4f768d477a27846e3f853b5844137e41b5194bd5365e0ff120498c60",
+                            "docker.io/kubearmor/kubearmor:v1.7.5"
+                        ],
+                        "sizeBytes": 72963731
+                    },
+                    {
+                        "names": [
+                            "docker.io/calico/cni@sha256:191f0d9b082070be55b6ce0785817f7cb415097d212ca04c0c1d5448b3fdd062",
+                            "docker.io/calico/cni:v3.30.1"
+                        ],
+                        "sizeBytes": 71899200
+                    },
+                    {
+                        "names": [
+                            "docker.io/kubearmor/kubearmor-relay-server@sha256:73ec881d511c2d25276c0b467cbbe10aa7fd726efaa14ca3d3ac61ca90bce185",
+                            "docker.io/kubearmor/kubearmor-relay-server:stable"
+                        ],
+                        "sizeBytes": 71218538
+                    }
+                ],
+                "nodeInfo": {
+                    "architecture": "amd64",
+                    "bootID": "f6eea374-795c-4647-a097-e3bd436fbbce",
+                    "containerRuntimeVersion": "containerd://2.1.3",
+                    "kernelVersion": "7.0.0-43-generic",
+                    "kubeProxyVersion": "",
+                    "kubeletVersion": "v1.34.0",
+                    "machineID": "b79f90499d1141afb25a0ea7c1550b13",
+                    "operatingSystem": "linux",
+                    "osImage": "Debian GNU/Linux 12 (bookworm)",
+                    "systemUUID": "55b7cf4c-38da-425c-bb0d-6053c071b733"
+                },
+                "runtimeHandlers": [
+                    {
+                        "features": {
+                            "recursiveReadOnlyMounts": true,
+                            "userNamespaces": true
+                        },
+                        "name": "runc"
+                    },
+                    {
+                        "features": {
+                            "recursiveReadOnlyMounts": true,
+                            "userNamespaces": true
+                        },
+                        "name": ""
+                    },
+                    {
+                        "features": {
+                            "recursiveReadOnlyMounts": true,
+                            "userNamespaces": true
+                        },
+                        "name": "test-handler"
+                    }
+                ]
+            }
+        }
+    ],
+    "kind": "List",
+    "metadata": {
+        "resourceVersion": ""
+    }
+}

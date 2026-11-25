@@ -1,0 +1,60 @@
+# O3 (docs/PLAN-AGENT-ADAPTERS.md, docs/AGENT-HARNESSES.md): an exec allowlist for the pi
+# agent adapter (spec.agent.harness: pi). Reference it with spec.policyRefs: [agent-pi].
+#
+# With a non-empty exec list the Loop's KubeArmorPolicy is an allowlist under Block for the
+# WHOLE sandbox pod, init containers included, so the list holds:
+#   - the platform: the adapter (/usr/local/bin/runner) and fence-wait's python3 (the
+#     pinned python:3.13-alpine probe image);
+#   - the init containers' tools (cat, cp, mkdir, base64, rm) and git;
+#   - the shell (/bin/sh is required: ExecListMissingShell), git and the Go toolchain;
+#   - the binaries the pi agent ran in learn mode on kind-ref (11-25).
+#
+# What this list cannot allow (D46, R15): anything under /workspace, /scratch or /tmp,
+# so the agent's own `go test` cannot run its test binary in the sandbox (the verify Job
+# runs the checks). A command the agent tries that is not listed is denied and recorded.
+apiVersion: coxswain.wattu.com/v1alpha1
+kind: AgentPolicy
+metadata:
+  name: agent-pi
+spec:
+  exec:
+    - /usr/local/bin/runner
+    - /usr/local/bin/python3
+    - /usr/local/bin/python3.13
+    - /bin/sh
+    - /usr/bin/sh
+    - /usr/bin/dash
+    - /bin/bash
+    - /usr/bin/bash
+    - /bin/base64
+    - /bin/cat
+    - /bin/cp
+    - /bin/mkdir
+    - /bin/rm
+    - /usr/bin/git
+    - /usr/lib/git-core/git
+    - /usr/libexec/git-core/git
+    - /usr/libexec/git-core/git-remote-http
+    - /usr/local/go/bin/go
+    - /usr/local/bin/go
+    - /usr/local/go/bin/gofmt
+    - /usr/local/bin/gofmt
+    - /usr/local/go/pkg/tool/linux_amd64/asm
+    - /usr/local/go/pkg/tool/linux_amd64/compile
+    - /usr/local/go/pkg/tool/linux_amd64/link
+    - /usr/local/go/pkg/tool/linux_amd64/vet
+    - /usr/local/go/pkg/tool/linux_amd64/cgo
+    - /usr/local/go/pkg/tool/linux_amd64/buildid
+    - /usr/local/go/pkg/tool/linux_amd64/cover
+    - /usr/local/go/pkg/tool/linux_amd64/test2json
+    - /usr/local/bin/node
+    - /usr/local/bin/pi
+    - /usr/bin/cat
+    - /usr/bin/find
+    - /usr/bin/grep
+    - /usr/bin/head
+    - /usr/bin/id
+    - /usr/bin/ls
+    - /usr/bin/mkdir
+    - /usr/bin/touch
+    - /usr/bin/which

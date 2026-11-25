@@ -84,6 +84,8 @@ test: manifests generate fmt vet setup-envtest ## Run tests.
 	$(MAKE) image-args-test
 	@# F21: the RWX-storage script's execution test (real script, stubbed kubectl).
 	$(MAKE) rwx-storage-test
+	@# S10: the agent-matrix lab script's execution test (real probe and verdict functions, stubbed kubectl/docker).
+	$(MAKE) agent-matrix-lab-test
 	@# F72 review F6: the evil-agent e2e's verdict gate and preflight self-test (bash + coreutils only,
 	@# no cluster, ~2 s). The gate exists to make the e2e's exit code mean something, so it must be
 	@# seen to pass in PR CI, not only on a human-invoked e2e target.
@@ -247,6 +249,10 @@ agent-images: ## Build the agent adapter images ($(AGENT_IMAGE_PREFIX)<agent>:$(
 agent-images-test: ## T2: each agent image works and is self-contained (Docker; needs a model endpoint).
 	$(CONTAINER_TOOL) build -t local/coxswain/main-model-proxy:t2 -f cmd/model-proxy/Dockerfile .
 	AGENT_IMAGE_PREFIX=$(AGENT_IMAGE_PREFIX) AGENT_TAG=$(AGENT_TAG) hack/agent-images-test.sh $(AGENTS)
+
+.PHONY: agent-matrix-lab-test
+agent-matrix-lab-test: ## S10: execution test of hack/agent-matrix-lab.sh and its T4 probe (no cluster).
+	@bash hack/agent-matrix-lab-test.sh
 
 .PHONY: runner-build
 runner-build: ## S3: build the runner agent image ($(RUNNER_IMG)) from cmd/runner/Dockerfile.

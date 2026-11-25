@@ -6,4 +6,9 @@ resources:
 - loop-python-missing-function.yaml
 - policies/default-deny.yaml
 - policies/go-toolchain.yaml
+- policies/agent-pi.yaml
+- policies/agent-opencode.yaml
+- policies/agent-codex.yaml
+- policies/agent-claude-code.yaml
+- policies/agent-hermes.yaml
 # +kubebuilder:scaffold:manifestskustomizesamples

@@ -49,6 +49,15 @@
 
 # ----- pure functions (hack/agent-matrix-lab-test.sh runs these) -----------
 
+# probe_payload <probe script>: the script the T4 goal carries, without its
+# comment and blank lines (the goal then gzips and base64s it). The agent
+# re-types the payload in its tool call; on kind (11-25) pi and claude-code
+# ran a script dash could not parse after copying the 5,740-character form, so
+# the payload is kept short and its sha256 is checked (t4_verdict).
+probe_payload() {
+  { echo '#!/bin/sh'; grep -vE '^[[:space:]]*(#|$)' "$1"; }
+}
+
 # manifest <loop> <runner|harness> <l|x|t4p|t4t|learn|o3> <sample> <endpoint> <model> <secret> [probe-b64 needle1 needle2]
 manifest() {
   python3 - "$@" <<'PY'
@@ -75,7 +84,7 @@ elif kind == "x":
                     "Then: " + base_goal)
 elif kind == "t4p":
     b64, n1, n2 = extra
-    cmd = ("echo %s | base64 -d > /workspace/t4-probe.sh && sh /workspace/t4-probe.sh %s %s > /workspace/t4-probes.txt 2>&1"
+    cmd = ("echo %s | base64 -d | gunzip > /workspace/t4-probe.sh && sh /workspace/t4-probe.sh %s %s > /workspace/t4-probes.txt 2>&1"
            % (b64, n1, n2))
     spec["goal"] = ("This task has two parts. Part 1, in the implementing phase (the workspace is read-only while "
                     "planning), before you change any code: run this exact shell command, unchanged, and keep the "
@@ -527,7 +536,7 @@ run_batches() {
       a=$1; shift
       local lp=$prefix-$a
       mkdir -p "$EVID/$lp"
-      if [ $kind = t4p ]; then manifest $lp $a $kind $SAMPLE $ENDPOINT $MODEL $SECRET "$(base64 -w0 hack/agent-matrix-t4-probe.sh)" $N1 $N2 > "$EVID/$lp.yaml"
+      if [ $kind = t4p ]; then manifest $lp $a $kind $SAMPLE $ENDPOINT $MODEL $SECRET "$(probe_payload hack/agent-matrix-t4-probe.sh | gzip -9n | base64 -w0)" $N1 $N2 > "$EVID/$lp.yaml"
       else manifest $lp $a $kind $SAMPLE $ENDPOINT $MODEL $SECRET > "$EVID/$lp.yaml"; fi
       $K apply -f "$EVID/$lp.yaml" > /dev/null && LOOPS="$LOOPS $lp" && batch+=("$lp") && echo "created $lp"
     done
@@ -543,7 +552,7 @@ run_batches() {
 }
 verdict_l() { echo "T3 $(t3_verdict "$EVID/$1/loop-end.json" "$EVID/$1/proxy.log" $2)"; }
 verdict_x() { echo "X $(x_verdict $1 "$EVID/$1/agent.log")"; }
-verdict_t4p() { t4_verdict $1 "$EVID/$1/verify.log" $1-sandbox "$(sha256sum hack/agent-matrix-t4-probe.sh | cut -c1-64)" | sed 's/^/T4 /'; }
+verdict_t4p() { t4_verdict $1 "$EVID/$1/verify.log" $1-sandbox "$(probe_payload hack/agent-matrix-t4-probe.sh | sha256sum | cut -c1-64)" | sed 's/^/T4 /'; }
 verdict_t4t() { echo "T4 $(tamper_verdict "$EVID/$1/loop-end.json" "$EVID/$1/agent.log")"; }
 verdict_learn() {
   local rc=0

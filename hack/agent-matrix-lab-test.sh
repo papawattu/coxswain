@@ -223,14 +223,22 @@ import json, sys
 l = json.load(open(sys.argv[1])); d = sys.argv[2]
 l["metadata"]["name"] = "o3-pi"
 json.dump(l, open(d + "/o3.json", "w"))
-def pod(restarts, waiting=None, init_exit=0):
+def pod(restarts, waiting=None, init_exit=0, last_exit=None):
     st = {"state": {"waiting": {"reason": waiting}}} if waiting else {"state": {"running": {}}}
+    if last_exit is not None:
+        st["lastState"] = {"terminated": {"exitCode": last_exit}}
     return {"metadata": {"name": "o3-pi-sandbox"}, "status": {
         "initContainerStatuses": [{"name": "fence-wait", "restartCount": 0, "state": {"terminated": {"exitCode": init_exit}}}],
         "containerStatuses": [dict({"name": "agent", "restartCount": restarts}, **st)]}}
 other = {"metadata": {"name": "o3-pix-sandbox"}, "status": {"containerStatuses": [{"name": "agent", "restartCount": 9, "state": {"running": {}}}]}}
 open(d + "/watch-ok.json", "w").write("\n".join(json.dumps(p) for p in [pod(0), other, pod(0)]))
-open(d + "/watch-crash.json", "w").write("\n".join(json.dumps(p) for p in [pod(0), pod(2, "CrashLoopBackOff")]))
+open(d + "/watch-crash.json", "w").write("\n".join(json.dumps(p) for p in [pod(0), pod(2, "CrashLoopBackOff", last_exit=1)]))
+open(d + "/watch-backoff0.json", "w").write("\n".join(json.dumps(p) for p in [pod(0), pod(2, "CrashLoopBackOff", last_exit=0)]))
+open(d + "/watch-nostart.json", "w").write(json.dumps(pod(0, "CreateContainerError")))
+# the real m-opencode sandbox (S10 kind run, no policy): agent restarted once, exit 0 both times
+r = json.load(open(sys.argv[1].replace("r6-pi.loop-end.json", "m-opencode.sandbox-restarted.json")))
+r["metadata"]["name"] = "o3-pi-sandbox"
+open(d + "/watch-real.json", "w").write(json.dumps(r))
 open(d + "/watch-init.json", "w").write(json.dumps(pod(0, init_exit=1)))
 open(d + "/watch-none.json", "w").write(json.dumps(other))
 def kapt(action, paths):
@@ -244,7 +252,10 @@ PY
 echo 'Error from server (NotFound): kubearmorpolicies.security.kubearmor.com "coxswain-o3-pi" not found' > "$T/kapt-missing.json"
 o3() { o3_verdict "$T/o3.json" "$T/watch-$1.json" "$T/kapt-$2.json" "$T/policy.yaml" > "$T/o"; }
 o3 ok ok; want "$T/o" "PASS o3-pi phase=Succeeded PolicyEnforced=('True', 'Enforcing') exec-allow=2 paths" "a clean Loop under the sample's allowlist is a PASS"
-o3 crash ok; want "$T/o" "FAIL o3-pi" "a crash loop fails"; want "$T/o" "restartCount=2; crash=agent:CrashLoopBackOff" "names the crash"
+o3 crash ok; want "$T/o" "FAIL o3-pi" "a crash loop fails"; want "$T/o" "crash=agent:exit 1" "names the crash"
+o3 backoff0 ok; want "$T/o" "PASS o3-pi" "a back-off after exit 0 is the normal phase restart"; want "$T/o" "max-restarts=2" "reports the restarts"
+o3 real ok; want "$T/o" "PASS o3-pi" "the real restarted m-opencode sandbox (exit 0) is not a crash"; want "$T/o" "max-restarts=1" "reports its restart"
+o3 nostart ok; want "$T/o" "crash=agent:CreateContainerError" "a container that cannot start fails"
 o3 init ok; want "$T/o" "crash=fence-wait:exit 1" "a failed init container fails"
 o3 none ok; want "$T/o" "NOT PROVEN o3-pi: the sandbox pod was never seen" "no pod seen is NOT PROVEN"
 o3 ok short; want "$T/o" "process allow ['/bin/sh'] != the sample's exec ['/bin/sh', '/usr/bin/git']" "an allow that is not the sample's exec fails"

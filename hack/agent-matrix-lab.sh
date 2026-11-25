@@ -223,11 +223,13 @@ else:
 PY
 }
 
-# o3_verdict <loop-end.json> <podwatch.json> <kubearmorpolicy.json> <policy.yaml>:
+# o3_verdict <loop-end.json> <pods.json> <kubearmorpolicy.json> <policy.yaml>:
 # PASS = Succeeded; the Loop's KubeArmorPolicy, read while the Loop ran, is
 # Block with a process allow of exactly the sample policy's exec list (so the
 # allowlist was in force: PolicyEnforced=True alone is also set with no
-# AgentPolicy); and no container of the sandbox pod restarted or crash-looped.
+# AgentPolicy); and no container of the sandbox pod failed (a non-zero exit)
+# or could not start. <pods.json> is any stream of pod objects (the pod watch
+# plus the sandbox pod saved at the end).
 o3_verdict() {
   python3 - "$@" <<'PY'
 import sys, json, yaml
@@ -255,14 +257,20 @@ while i < len(s):
         if p.get("metadata", {}).get("name") != name + "-sandbox": continue
         seen += 1
         ps = p.get("status", {})
+        # The agent container exits 0 at the end of each phase and is
+        # restarted for the next, so a restart (even a CrashLoopBackOff back-off)
+        # is normal; seen on kind with no policy (S10 m-opencode, m-runner).
+        # A crash is a non-zero exit of any container, or a container that
+        # could not start.
         for cs in (ps.get("initContainerStatuses") or []) + (ps.get("containerStatuses") or []):
             restarts = max(restarts, cs.get("restartCount", 0))
             w = (cs.get("state") or {}).get("waiting") or {}
-            if w.get("reason") in ("CrashLoopBackOff", "Error", "RunContainerError", "CreateContainerError"):
+            if w.get("reason") in ("RunContainerError", "CreateContainerError", "CreateContainerConfigError", "StartError"):
                 crash.add("%s:%s" % (cs["name"], w["reason"]))
-            t = (cs.get("state") or {}).get("terminated") or {}
-            if cs["name"] != "agent" and t and t.get("exitCode", 0) != 0:
-                crash.add("%s:exit %s" % (cs["name"], t.get("exitCode")))
+            for which in ("state", "lastState"):
+                t = (cs.get(which) or {}).get("terminated") or {}
+                if t and t.get("exitCode", 0) != 0:
+                    crash.add("%s:exit %s" % (cs["name"], t.get("exitCode")))
 try:
     want = sorted(yaml.safe_load(open(sys.argv[4]))["spec"].get("exec") or [])
 except (OSError, KeyError, TypeError, yaml.YAMLError) as e:
@@ -283,11 +291,10 @@ if c.get("PolicyEnforced", ("",))[0] != "True": bad.append("PolicyEnforced=%s" %
 if k.get("action") != "Block": bad.append("KubeArmorPolicy action=%s" % k.get("action"))
 if (k.get("process") or {}).get("action") != "Allow" or got != want or not want:
     bad.append("process allow %s != the sample's exec %s" % (got, want))
-if restarts: bad.append("restartCount=%d" % restarts)
 if crash: bad.append("crash=%s" % ",".join(sorted(crash)))
-print("%s %s phase=%s PolicyEnforced=%s exec-allow=%d paths blocked=%s sandbox-watch-events=%d%s" % (
+print("%s %s phase=%s PolicyEnforced=%s exec-allow=%d paths blocked=%s sandbox-watch-events=%d max-restarts=%d%s" % (
     "FAIL" if bad else "PASS", name, phase, c.get("PolicyEnforced"), len(got),
-    (st.get("policy") or {}).get("blockedCount"), seen, (" | " + "; ".join(bad)) if bad else ""))
+    (st.get("policy") or {}).get("blockedCount"), seen, restarts, (" | " + "; ".join(bad)) if bad else ""))
 PY
 }
 
@@ -381,7 +388,9 @@ cleanup() {
   echo "== $(date -u +%H:%M:%SZ) cleanup"
   $K -n $NS get events -o json > "$EVID/events-end.json" 2>&1
   for L in $LOOPS; do $K -n $NS delete loop $L --ignore-not-found --wait=true --timeout=180s >/dev/null; done
-  for p in $CAP_PIDS; do kill "$p" 2>/dev/null; done
+  # A watch loop's subshell is killed first, then the kubectl it was running
+  # (its child, by PID: listed before the kill, since it is re-parented after).
+  for p in $CAP_PIDS; do kids=$(pgrep -P "$p"); kill "$p" 2>/dev/null; [ -z "$kids" ] || kill $kids 2>/dev/null; done
   for P in $POLICIES; do $K -n $NS delete agentpolicy $P --ignore-not-found >/dev/null; done
   [ -n "$CHG_SECRET" ] && $K -n $NS delete secret $SECRET --ignore-not-found
   [ -n "$CHG_LABEL" ] && $K -n $NS label secret samples-git-cred coxswain.io/usable- >/dev/null
@@ -416,8 +425,10 @@ print(yaml.safe_dump_all([d for d in yaml.safe_load_all(sys.stdin) if d and d['k
 $K apply --server-side --force-conflicts -f "$EVID/rbac.yaml" > "$EVID/rbac.log" 2>&1 || fatal "rbac"
 bin/kustomize build config/admission > "$EVID/admission.yaml" || fatal "admission build"
 $K apply --server-side --force-conflicts -f "$EVID/admission.yaml" > "$EVID/admission.log" 2>&1 || fatal "admission"
-$K -n $NS get pods -w -o json > "$EVID/samples-podwatch.json" 2>&1 & CAP_PIDS="$CAP_PIDS $!"
-$K -n $NS get events --watch -o json > "$EVID/events-watch.json" 2>&1 & CAP_PIDS="$CAP_PIDS $!"
+# A watch ends when the apiserver closes it (S10: both had stopped within an
+# hour), so each is restarted; the loop is killed with the other captures.
+( while :; do $K -n $NS get pods -w -o json; sleep 1; done ) >> "$EVID/samples-podwatch.json" 2>&1 & CAP_PIDS="$CAP_PIDS $!"
+( while :; do $K -n $NS get events --watch -o json; sleep 1; done ) >> "$EVID/events-watch.json" 2>&1 & CAP_PIDS="$CAP_PIDS $!"
 NEWARGS=$(echo "$OLDARGS" | python3 -c "
 import sys,json
 mem=dict(x.split('=',1) for x in '$MEMORY'.split())
@@ -492,6 +503,7 @@ save_end() {
   $K -n $NS logs -l coxswain.io/verify-for=$lp --all-containers --prefix --tail=-1 > "$EVID/$lp/verify.log" 2>&1
   $K -n $NS get loop $lp -o json > "$EVID/$lp/loop-end.json"
   $K -n $NS get kubearmorpolicy coxswain-$lp -o json > "$EVID/$lp/kubearmorpolicy.json" 2>&1
+  $K -n $NS get pod $lp-sandbox -o json > "$EVID/$lp/sandbox-pod.json" 2>&1
   agent_log $lp > "$EVID/$lp/agent.log"
 }
 # watch_loops <limit s> <loop...>: until each is terminal.
@@ -559,7 +571,10 @@ verdict_learn() {
   "$EVID/kubectl-cox" --context $CTX -n $NS policy suggest $1 --name agent-$2 > "$EVID/$1/agent-$2.suggested.yaml" 2> "$EVID/$1/suggest.err" || rc=$?
   echo "LEARN $1 (proves nothing; a candidate only): rc=$rc $EVID/$1/agent-$2.suggested.yaml has $(grep -cE '^ *- "?/' "$EVID/$1/agent-$2.suggested.yaml") path lines; stderr: $(head -c 200 "$EVID/$1/suggest.err")"
 }
-verdict_o3() { echo "O3 $(o3_verdict "$EVID/$1/loop-end.json" "$EVID/samples-podwatch.json" "$EVID/$1/kubearmorpolicy.json" config/samples/policies/agent-$2.yaml)"; }
+verdict_o3() {
+  { cat "$EVID/samples-podwatch.json"; grep -q '^{' "$EVID/$1/sandbox-pod.json" && cat "$EVID/$1/sandbox-pod.json"; } > "$EVID/$1/pods-seen.json"
+  echo "O3 $(o3_verdict "$EVID/$1/loop-end.json" "$EVID/$1/pods-seen.json" "$EVID/$1/kubearmorpolicy.json" config/samples/policies/agent-$2.yaml)"
+}
 
 if has_step L; then echo "== $(date -u +%H:%M:%SZ) L (T3): one Loop per agent, $BATCH at a time"; run_batches l 3600 $AGENTS; fi
 if has_step X; then echo "== $(date -u +%H:%M:%SZ) X: egress controls"; run_batches x 2400 $AGENTS; fi

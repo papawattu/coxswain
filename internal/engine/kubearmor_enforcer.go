@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"strings"
 
 	"github.com/papawattu/coxswain/api/v1alpha1"
@@ -85,6 +86,14 @@ type KubeArmorEnforcer struct {
 	AgentPodLabel  string
 	BPFLabel       string
 	BPFLabelValue  string
+	// PoolNodeSelector is the manager's --loop-node-selector (C2 + D101). When
+	// set, fact 1 checks only the BPF-LSM nodes in the Loop pool. Every pod
+	// coxswain puts a KubeArmorPolicy on (sandbox, model/Judge/egress/tool
+	// proxies, Jobs) is pinned to the pool. KubeArmor's node probe labels
+	// every BPF-LSM node, so a cluster that runs agents on the pool only
+	// would otherwise hold every Loop with NodeNotEnforcing. Empty means every
+	// BPF-LSM node, as before.
+	PoolNodeSelector map[string]string
 }
 
 // Apply emits (creates or updates) the KubeArmorPolicy for the Loop's effective
@@ -419,9 +428,13 @@ func (e *KubeArmorEnforcer) Enforcing(ctx context.Context, loop *v1alpha1.Loop) 
 	bpfLabel := e.bpfLabel()
 	bpfLabelValue := e.bpfLabelValue()
 
-	// Fact 2 (and the first half of fact 1): find nodes with the BPF-LSM label.
+	// Fact 2 (and the first half of fact 1): find nodes with the BPF-LSM label,
+	// in the Loop pool when one is set.
+	nodeLabels := client.MatchingLabels{}
+	maps.Copy(nodeLabels, e.PoolNodeSelector)
+	nodeLabels[bpfLabel] = bpfLabelValue
 	nodeList := &corev1.NodeList{}
-	if err := e.a1Reader().List(ctx, nodeList, client.MatchingLabels{bpfLabel: bpfLabelValue}); err != nil {
+	if err := e.a1Reader().List(ctx, nodeList, nodeLabels); err != nil {
 		return false, ReasonEngineUnavailable
 	}
 	if len(nodeList.Items) == 0 {

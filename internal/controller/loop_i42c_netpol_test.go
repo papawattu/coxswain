@@ -436,6 +436,58 @@ var _ = Describe("I42c: NetworkPolicy changes (agent egress + egress-proxy egres
 			"the proxy's egress carves out private ranges, so its fence-wait can pass on a private node IP")
 	})
 
+	// The egress proxy's KubeArmorPolicy must allow DNS for every host the
+	// proxy serves, so the controller hands the enforcer the proxy's whole
+	// allowlist (homelab 2026-11-26: KubeArmor blocked the clone's github.com
+	// lookup because the policy carried only the AgentPolicy's hosts).
+	captureEffective := func(name, ns string) policy.EffectivePolicy {
+		var got policy.EffectivePolicy
+		// The enforcement path runs only with an Enforcer (P6b's fixture).
+		r.Enforcer = &fakeEnforcer{enforcing: true}
+		r.AllowUnenforced = false
+		r.ApplyEnforcementWritesFn = func(_ context.Context, _ *coxv1alpha1.Loop, ep policy.EffectivePolicy) error {
+			got = ep
+			return nil
+		}
+		for range 3 {
+			reconcileI42C(name, ns)
+		}
+		return got
+	}
+
+	It("hands the enforcer the egress proxy's whole allowlist: network allows plus the repo host", func() {
+		ns := "i42c-kapt-hosts-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+		Expect(k8sClient.Create(ctx, &coxv1alpha1.AgentPolicy{
+			ObjectMeta: metav1.ObjectMeta{Name: i42cPolicyName, Namespace: ns},
+			Spec:       coxv1alpha1.AgentPolicySpec{Network: []string{i42cExternalAllow}},
+		})).To(Succeed())
+		makeSecret("kh-model", ns)
+		loop := buildLoopI42C("kh", ns, "kh-model", []string{i42cPolicyName})
+		loop.Spec.Workspace.Repo = "https://github.com/example/gocli.git"
+		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
+
+		ep := captureEffective("kh", ns)
+		Expect(ep.Network).To(ConsistOf(i42cExternalAllow), "the agent's allows are unchanged")
+		Expect(ep.EgressProxyHosts).To(ContainElements(i42cExternalAllow, "github.com:443"))
+	})
+
+	It("hands the enforcer the repo host for a clone-only egress proxy (no network allows)", func() {
+		ns := "i42c-kapt-clone-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+		makeSecret("kc-model", ns)
+		loop := buildLoopI42C("kc", ns, "kc-model", nil)
+		loop.Spec.Workspace.Repo = "https://github.com/example/gocli.git"
+		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
+
+		ep := captureEffective("kc", ns)
+		Expect(ep.Network).To(BeEmpty())
+		Expect(ep.EgressProxyHosts).To(ContainElement("github.com:443"),
+			"the clone's egress proxy needs a KubeArmorPolicy that allows the repo host")
+	})
+
 	// spec 5: carve-out CIDRs are from config — a different POD_CIDR yields a
 	// different except list (not hardcoded).
 	It("derives the egress-proxy netpol carve-outs from the reconciler's config", func() {

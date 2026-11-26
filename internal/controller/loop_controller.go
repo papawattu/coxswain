@@ -6262,6 +6262,14 @@ func (r *LoopReconciler) applyEnforcementWrites(ctx context.Context, loop *coxv1
 	// ForeignKubeArmorPolicy and hold the sandbox Suspended (the
 	// order-independent gate in ensureSandbox reads the live objects).
 	// Reconcile does not error-loop.
+	// The egress proxy's KubeArmorPolicy carries the proxy's whole allowlist
+	// (egressProxyAllows: the network allows plus the external repo's clone,
+	// verify and deliver hosts), so KubeArmor allows the DNS lookups the
+	// proxy makes. If it cannot be computed, EgressProxyHosts stays empty and
+	// the policy falls back to the network allows: stricter, never wider.
+	if hosts, expected, err := r.egressProxyAllows(ctx, loop); err == nil && expected {
+		effective.EgressProxyHosts = hosts
+	}
 	applyErr := r.enforcementApply(ctx, loop, effective)
 	if applyErr != nil && errors.Is(applyErr, engine.ErrForeignKapt) {
 		setCondition(loop, "KubeArmorPolicyConflict", metav1.ConditionTrue, "ForeignKubeArmorPolicy",

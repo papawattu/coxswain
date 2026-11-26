@@ -40,6 +40,7 @@ import (
 	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -399,6 +400,40 @@ var _ = Describe("I42c: NetworkPolicy changes (agent egress + egress-proxy egres
 		np := &networkingv1.NetworkPolicy{}
 		err := k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: "eg-noallow-egress-proxy-netpol"}, np)
 		Expect(err).To(HaveOccurred(), "no egress-proxy NetworkPolicy when there are no network allows")
+	})
+
+	// The egress-proxy netpol gap (homelab run, 2026-11-25): an EXTERNAL repo
+	// with no network allows still gets an egress proxy (S6/D61: the workspace-init and verify clones
+	// traverse it), so it must get the egress-proxy NetworkPolicy too. Before
+	// the fix the netpol followed the AgentPolicy allows only: the proxy ran
+	// unfenced, and since fence-wait (#521) its init never passed.
+	It("fences the egress proxy an external-repo clone creates, with no network allows", func() {
+		ns := "i42c-extrepo-" + nowSuffix()
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}) }()
+
+		makeSecret("extrepo-model", ns)
+		loop := buildLoopI42C("extrepo", ns, "extrepo-model", nil) // no policyRefs: no network allows
+		loop.Spec.Workspace.Repo = "https://github.com/example/gocli.git"
+		Expect(k8sClient.Create(ctx, loop)).To(Succeed())
+		for range 3 {
+			reconcileI42C("extrepo", ns)
+		}
+
+		pod := &corev1.Pod{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: egressProxyPodName("extrepo")}, pod)).
+			To(Succeed(), "the external-repo clone creates the egress proxy (S6)")
+
+		np := getEgressProxyNetpol(ns, "extrepo")
+		sel, err := metav1.LabelSelectorAsSelector(&np.Spec.PodSelector)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(sel.Matches(labels.Set(pod.Labels))).To(BeTrue(),
+			"the egress-proxy NetworkPolicy must select the egress proxy pod")
+		Expect(np.Spec.PolicyTypes).To(ConsistOf(networkingv1.PolicyTypeIngress, networkingv1.PolicyTypeEgress))
+		Expect(np.Spec.Egress).NotTo(BeEmpty())
+		Expect(np.Spec.Egress[0].To[0].IPBlock).NotTo(BeNil())
+		Expect(np.Spec.Egress[0].To[0].IPBlock.Except).To(ContainElement("192.168.0.0/16"),
+			"the proxy's egress carves out private ranges, so its fence-wait can pass on a private node IP")
 	})
 
 	// spec 5: carve-out CIDRs are from config — a different POD_CIDR yields a

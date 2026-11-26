@@ -466,6 +466,9 @@ func main() {
 		AgentPodLabel:  kaAgentPodLabel,
 		BPFLabel:       kaBPFLabel,
 		BPFLabelValue:  kaBPFLabelValue,
+		// Fact 1 checks only the Loop pool's BPF-LSM nodes: every pod with a
+		// KubeArmorPolicy is pinned to the pool (C2 + D101).
+		PoolNodeSelector: loopNodeSelectorMap,
 	}
 	// D38: the operator-side CNI self-test prober. It runs the probe pod in the
 	// fixed coxswain-cni-probe namespace, reads the termination message, and

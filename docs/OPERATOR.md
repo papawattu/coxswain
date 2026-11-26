@@ -1262,8 +1262,20 @@ kubectl taint node <n> coxswain.io/pool=loops:NoSchedule
 --loop-tolerations=coxswain.io/pool:Equal:NoSchedule:loops
 ```
 
-**What is pinned (D101):** the sandbox pod, the model proxy pod, the egress
-and tool proxy pods, and the verify, deliver and memory-writer Jobs.
+**What is pinned (D101):** the sandbox pod, the model and Judge proxy pods,
+the egress and tool proxy pods, and the verify, Judge, deliver and
+memory-writer Jobs.
+
+**The pool also scopes the policy gate.** With `--loop-node-selector` set,
+`PolicyEnforced` needs a Ready KubeArmor agent only on the pool's BPF-LSM
+nodes (`kubearmor.io/enforcer=bpf` plus the selector's labels). KubeArmor's
+node probe labels every BPF-LSM node, so without this a cluster that runs
+agents on the pool only would hold every Loop with `NodeNotEnforcing`. Every
+pod coxswain puts a KubeArmorPolicy on is pinned to the pool, so a node
+outside it never runs one. To run agents on the pool only with the KubeArmor
+operator, set `globalNodeSelector` and `globalTolerations` in the
+KubeArmorConfig to the same label and taint. A pool with no BPF-LSM node is
+`NodeNotEnforcing`.
 
 **What happens when the flags change:** the sandbox template is updated in
 place (and cleared when the flags are emptied); the proxy pods are recreated

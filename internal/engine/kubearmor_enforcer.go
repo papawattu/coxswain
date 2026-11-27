@@ -163,11 +163,19 @@ func (e *KubeArmorEnforcer) Apply(ctx context.Context, loop *v1alpha1.Loop, p po
 	}
 
 	// I42f: the egress proxy policy (created only when the egress proxy is
-	// expected, i.e. the effective policy has network allows). Cleaned up in
-	// the else branch when the allows go away (a stale policy would keep
-	// fencing a pod that no longer exists — drift the reconciler must own).
-	if p.NeedsEgress() {
-		egressObj := EmitEgressProxyKubeArmorPolicy(loop.Name, loop.Namespace, p.Network)
+	// expected). Cleaned up in the else branch when it is not (a stale policy
+	// would keep fencing a pod that no longer exists — drift the reconciler
+	// must own). The proxy is expected when the effective policy needs egress
+	// or the controller set EgressProxyHosts (an external repo's clone, verify
+	// or deliver traverses it even with no network allows). Its DNS allowlist
+	// is EgressProxyHosts, the proxy's whole allowlist, so KubeArmor does not
+	// block the repo host's lookup; Network when the controller set none.
+	egressHosts := p.Network
+	if len(p.EgressProxyHosts) > 0 {
+		egressHosts = p.EgressProxyHosts
+	}
+	if p.NeedsEgress() || len(p.EgressProxyHosts) > 0 {
+		egressObj := EmitEgressProxyKubeArmorPolicy(loop.Name, loop.Namespace, egressHosts)
 		if err := e.createOrUpdateKapt(ctx, loop, egressObj); err != nil {
 			return err
 		}

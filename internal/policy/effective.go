@@ -128,6 +128,14 @@ type EffectivePolicy struct {
 	// AuditOnlyIgnored names the auditOnly policies whose flag had no effect
 	// because an enforcing policy is also referenced (D108).
 	AuditOnlyIgnored []string
+	// EgressProxyHosts is the egress proxy's whole allowlist: Network plus the
+	// repo hosts the proxy also serves (the workspace clone, the verify
+	// clone-base and the deliver push of an external repo). The controller sets
+	// it when the egress proxy exists. The enforcer builds the egress proxy's
+	// KubeArmorPolicy from it, so KubeArmor allows the DNS lookups the proxy
+	// makes. Empty means Network. It is not part of EffectiveHash: it is
+	// derived from the Loop spec, not from the user's policies.
+	EgressProxyHosts []string
 }
 
 // Translate turns a Loop's effective allows into the engine policy (C6a). It is

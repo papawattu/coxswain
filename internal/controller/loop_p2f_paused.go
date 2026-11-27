@@ -153,17 +153,26 @@ func loopPaused(loop *coxv1alpha1.Loop) bool {
 // the Paused phase uses (P2f) stops the sandbox: the deliver Job runs in its
 // own pod (clone-base/import-agent/push read the workspace from a volume,
 // independent of the sandbox pod), so delivery still works after Succeeded.
+//
+// Verifying is stopped too, the whole phase and not only the P5f holds
+// (Delivering D69 / Judging ADR-0011, which are sub-states of it). The runner
+// executes nothing at Verifying, but a Running sandbox pod keeps the RWO
+// workspace PVC attached to its node. The verify Job mounts the same PVC, and
+// on a network block StorageClass (Ceph RBD) a verify pod scheduled on
+// another node failed with Multi-Attach and sat in Init until its deadline
+// (homelab, 2026-11-27). A verify failure moves the Loop back to
+// Implementing, where the S4 recycle rebuilds the sandbox Running.
 func (r *LoopReconciler) loopSandboxStopped(loop *coxv1alpha1.Loop) bool {
 	return loopPaused(loop) ||
 		loop.Status.Phase == coxv1alpha1.LoopPhaseSucceeded ||
 		loop.Status.Phase == coxv1alpha1.LoopPhaseFailed ||
-		loopHeldAfterVerify(loop) // P5f: Verifying hold (Delivering D69 / Judging ADR-0011)
+		loop.Status.Phase == coxv1alpha1.LoopPhaseVerifying
 }
 
 // sandboxOperatingMode is the P2f suspension gate: desired OperatingMode =
-// Suspended iff spec.suspend || phase==Paused || a terminal phase
-// (Succeeded, Failed). A budget- or stall-paused Loop has spec.suspend=false
-// — the gate still suspends it. A terminal Loop's sandbox is stopped (I74):
+// Suspended iff spec.suspend || phase==Paused || phase==Verifying || a
+// terminal phase (Succeeded, Failed). A budget- or stall-paused Loop has
+// spec.suspend=false — the gate still suspends it. A terminal Loop's sandbox is stopped (I74):
 // before F52 C2 the one-shot runner crashlooped on the terminal desired-phase
 // and it idles on it now, but no phase is left for it to execute. The
 // deliver Job runs in its own pod (independent of the sandbox pod), so the

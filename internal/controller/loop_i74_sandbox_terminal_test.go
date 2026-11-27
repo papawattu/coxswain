@@ -103,9 +103,9 @@ func TestI74SandboxGateSuspendedOnTerminalPhase(t *testing.T) {
 	// Negative control: a non-terminal phase with no suspend stays Running
 	// (the gate does not over-suspend).
 	running := &coxv1alpha1.Loop{}
-	running.Status.Phase = coxv1alpha1.LoopPhaseVerifying
+	running.Status.Phase = coxv1alpha1.LoopPhaseImplementing
 	if got := r.sandboxOperatingMode(running, false); got != sandboxv1beta1.SandboxOperatingModeRunning {
-		t.Fatalf("sandboxOperatingMode(Verifying) = %s, want Running (the gate must not over-suspend a non-terminal phase)", got)
+		t.Fatalf("sandboxOperatingMode(Implementing) = %s, want Running (the gate must not over-suspend a non-terminal phase)", got)
 	}
 }
 

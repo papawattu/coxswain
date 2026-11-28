@@ -52,8 +52,9 @@ func TestP5fDeadlineExceededMapsToDeliveryFailed(t *testing.T) {
 }
 
 // TestP5fSandboxGateStoppedOnDeliveryHold: the extended loopSandboxStopped
-// gate stops the sandbox for Verifying+Delivering only (a Verifying Loop that
-// is not holding keeps its sandbox Running).
+// gate stops the sandbox for Verifying+Delivering. Since the Verifying stop
+// (loop_verifying_sandbox_suspended_test.go) plain Verifying is stopped too;
+// the runner's own phase (Implementing) keeps its sandbox Running.
 func TestP5fSandboxGateStoppedOnDeliveryHold(t *testing.T) {
 	r := &LoopReconciler{CNIProber: testCNIProber()}
 	held := &coxv1alpha1.Loop{}
@@ -67,8 +68,13 @@ func TestP5fSandboxGateStoppedOnDeliveryHold(t *testing.T) {
 	}
 	plain := &coxv1alpha1.Loop{}
 	plain.Status.Phase = coxv1alpha1.LoopPhaseVerifying
-	if got := r.sandboxOperatingMode(plain, false); got != sandboxv1beta1.SandboxOperatingModeRunning {
-		t.Fatalf("plain Verifying: mode = %s, want Running", got)
+	if got := r.sandboxOperatingMode(plain, false); got != sandboxv1beta1.SandboxOperatingModeSuspended {
+		t.Fatalf("plain Verifying: mode = %s, want Suspended (the verify Job owns the RWO workspace PVC)", got)
+	}
+	implementing := &coxv1alpha1.Loop{}
+	implementing.Status.Phase = coxv1alpha1.LoopPhaseImplementing
+	if got := r.sandboxOperatingMode(implementing, false); got != sandboxv1beta1.SandboxOperatingModeRunning {
+		t.Fatalf("Implementing: mode = %s, want Running", got)
 	}
 }
 
@@ -228,7 +234,7 @@ var _ = Describe("P5f: Succeeded is held until Delivered is terminal (I98)", fun
 		Expect(loopHoldingForDelivery(loop)).To(BeFalse())
 	})
 
-	It("keeps a REAL sandbox Suspended during the hold (gates satisfied: not masked by D30/D35a), Running at plain Verifying", func() {
+	It("keeps a REAL sandbox Suspended during the hold (gates satisfied: not masked by D30/D35a), and already at plain Verifying", func() {
 		ns := freshNS("p5f-gate")
 		name := "gate1"
 		r := &LoopReconciler{
@@ -262,13 +268,13 @@ var _ = Describe("P5f: Succeeded is held until Delivered is terminal (I98)", fun
 		rec()
 		Expect(p5fSandboxMode(ns, name)).To(Equal(sandboxv1beta1.SandboxOperatingModeRunning), "baseline: Running")
 
-		By("plain Verifying (no hold) keeps the sandbox Running")
+		By("plain Verifying (no hold) already stops the sandbox (the verify Job owns the RWO workspace PVC)")
 		l := p5fGet(ns, name)
 		l.Status.Phase, l.Status.DesiredPhase = coxv1alpha1.LoopPhaseVerifying, coxv1alpha1.LoopPhaseVerifying
 		Expect(k8sClient.Status().Update(ctx, l)).To(Succeed())
 		rec()
 		rec()
-		Expect(p5fSandboxMode(ns, name)).To(Equal(sandboxv1beta1.SandboxOperatingModeRunning))
+		Expect(p5fSandboxMode(ns, name)).To(Equal(sandboxv1beta1.SandboxOperatingModeSuspended))
 
 		By("Verifying + reason Delivering stops the sandbox")
 		l = p5fGet(ns, name)

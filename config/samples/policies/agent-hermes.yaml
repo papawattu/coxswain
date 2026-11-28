@@ -1,0 +1,67 @@
+# O3 (docs/PLAN-AGENT-ADAPTERS.md, docs/AGENT-HARNESSES.md): an exec allowlist for the hermes
+# agent adapter (spec.agent.harness: hermes). Reference it with spec.policyRefs: [agent-hermes].
+#
+# With a non-empty exec list the Loop's KubeArmorPolicy is an allowlist under Block for the
+# WHOLE sandbox pod, init containers included, so the list holds:
+#   - the platform: the adapter (/usr/local/bin/runner) and fence-wait's python3 (the
+#     pinned python:3.13-alpine probe image);
+#   - the init containers' tools (cat, cp, mkdir, base64, rm) and git;
+#   - the shell (/bin/sh is required: ExecListMissingShell), git and the Go toolchain;
+#   - the binaries the hermes agent ran in learn mode on kind-ref (11-25).
+#
+# What this list cannot allow (D46, R15): anything under /workspace, /scratch or /tmp,
+# so the agent's own `go test` cannot run its test binary in the sandbox (the verify Job
+# runs the checks). A command the agent tries that is not listed is denied and recorded.
+apiVersion: coxswain.wattu.com/v1alpha1
+kind: AgentPolicy
+metadata:
+  name: agent-hermes
+spec:
+  exec:
+    - /usr/local/bin/runner
+    - /usr/local/bin/python3
+    - /usr/local/bin/python3.13
+    - /bin/sh
+    - /usr/bin/sh
+    - /usr/bin/dash
+    - /bin/bash
+    - /usr/bin/bash
+    - /bin/base64
+    - /bin/cat
+    - /bin/cp
+    - /bin/mkdir
+    - /bin/rm
+    - /usr/bin/git
+    - /usr/lib/git-core/git
+    - /usr/libexec/git-core/git
+    - /usr/libexec/git-core/git-remote-http
+    - /usr/local/go/bin/go
+    - /usr/local/bin/go
+    - /usr/local/go/bin/gofmt
+    - /usr/local/bin/gofmt
+    - /usr/local/go/pkg/tool/linux_amd64/asm
+    - /usr/local/go/pkg/tool/linux_amd64/compile
+    - /usr/local/go/pkg/tool/linux_amd64/link
+    - /usr/local/go/pkg/tool/linux_amd64/vet
+    - /usr/local/go/pkg/tool/linux_amd64/cgo
+    - /usr/local/go/pkg/tool/linux_amd64/buildid
+    - /usr/local/go/pkg/tool/linux_amd64/cover
+    - /usr/local/go/pkg/tool/linux_amd64/test2json
+    - /opt/hermes/.venv/bin/hermes
+    - /opt/hermes/libexec/hermes
+    - /opt/hermes/.venv/bin/python
+    - /opt/hermes/.venv/bin/python3
+    - /opt/hermes/tools/python-3.14.9+20261021-linux-x64/bin/python
+    - /opt/hermes/tools/python-3.14.9+20261021-linux-x64/bin/python3
+    - /opt/hermes/tools/python-3.14.9+20261021-linux-x64/bin/python3.14
+    - /usr/bin/awk
+    - /usr/bin/dirname
+    - /usr/bin/grep
+    - /usr/bin/id
+    - /usr/bin/mktemp
+    - /usr/bin/mv
+    - /usr/bin/readlink
+    - /usr/bin/realpath
+    - /usr/bin/run-parts
+    - /usr/bin/touch
+    - /usr/bin/uname

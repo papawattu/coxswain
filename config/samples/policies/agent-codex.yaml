@@ -1,0 +1,69 @@
+# O3 (docs/PLAN-AGENT-ADAPTERS.md, docs/AGENT-HARNESSES.md): an exec allowlist for the codex
+# agent adapter (spec.agent.harness: codex). Reference it with spec.policyRefs: [agent-codex].
+#
+# With a non-empty exec list the Loop's KubeArmorPolicy is an allowlist under Block for the
+# WHOLE sandbox pod, init containers included, so the list holds:
+#   - the platform: the adapter (/usr/local/bin/runner) and fence-wait's python3 (the
+#     pinned python:3.13-alpine probe image);
+#   - the init containers' tools (cat, cp, mkdir, base64, rm) and git;
+#   - the shell (/bin/sh is required: ExecListMissingShell), git and the Go toolchain;
+#   - the binaries the codex agent ran in learn mode on kind-ref (11-25).
+#
+# What this list cannot allow (D46, R15): anything under /workspace, /scratch or /tmp,
+# so the agent's own `go test` cannot run its test binary in the sandbox (the verify Job
+# runs the checks). A command the agent tries that is not listed is denied and recorded.
+#
+# NOT ALLOWABLE (S10 finding): the CRD's exec rule rejects '@', and the codex CLI's
+# real binary is under an npm scope, so it cannot be listed and is denied under this policy:
+#   /usr/local/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex
+apiVersion: coxswain.wattu.com/v1alpha1
+kind: AgentPolicy
+metadata:
+  name: agent-codex
+spec:
+  exec:
+    - /usr/local/bin/runner
+    - /usr/local/bin/python3
+    - /usr/local/bin/python3.13
+    - /bin/sh
+    - /usr/bin/sh
+    - /usr/bin/dash
+    - /bin/bash
+    - /usr/bin/bash
+    - /bin/base64
+    - /bin/cat
+    - /bin/cp
+    - /bin/mkdir
+    - /bin/rm
+    - /usr/bin/git
+    - /usr/lib/git-core/git
+    - /usr/libexec/git-core/git
+    - /usr/libexec/git-core/git-remote-http
+    - /usr/local/go/bin/go
+    - /usr/local/bin/go
+    - /usr/local/go/bin/gofmt
+    - /usr/local/bin/gofmt
+    - /usr/local/go/pkg/tool/linux_amd64/asm
+    - /usr/local/go/pkg/tool/linux_amd64/compile
+    - /usr/local/go/pkg/tool/linux_amd64/link
+    - /usr/local/go/pkg/tool/linux_amd64/vet
+    - /usr/local/go/pkg/tool/linux_amd64/cgo
+    - /usr/local/go/pkg/tool/linux_amd64/buildid
+    - /usr/local/go/pkg/tool/linux_amd64/cover
+    - /usr/local/go/pkg/tool/linux_amd64/test2json
+    - /usr/local/bin/codex
+    - /usr/local/bin/node
+    - /usr/bin/awk
+    - /usr/bin/cat
+    - /usr/bin/df
+    - /usr/bin/getconf
+    - /usr/bin/grep
+    - /usr/bin/head
+    - /usr/bin/id
+    - /usr/bin/ls
+    - /usr/bin/rm
+    - /usr/bin/run-parts
+    - /usr/bin/sed
+    - /usr/bin/touch
+    - /usr/bin/tr
+    - /usr/bin/wc

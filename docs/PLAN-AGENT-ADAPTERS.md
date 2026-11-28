@@ -1,6 +1,11 @@
 # Agent adapters: Claude Code, Codex, pi, Hermes and opencode on one template
 
-> **Status:** PLANNED, not started. D147, D148 and D149 were answered (a) by the owner on 11-23.
+> **Status:** in progress. D147, D148 and D149 were answered (a) by the owner on 11-23. Merged so far:
+> - #529: S0–S2 (the CLI engine, `agent-base` and the five adapter images, T1 and T2);
+> - #530: O1 (`spec.agent.harness`, `--agent-harness`);
+> - #531: O2 (proxy metering and the credential header for Messages and Responses).
+>
+> S10 (#532) adds the T3 matrix as one lab script (`hack/agent-matrix-lab.sh`), T4 per agent, the sample AgentPolicies (O3) and the docs. The "What exists today" section below describes `76b5d4d`, before these PRs.
 >
 > **Ask (owner, 11-23):** create agents for Claude Code, Codex, pi, Hermes and opencode, all from the same template, plus tests that show each one is working and self-contained.
 
@@ -45,6 +50,7 @@ A Loop can run any of five third-party coding agents in place of the reference r
   - **Rules for env:** `spec.agent.env` cannot set `COX_*` or proxy names (I34).
   - **Filesystem:** a read-only root, with writable `/workspace`, `/scratch` and `/tmp`. The workspace is read-only during Planning, except `.coxswain`.
 - **The model proxy forwards any path, but meters only OpenAI chat-completions usage.**
+  - *Superseded by #531 (`docs/adr/0009-amendment-a1-messages-responses.md`, ADR-0009-A1): the proxy now meters Messages and Responses and sends the key in each API's header.*
   - It is a path-agnostic reverse proxy (`internal/proxy/proxy.go:129-185`).
   - Usage is parsed only from `prompt_tokens` and `completion_tokens` (`internal/proxy/shape.go:16-17,48-49`). Anthropic Messages and OpenAI Responses report `input_tokens` and `output_tokens`, so a call in either API would read as unmetered, and the budget gates would see no usage.
   - The credential always goes in `Authorization: Bearer …` (`proxy.go:84-86`). Nothing sets `CredHeader` (`cmd/model-proxy/main.go`).

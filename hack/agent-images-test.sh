@@ -56,6 +56,7 @@ MODEL=${MODEL:-qwen3.8-27b}
 EVIDENCE=${EVIDENCE:-.samples/agent-images/$(date -u +%Y%m%dT%H%M%SZ)}
 REPO=$(git rev-parse --show-toplevel)
 RUN=t2-$$
+KEYDIR=
 NET=$RUN-int
 CANARY="t2-canary-$(head -c 12 /dev/urandom | od -An -tx1 | tr -d ' \n')"
 CAP_IMAGE=local/coxswain/t2-tcpdump:dev
@@ -76,6 +77,7 @@ rootrm() { docker run --rm -u 0 -v "$1":/d alpine:3.22 sh -c 'rm -rf /d/* /d/.[!
 cleanup() {
   docker rm -f "$RUN-proxy" "$RUN-holder" "$RUN-cap" >/dev/null 2>&1
   docker network rm "$NET" >/dev/null 2>&1
+  rm -rf "$KEYDIR"
 }
 trap cleanup EXIT
 
@@ -85,13 +87,17 @@ printf 'FROM alpine:3.22\nRUN apk add --no-cache tcpdump\nENTRYPOINT ["tcpdump"]
 docker image inspect "$PROXY_IMAGE" >/dev/null 2>&1 || { echo "FATAL no proxy image $PROXY_IMAGE"; exit 2; }
 docker network create --internal "$NET" >/dev/null || { echo "FATAL cannot create $NET"; exit 2; }
 mkdir -p "$EVIDENCE/proxy"
-printf '%s' "$CANARY" > "$EVIDENCE/proxy/key"
-chmod 0644 "$EVIDENCE/proxy/key"
+# The canary key lives outside the evidence dir and is removed on exit, so no
+# key is left in the evidence (S10). The evidence records only where it was.
+KEYDIR=$(mktemp -d "${TMPDIR:-/tmp}/t2-key.XXXXXX")
+printf '%s' "$CANARY" > "$KEYDIR/key"
+chmod 0644 "$KEYDIR/key"
+echo "the proxy's canary key was $KEYDIR/key (removed on exit; not kept in the evidence)" > "$EVIDENCE/proxy/key-location.txt"
 # The proxy: on the default bridge (to reach MODEL_ENDPOINT) and on the internal
 # network as "model-proxy" (the agent's only peer).
 docker run -d --name "$RUN-proxy" -e MODEL_ENDPOINT="$MODEL_ENDPOINT" -e MODEL_CRED_FILE=/creds/key \
   -e PROXY_USAGE_FILE=/tmp/usage.json -e LOOP_NAME=t2 -e LOOP_NAMESPACE=t2 \
-  -v "$EVIDENCE/proxy/key":/creds/key:ro --tmpfs /tmp "$PROXY_IMAGE" >/dev/null || { echo "FATAL proxy start"; exit 2; }
+  -v "$KEYDIR/key":/creds/key:ro --tmpfs /tmp "$PROXY_IMAGE" >/dev/null || { echo "FATAL proxy start"; exit 2; }
 docker network connect --alias model-proxy "$NET" "$RUN-proxy" || { echo "FATAL proxy network"; exit 2; }
 PROXY_IP=$(docker inspect -f "{{(index .NetworkSettings.Networks \"$NET\").IPAddress}}" "$RUN-proxy")
 say "setup: network $NET (internal), proxy $PROXY_IMAGE at $PROXY_IP -> $MODEL_ENDPOINT, model $MODEL, evidence $EVIDENCE"
@@ -134,7 +140,7 @@ else
   fail "control egress: the capture did NOT detect example.com; the network check cannot be trusted"
   exit 1
 fi
-if grep -rqF "$CANARY" "$EVIDENCE/proxy"; then
+if grep -rqF "$CANARY" "$KEYDIR"; then
   pass "control canary: the grep finds the canary in the proxy's key file"
 else
   fail "control canary: the grep does not find the canary where it is; the credential check cannot be trusted"
